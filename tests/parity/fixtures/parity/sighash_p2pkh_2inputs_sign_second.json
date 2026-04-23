@@ -1,0 +1,42 @@
+{
+  "_meta": {
+    "ts_sdk_version": "1.10.1",
+    "generated_at": "2026-04-21T15:14:25.933Z",
+    "generator_script": "tests/parity/ts-fixtures/generate.mjs",
+    "seed": "sighash_p2pkh_2inputs_sign_second",
+    "note": "BIP-143 sighash preimage: two inputs, signing input 1"
+  },
+  "input": {
+    "tx_hex": "010000000211111111111111111111111111111111111111111111111111111111111111110000000000ffffffff22222222222222222222222222222222222222222222222222222222222222220100000000ffffffff0108460200000000001976a914cccccccccccccccccccccccccccccccccccccccc88ac00000000",
+    "inputs": [
+      {
+        "source_txid": "1111111111111111111111111111111111111111111111111111111111111111",
+        "source_vout": 0,
+        "source_satoshis": 100000,
+        "source_locking_script_hex": "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac",
+        "sequence": 4294967295
+      },
+      {
+        "source_txid": "2222222222222222222222222222222222222222222222222222222222222222",
+        "source_vout": 1,
+        "source_satoshis": 50000,
+        "source_locking_script_hex": "76a914bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb88ac",
+        "sequence": 4294967295
+      }
+    ],
+    "outputs": [
+      {
+        "satoshis": 149000,
+        "locking_script_hex": "76a914cccccccccccccccccccccccccccccccccccccccc88ac"
+      }
+    ],
+    "input_index": 1,
+    "version": 1,
+    "locktime": 0,
+    "scope": 65
+  },
+  "expected": {
+    "preimage_hex": "010000007b3c2ebd5b19afa039feca8f9dd091e9091a054cef8430c8fcd2cc5a32f51fcd752adad0a7b9ceca853768aebb6965eca126a62965f698a0c1bc43d83db632ad2222222222222222222222222222222222222222222222222222222222222222010000001976a914bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb88ac50c3000000000000ffffffff69b4f3caa38c2c2ace75587ff792cbdb442050dd60849c3416369bb80d48de400000000041000000",
+    "sighash_digest_hex": "9a41212c78afb4ab57c9b13e6de2370d988a3deff57d6a6f65030e596e909fc9"
+  }
+}

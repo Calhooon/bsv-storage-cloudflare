@@ -1,0 +1,14 @@
+{
+  "_meta": {
+    "ts_sdk_version": "1.10.1",
+    "generated_at": "2026-04-21T15:14:25.948Z",
+    "generator_script": "tests/parity/ts-fixtures/generate.mjs",
+    "seed": "too_few_fields_rejects",
+    "note": "tm_uhrp admission case: 4 fields total (3 data + junk sig) — fails `< 5` check"
+  },
+  "admin_pub_hex": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+  "label": "too_few_fields_rejects",
+  "expected_admit": false,
+  "reason": "4 fields total (3 data + junk sig) — fails `< 5` check",
+  "locking_script_hex": "210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798ac210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f8179820cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc2168747470733a2f2f7075622d6162632e72322e6465762f63646e2f746f6f6665770830060201010201016d6d"
+}

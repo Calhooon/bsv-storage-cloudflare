@@ -1,0 +1,14 @@
+{
+  "_meta": {
+    "ts_sdk_version": "1.10.1",
+    "generated_at": "2026-04-21T15:14:25.949Z",
+    "generator_script": "tests/parity/ts-fixtures/generate.mjs",
+    "seed": "max_content_length_admits",
+    "note": "tm_uhrp admission case: max JS-representable u53 content length still admits (TS only checks file_size<1)"
+  },
+  "admin_pub_hex": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+  "label": "max_content_length_admits",
+  "expected_admit": true,
+  "reason": "max JS-representable u53 content length still admits (TS only checks file_size<1)",
+  "locking_script_hex": "2103e8ecdfc6d3ed41b6794073a311666837fbc9946b49050263d37ab98c2c877c96ac210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f8179820fafafafafafafafafafafafafafafafafafafafafafafafafafafafafafafafa2268747470733a2f2f7075622d6162632e72322e6465762f63646e2f6d617873697a6505fe00b33f7109ffffffffffffff1f0046304402202c2990539461168ac562fee6061498271adc093a4e94c3db9338f845df0800db02206ca3a7c9b2f48f40b1e039293bfe241dc3978f9ad8dfea5b5aa0ff84269bd81c6d6d6d"
+}

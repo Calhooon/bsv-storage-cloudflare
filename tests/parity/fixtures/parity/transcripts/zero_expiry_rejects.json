@@ -1,0 +1,14 @@
+{
+  "_meta": {
+    "ts_sdk_version": "1.10.1",
+    "generated_at": "2026-04-21T15:14:25.947Z",
+    "generator_script": "tests/parity/ts-fixtures/generate.mjs",
+    "seed": "zero_expiry_rejects",
+    "note": "tm_uhrp admission case: expiry_time=0 fails TS check `expiry_time < 1`"
+  },
+  "admin_pub_hex": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+  "label": "zero_expiry_rejects",
+  "expected_admit": false,
+  "reason": "expiry_time=0 fails TS check `expiry_time < 1`",
+  "locking_script_hex": "2103e8ecdfc6d3ed41b6794073a311666837fbc9946b49050263d37ab98c2c877c96ac210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f817982033333333333333333333333333333333333333333333333333333333333333331f68747470733a2f2f7075622d6162632e72322e6465762f63646e2f7a65726f0003fdf4014730450221009f1b2e4dad387eae618f86f6e42b6ebe0b8397dd2bc8f29a97ca350de2be37370220052a963299a1adb75e2893d0331973a1cc124d0f3d4047da8e3e30337ff6dad16d6d6d"
+}

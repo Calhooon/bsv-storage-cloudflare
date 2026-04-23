@@ -1,0 +1,15 @@
+{
+  "name": "parity-overlay-testbed",
+  "version": "0.1.0",
+  "description": "Locally-hosted @bsv/overlay-express stack for hermetic SHIP/SLAP admission parity tests. Not published, not a public interface.",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "dependencies": {
+    "@bsv/overlay-express": "^0.7.5",
+    "mysql2": "^3.11.5"
+  },
+  "_pinning": "Using @bsv/overlay-express@0.7.5 (the latest canonical on npm as of 2026-04-21) which bundles compatible @bsv/overlay, @bsv/overlay-discovery-services, and @bsv/sdk 1.x. npm resolves the full tree. The exact SDK version matters for the bsv-rs Layer-1 goldens — keep this in rough sync with tests/parity/ts-fixtures/package.json (which pins @bsv/sdk 1.10.1). If the admission policy ever diverges, check .package-lock.json here vs there."
+}

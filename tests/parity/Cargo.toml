@@ -1,0 +1,63 @@
+[package]
+name = "parity"
+version = "0.1.0"
+edition = "2021"
+description = "Parity harness: diffs Rust worker JSON against nanostore.babbage.systems byte-for-byte."
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "parity"
+path = "src/main.rs"
+
+# Standalone keypair generator. Uses bsv-rs secp256k1 PrivateKey::random,
+# same source the parity identity loader uses — so any key it emits is a
+# proper BRC-100-compatible identity (32-byte scalar, derived pubkey is the
+# compressed 33-byte point). Usage:
+#   cargo run -p parity --bin keygen
+[[bin]]
+name = "keygen"
+path = "src/bin/keygen.rs"
+
+# Read file bytes from stdin, emit the UHRP URL (raw base58check). Matches
+# `src/uhrp/hash.rs::derive_uhrp_url` byte-for-byte. Usage:
+#   cargo run -p parity --bin uhrp_url < file
+[[bin]]
+name = "uhrp_url"
+path = "src/bin/uhrp_url.rs"
+
+# Native-only dependencies. This crate is NEVER compiled to wasm — the
+# root crate's `cargo check --target wasm32-unknown-unknown` does not pull
+# workspace members in unless `--workspace` is added.
+[dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+sha2 = "0.10"
+hex = "0.4"
+
+# Path dep, matches root crate. Parity harness uses bsv-rs for:
+# - test identity keypair (PrivateKey::random + PublicKey hex export, default features)
+# - BRC-31 mutual auth client (auth + http features — SimplifiedFetchTransport
+#   does the wire-level work against nanostore.babbage.systems and our worker)
+bsv-rs = { path = "../../../bsv-rs", features = ["auth", "http", "overlay"] }
+
+# Request correlation IDs for the BRC-31 client (`src/auth.rs`) — 32 random
+# bytes per in-flight General message so the transport callback can route
+# responses back to the right `oneshot::Sender`. Not security-critical;
+# cryptographic randomness just keeps collisions impossible in practice.
+rand = "0.8"
+
+# async_trait is already pulled in transitively by bsv-rs::auth, but we name
+# it here so `Transport` trait bounds compile cleanly on our wrapper types.
+async-trait = "0.1"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"

@@ -1,0 +1,30 @@
+{
+  "_meta": {
+    "ts_sdk_version": "1.10.1",
+    "generated_at": "2026-04-21T15:14:25.932Z",
+    "generator_script": "tests/parity/ts-fixtures/generate.mjs",
+    "seed": "brc29_payment_large_keyid",
+    "note": "BRC-29 payment: sender derives receiver child, builds P2PKH to it"
+  },
+  "sender_priv_hex": "0000000000000000000000000000000000000000000000000000000000000002",
+  "sender_pub_hex": "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+  "receiver_priv_hex": "0000000000000000000000000000000000000000000000000000000000000003",
+  "receiver_pub_hex": "02f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9",
+  "derivation": {
+    "protocol": [
+      2,
+      "3241645161d8"
+    ],
+    "key_id": "prefix-with-some-length-AAAAAAAA suffix-with-some-length-BBBBBBBB",
+    "derivation_prefix": "prefix-with-some-length-AAAAAAAA",
+    "derivation_suffix": "suffix-with-some-length-BBBBBBBB",
+    "counterparty": "02f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9",
+    "for_self": false
+  },
+  "expected": {
+    "derived_pubkey_hex": "02c258d9ff61559800488b917415488acdaaafb790e9d5f177d9927f18b048290f",
+    "locking_script_hex": "76a914bc29d5fbf7f2575c2c658fa6ac2fd2801b3d584c88ac",
+    "tx_hex": "01000000000110a40000000000001976a914bc29d5fbf7f2575c2c658fa6ac2fd2801b3d584c88ac00000000",
+    "satoshis": 42000
+  }
+}

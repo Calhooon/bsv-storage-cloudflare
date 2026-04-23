@@ -1,0 +1,30 @@
+{
+  "_meta": {
+    "ts_sdk_version": "1.10.1",
+    "generated_at": "2026-04-21T15:14:25.931Z",
+    "generator_script": "tests/parity/ts-fixtures/generate.mjs",
+    "seed": "brc29_payment_basic",
+    "note": "BRC-29 payment: sender derives receiver child, builds P2PKH to it"
+  },
+  "sender_priv_hex": "0000000000000000000000000000000000000000000000000000000000000002",
+  "sender_pub_hex": "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+  "receiver_priv_hex": "0000000000000000000000000000000000000000000000000000000000000003",
+  "receiver_pub_hex": "02f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9",
+  "derivation": {
+    "protocol": [
+      2,
+      "3241645161d8"
+    ],
+    "key_id": "pfx-basic sfx-basic",
+    "derivation_prefix": "pfx-basic",
+    "derivation_suffix": "sfx-basic",
+    "counterparty": "02f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9",
+    "for_self": false
+  },
+  "expected": {
+    "derived_pubkey_hex": "02972c6ab4f07c4b2faa5f64de2ba55b065c093316b9a14f8056b70c9e320522c6",
+    "locking_script_hex": "76a91426560e9a650e8d15cea5e3bf5ecf6a5a910975b788ac",
+    "tx_hex": "010000000001e8030000000000001976a91426560e9a650e8d15cea5e3bf5ecf6a5a910975b788ac00000000",
+    "satoshis": 1000
+  }
+}

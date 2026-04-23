@@ -1,0 +1,14 @@
+{
+  "_meta": {
+    "ts_sdk_version": "1.10.1",
+    "generated_at": "2026-04-21T15:14:25.947Z",
+    "generator_script": "tests/parity/ts-fixtures/generate.mjs",
+    "seed": "valid_admit",
+    "note": "tm_uhrp admission case: all fields correct, https url, sig valid, linkage valid"
+  },
+  "admin_pub_hex": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+  "label": "valid_admit",
+  "expected_admit": true,
+  "reason": "all fields correct, https url, sig valid, linkage valid",
+  "locking_script_hex": "2103e8ecdfc6d3ed41b6794073a311666837fbc9946b49050263d37ab98c2c877c96ac210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f817982011111111111111111111111111111111111111111111111111111111111111111d68747470733a2f2f7075622d6162632e72322e6465762f63646e2f6f6b05fe00b33f7103fdf40146304402207b9d182fb7ac1bf4856886aa3804f4b783f81bc4756beceed3bd3096be81601f022037ee88b55e7a6c7d26cee9eec605b32345be21b62f2b5e688405dee0cce6285f6d6d6d"
+}

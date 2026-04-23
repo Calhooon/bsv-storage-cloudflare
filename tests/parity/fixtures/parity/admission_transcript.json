@@ -1,0 +1,24 @@
+{
+  "_meta": {
+    "ts_sdk_version": "1.10.1",
+    "generated_at": "2026-04-21T15:14:25.922Z",
+    "generator_script": "tests/parity/ts-fixtures/generate.mjs",
+    "seed": "admission_transcript",
+    "note": "tm_uhrp admit decisions on valid + edge PushDrops. Rust cross-validator runs these."
+  },
+  "admin_pub_hex": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+  "cases": [
+    {
+      "label": "valid_future_expiry",
+      "locking_script_hex": "2103e8ecdfc6d3ed41b6794073a311666837fbc9946b49050263d37ab98c2c877c96ac210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f8179820abababababababababababababababababababababababababababababababab2068747470733a2f2f7075622d6162632e72322e6465762f63646e2f76616c696405fe00d2496b03fdf401463044022067633b853976983af213035f574ab778c1a65be829da2c7f9a07a33b5b387d75022013292a6a35766b87041ae1dcbe350a742cf6507b139a6e6198d929cee3498b876d6d6d",
+      "expected_admit": true,
+      "reason": "all fields correct, https url, sig valid, linkage valid"
+    },
+    {
+      "label": "past_expiry_still_admits",
+      "locking_script_hex": "2103e8ecdfc6d3ed41b6794073a311666837fbc9946b49050263d37ab98c2c877c96ac210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f8179820cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd1f68747470733a2f2f7075622d6162632e72322e6465762f63646e2f7061737405fe00f1536501644630440220264c0478d82baf008bf8216fd72717906640fbfb4a1ecfc95a1d7277e9145e8302204affdb8ab77bb5ab83fc725d0632d48f6b8dca926a78abb06dd44f52ab68b2df6d6d6d",
+      "expected_admit": true,
+      "reason": "TS tm_uhrp rejects only expiry<1 (UHRPTopicManager.ts:55); past expiry admits"
+    }
+  ]
+}

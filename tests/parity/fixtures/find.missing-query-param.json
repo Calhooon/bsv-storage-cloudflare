@@ -1,0 +1,1 @@
+{"request":{"method":"GET","path":"/find"},"response":{"body":{"code":"ERR_NO_UHRP_URL","description":"You must provide a uhrpUrl query parameter","status":"error"},"status_code":400},"route":"/find","scenario":"missing-query-param"}

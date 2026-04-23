@@ -1,0 +1,1 @@
+{"request":{"body":{"fileSize":1048576,"retentionPeriod":43200},"method":"POST","path":"/quote"},"response":{"body":{"quote":"$VOLATILE:u64$"},"status_code":200},"route":"/quote","scenario":"small-file"}

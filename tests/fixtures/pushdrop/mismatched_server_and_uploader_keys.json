@@ -1,0 +1,20 @@
+{
+  "name": "mismatched_server_and_uploader_keys",
+  "description": "oracle: @bsv/sdk v1.8.2 PushDrop.lock with [2, 'uhrp advertisement']",
+  "locking_public_key_hex": "0323176c6e72cf211dd17fe2640444f5df3f82b00e78273374adaee681794b9139",
+  "server_identity_key_hex": "025cbdf0646e5db4eaa398f365f2ea7a0e3d419b7e0330e39ce92bddedcac4f9bc",
+  "hash_hex": "1a5ec49a3f32cd56d19732e89bde5d81755ddc0fd8515dc8b226d47654139dca",
+  "url": "https://s.example/cdn/xyz",
+  "expiry_time": 1,
+  "content_length": 0,
+  "signature_hex": "30450221009b64bf7be3459d6994d850c8bdbfe24dfd4836617bb17777c441ceca4be7e96b02207cfa84444d4c4cf2c776f2348a9576b21a17679575c4368676165e48712d61fb",
+  "expected_locking_script_hex": "210323176c6e72cf211dd17fe2640444f5df3f82b00e78273374adaee681794b9139ac21025cbdf0646e5db4eaa398f365f2ea7a0e3d419b7e0330e39ce92bddedcac4f9bc201a5ec49a3f32cd56d19732e89bde5d81755ddc0fd8515dc8b226d47654139dca1968747470733a2f2f732e6578616d706c652f63646e2f78797a51004730450221009b64bf7be3459d6994d850c8bdbfe24dfd4836617bb17777c441ceca4be7e96b02207cfa84444d4c4cf2c776f2348a9576b21a17679575c4368676165e48712d61fb6d6d6d",
+  "field_bytes_hex": {
+    "server_identity_key": "025cbdf0646e5db4eaa398f365f2ea7a0e3d419b7e0330e39ce92bddedcac4f9bc",
+    "hash": "1a5ec49a3f32cd56d19732e89bde5d81755ddc0fd8515dc8b226d47654139dca",
+    "url": "68747470733a2f2f732e6578616d706c652f63646e2f78797a",
+    "expiry_time_varint": "01",
+    "content_length_varint": "00",
+    "signature": "30450221009b64bf7be3459d6994d850c8bdbfe24dfd4836617bb17777c441ceca4be7e96b02207cfa84444d4c4cf2c776f2348a9576b21a17679575c4368676165e48712d61fb"
+  }
+}

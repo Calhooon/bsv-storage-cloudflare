@@ -1,0 +1,35 @@
+{
+  "_meta": {
+    "ts_sdk_version": "1.10.1",
+    "generated_at": "2026-04-21T15:14:25.934Z",
+    "generator_script": "tests/parity/ts-fixtures/generate.mjs",
+    "seed": "sighash_pushdrop_subscript",
+    "note": "BIP-143 sighash preimage with non-P2PKH subscript (PushDrop-shaped bytes)"
+  },
+  "input": {
+    "tx_hex": "010000000111111111111111111111111111111111111111111111111111111111111111110000000000ffffffff0101000000000000001976a914cccccccccccccccccccccccccccccccccccccccc88ac00000000",
+    "inputs": [
+      {
+        "source_txid": "1111111111111111111111111111111111111111111111111111111111111111",
+        "source_vout": 0,
+        "source_satoshis": 1,
+        "source_locking_script_hex": "2102e14da90ec43a7c1b7898cc9d1fe0e1d2c4e4e7d6f8d1c5e5f7e9d3c5e7f9a1b3ac20aabbccddeeff001122334455667788aabbccddeeff001122334455667788aabb6d6d",
+        "sequence": 4294967295
+      }
+    ],
+    "outputs": [
+      {
+        "satoshis": 1,
+        "locking_script_hex": "76a914cccccccccccccccccccccccccccccccccccccccc88ac"
+      }
+    ],
+    "input_index": 0,
+    "version": 1,
+    "locktime": 0,
+    "scope": 65
+  },
+  "expected": {
+    "preimage_hex": "0100000055e107cafb9fb7b336f385783df483239dabc2fceb8d5843986bc75c6877b2713bb13029ce7b1f559ef5e747fcac439f1455a2ec7c5f09b72290795e70665044111111111111111111111111111111111111111111111111111111111111111100000000462102e14da90ec43a7c1b7898cc9d1fe0e1d2c4e4e7d6f8d1c5e5f7e9d3c5e7f9a1b3ac20aabbccddeeff001122334455667788aabbccddeeff001122334455667788aabb6d6d0100000000000000ffffffff9fe581be2ef6fec89f482024d9e8242d11b03171d82153503e629a1cbd1bfc540000000041000000",
+    "sighash_digest_hex": "3f6eb940de1128867a8c5fcc324c6b8df144a13c9cef8f9235ad48b8fa5c1e8a"
+  }
+}

@@ -1,0 +1,35 @@
+{
+  "_meta": {
+    "ts_sdk_version": "1.10.1",
+    "generated_at": "2026-04-21T15:14:25.933Z",
+    "generator_script": "tests/parity/ts-fixtures/generate.mjs",
+    "seed": "sighash_p2pkh_1input",
+    "note": "BIP-143 sighash preimage: single P2PKH input, SIGHASH_ALL|FORKID"
+  },
+  "input": {
+    "tx_hex": "010000000111111111111111111111111111111111111111111111111111111111111111110000000000ffffffff01b8820100000000001976a914cccccccccccccccccccccccccccccccccccccccc88ac00000000",
+    "inputs": [
+      {
+        "source_txid": "1111111111111111111111111111111111111111111111111111111111111111",
+        "source_vout": 0,
+        "source_satoshis": 100000,
+        "source_locking_script_hex": "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac",
+        "sequence": 4294967295
+      }
+    ],
+    "outputs": [
+      {
+        "satoshis": 99000,
+        "locking_script_hex": "76a914cccccccccccccccccccccccccccccccccccccccc88ac"
+      }
+    ],
+    "input_index": 0,
+    "version": 1,
+    "locktime": 0,
+    "scope": 65
+  },
+  "expected": {
+    "preimage_hex": "0100000055e107cafb9fb7b336f385783df483239dabc2fceb8d5843986bc75c6877b2713bb13029ce7b1f559ef5e747fcac439f1455a2ec7c5f09b72290795e706650441111111111111111111111111111111111111111111111111111111111111111000000001976a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88aca086010000000000ffffffffb70b199d079bd3a4d318ea3630208341d7ae620ab3e37c1f94eea0bbda3dbefb0000000041000000",
+    "sighash_digest_hex": "cc6366b1b6e00bd79805fdaa44a89f9ee6a956b2c14b4af7766ea38af22a118f"
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "_meta": {
+    "ts_sdk_version": "1.10.1",
+    "generated_at": "2026-04-21T15:14:25.948Z",
+    "generator_script": "tests/parity/ts-fixtures/generate.mjs",
+    "seed": "bad_varint_expiry_rejects",
+    "note": "tm_uhrp admission case: expiry varint byte sequence does not decode"
+  },
+  "admin_pub_hex": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+  "label": "bad_varint_expiry_rejects",
+  "expected_admit": false,
+  "reason": "expiry varint byte sequence does not decode",
+  "locking_script_hex": "210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798ac210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f817982088888888888888888888888888888888888888888888888888888888888888882468747470733a2f2f7075622d6162632e72322e6465762f63646e2f626164766172696e7401ff03fdf4010830060201010201016d6d6d"
+}

@@ -1,0 +1,22 @@
+{
+  "_meta": {
+    "ts_sdk_version": "1.10.1",
+    "generated_at": "2026-04-21T15:14:25.917Z",
+    "generator_script": "tests/parity/ts-fixtures/generate.mjs",
+    "seed": "brc42_brc29_payment_to_admin",
+    "note": "BRC-42 child pubkey derivation"
+  },
+  "admin_priv_hex": "0000000000000000000000000000000000000000000000000000000000000001",
+  "input": {
+    "protocol": [
+      2,
+      "3241645161d8"
+    ],
+    "key_id": "prefix1 suffix1",
+    "counterparty": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+    "for_self": false
+  },
+  "expected": {
+    "derived_pubkey_hex": "02e04784795a19b9077f360d9a6a5e39b2f3920417b5df7f7b7e5849ef2432acac"
+  }
+}

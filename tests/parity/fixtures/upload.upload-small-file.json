@@ -1,0 +1,1 @@
+{"request":{"body":{"fileSize":1048576,"retentionPeriod":43200},"method":"POST","path":"/upload"},"response":{"body":{"amount":"$VOLATILE:u64$","description":"File can now be uploaded.","requiredHeaders":"$VOLATILE:string_map$","status":"success","uploadURL":"$VOLATILE:string$"},"status_code":200},"route":"/upload","scenario":"upload-small-file"}

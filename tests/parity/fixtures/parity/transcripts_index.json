@@ -1,0 +1,108 @@
+{
+  "_meta": {
+    "ts_sdk_version": "1.10.1",
+    "generated_at": "2026-04-21T15:14:25.949Z",
+    "generator_script": "tests/parity/ts-fixtures/generate.mjs",
+    "seed": "transcripts_index",
+    "note": "Index of per-case tm_uhrp admission fixtures"
+  },
+  "admin_pub_hex": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+  "cases": [
+    {
+      "label": "valid_admit",
+      "expected_admit": true,
+      "reason": "all fields correct, https url, sig valid, linkage valid",
+      "locking_script_hex": "2103e8ecdfc6d3ed41b6794073a311666837fbc9946b49050263d37ab98c2c877c96ac210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f817982011111111111111111111111111111111111111111111111111111111111111111d68747470733a2f2f7075622d6162632e72322e6465762f63646e2f6f6b05fe00b33f7103fdf40146304402207b9d182fb7ac1bf4856886aa3804f4b783f81bc4756beceed3bd3096be81601f022037ee88b55e7a6c7d26cee9eec605b32345be21b62f2b5e688405dee0cce6285f6d6d6d"
+    },
+    {
+      "label": "past_expiry_admits",
+      "expected_admit": true,
+      "reason": "TS tm_uhrp only rejects expiry<1; past expiry admits",
+      "locking_script_hex": "2103e8ecdfc6d3ed41b6794073a311666837fbc9946b49050263d37ab98c2c877c96ac210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f817982022222222222222222222222222222222222222222222222222222222222222221f68747470733a2f2f7075622d6162632e72322e6465762f63646e2f7061737405fe00ca9a3b03fdf401473045022100e93e6e2579c35f1b74592c50a4bf5effe4398219d041277ed47dd612aaed52e202207c1c58dce43d268e195dacd76e18ae5aef3383b4ac9c3f11aa3933bf1b7f250d6d6d6d"
+    },
+    {
+      "label": "zero_expiry_rejects",
+      "expected_admit": false,
+      "reason": "expiry_time=0 fails TS check `expiry_time < 1`",
+      "locking_script_hex": "2103e8ecdfc6d3ed41b6794073a311666837fbc9946b49050263d37ab98c2c877c96ac210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f817982033333333333333333333333333333333333333333333333333333333333333331f68747470733a2f2f7075622d6162632e72322e6465762f63646e2f7a65726f0003fdf4014730450221009f1b2e4dad387eae618f86f6e42b6ebe0b8397dd2bc8f29a97ca350de2be37370220052a963299a1adb75e2893d0331973a1cc124d0f3d4047da8e3e30337ff6dad16d6d6d"
+    },
+    {
+      "label": "http_scheme_rejects",
+      "expected_admit": false,
+      "reason": "URL scheme must be https; http:// rejects",
+      "locking_script_hex": "2103e8ecdfc6d3ed41b6794073a311666837fbc9946b49050263d37ab98c2c877c96ac210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f8179820444444444444444444444444444444444444444444444444444444444444444422687474703a2f2f7075622d6162632e72322e6465762f63646e2f696e73656375726505fe00b33f7103fdf40146304402201f6d303fed108531e29bb6ff50de78dff9f4718b16c28bcb1ab15c9b8c942b960220070fd3a15b6857909bb4c5c85fa8a5a968f1a91454aba5a0d8a9a4bb414b4f396d6d6d"
+    },
+    {
+      "label": "ftp_scheme_rejects",
+      "expected_admit": false,
+      "reason": "URL scheme must be https; ftp:// rejects",
+      "locking_script_hex": "2103e8ecdfc6d3ed41b6794073a311666837fbc9946b49050263d37ab98c2c877c96ac210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798205555555555555555555555555555555555555555555555555555555555555555226674703a2f2f7075622d6162632e72322e6465762f63646e2f6f6c647363686f6f6c05fe00b33f7103fdf401473045022100e8b3aa2fb07bcf14b3b4a0f99e5ac56f6b9d2852fdb79bd39a5db9d94dfcd8ca022071c0be0d29507eb3374a47943f8ec378444965de0de742617ba3cf9552351f646d6d6d"
+    },
+    {
+      "label": "bad_hash_length_31_rejects",
+      "expected_admit": false,
+      "reason": "field[1] hash must be 32 bytes",
+      "locking_script_hex": "210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798ac210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f817981f666666666666666666666666666666666666666666666666666666666666662268747470733a2f2f7075622d6162632e72322e6465762f63646e2f6261646861736805fe00b33f7103fdf4010830060201010201016d6d6d"
+    },
+    {
+      "label": "bad_identity_key_32_bytes_rejects",
+      "expected_admit": false,
+      "reason": "field[0] identity pubkey must be 33 bytes (compressed)",
+      "locking_script_hex": "210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798ac2077777777777777777777777777777777777777777777777777777777777777772066666666666666666666666666666666666666666666666666666666666666662068747470733a2f2f7075622d6162632e72322e6465762f63646e2f626164696405fe00b33f7103fdf4010830060201010201016d6d6d"
+    },
+    {
+      "label": "bad_varint_expiry_rejects",
+      "expected_admit": false,
+      "reason": "expiry varint byte sequence does not decode",
+      "locking_script_hex": "210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798ac210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f817982088888888888888888888888888888888888888888888888888888888888888882468747470733a2f2f7075622d6162632e72322e6465762f63646e2f626164766172696e7401ff03fdf4010830060201010201016d6d6d"
+    },
+    {
+      "label": "empty_signature_rejects",
+      "expected_admit": false,
+      "reason": "signature slot is empty; verify rejects",
+      "locking_script_hex": "210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798ac210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f817982099999999999999999999999999999999999999999999999999999999999999992368747470733a2f2f7075622d6162632e72322e6465762f63646e2f656d70747973696705fe00b33f7103fdf401006d6d6d"
+    },
+    {
+      "label": "bad_signature_wrong_key_rejects",
+      "expected_admit": false,
+      "reason": "valid DER shape but not signed by the author — verify fails",
+      "locking_script_hex": "210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798ac210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f8179820aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa2168747470733a2f2f7075622d6162632e72322e6465762f63646e2f62616473696705fe00b33f7103fdf40146304402207777777777777777777777777777777777777777777777777777777777777777022088888888888888888888888888888888888888888888888888888888888888886d6d6d"
+    },
+    {
+      "label": "bad_linkage_rejects",
+      "expected_admit": false,
+      "reason": "locking pubkey is not the BRC-42 child of identity+protocol",
+      "locking_script_hex": "21025cbdf0646e5db4eaa398f365f2ea7a0e3d419b7e0330e39ce92bddedcac4f9bcac210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f8179820bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb2268747470733a2f2f7075622d6162632e72322e6465762f63646e2f6261646c696e6b05fe00b33f7103fdf4010830060201010201016d6d6d"
+    },
+    {
+      "label": "too_few_fields_rejects",
+      "expected_admit": false,
+      "reason": "4 fields total (3 data + junk sig) — fails `< 5` check",
+      "locking_script_hex": "210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798ac210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f8179820cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc2168747470733a2f2f7075622d6162632e72322e6465762f63646e2f746f6f6665770830060201010201016d6d"
+    },
+    {
+      "label": "too_many_fields_rejects",
+      "expected_admit": false,
+      "reason": "6 data fields + sig = 7 pushed fields; Rust validator requires exactly 6",
+      "locking_script_hex": "210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798ac210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f8179820dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd2268747470733a2f2f7075622d6162632e72322e6465762f63646e2f746f6f6d616e7905fe00b33f7103fdf401030102030830060201010201016d6d6d75"
+    },
+    {
+      "label": "non_pushdrop_rejects",
+      "expected_admit": false,
+      "reason": "script is not a PushDrop shape at all (OP_RETURN + data)",
+      "locking_script_hex": "6a04deadbeef"
+    },
+    {
+      "label": "zero_content_length_rejects",
+      "expected_admit": false,
+      "reason": "content_length=0 fails TS `file_size < 1` check",
+      "locking_script_hex": "2103e8ecdfc6d3ed41b6794073a311666837fbc9946b49050263d37ab98c2c877c96ac210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f8179820eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee2368747470733a2f2f7075622d6162632e72322e6465762f63646e2f7a65726f73697a6505fe00b33f7100473045022100accaca45aa57fff0a133c592879f9b8deaa42b7f010417434362ac3f195ccb0b02205fb8f0a2d410df1ea084c615e017da1206666c138dd5349d76eaf8a71abfcd7b6d6d6d"
+    },
+    {
+      "label": "max_content_length_admits",
+      "expected_admit": true,
+      "reason": "max JS-representable u53 content length still admits (TS only checks file_size<1)",
+      "locking_script_hex": "2103e8ecdfc6d3ed41b6794073a311666837fbc9946b49050263d37ab98c2c877c96ac210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f8179820fafafafafafafafafafafafafafafafafafafafafafafafafafafafafafafafa2268747470733a2f2f7075622d6162632e72322e6465762f63646e2f6d617873697a6505fe00b33f7109ffffffffffffff1f0046304402202c2990539461168ac562fee6061498271adc093a4e94c3db9338f845df0800db02206ca3a7c9b2f48f40b1e039293bfe241dc3978f9ad8dfea5b5aa0ff84269bd81c6d6d6d"
+    }
+  ]
+}

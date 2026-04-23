@@ -1,0 +1,18 @@
+target/
+build/
+node_modules/
+.wrangler/
+.dev.vars
+.dev.vars.*
+*.swp
+.DS_Store
+
+# Deployment secrets — never committed. Local-only, same pattern as rust-chaintracks.
+secrets.md
+**/secrets.md
+
+# Parity harness — local-only, never committed.
+# .identity.json holds a test BRC-31 private key (chmod 600 on unix).
+# .captures.log is an append-only forensic log of capture runs.
+tests/parity/.identity.json
+tests/parity/.captures.log

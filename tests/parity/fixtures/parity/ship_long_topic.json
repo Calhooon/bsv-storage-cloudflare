@@ -1,0 +1,17 @@
+{
+  "_meta": {
+    "ts_sdk_version": "1.10.1",
+    "generated_at": "2026-04-21T15:14:25.907Z",
+    "generator_script": "tests/parity/ts-fixtures/generate.mjs",
+    "seed": "ship_long_topic",
+    "note": "SHIP advertisement PushDrop — protocol=[2,\"service host interconnect\"]"
+  },
+  "admin_priv_hex": "0000000000000000000000000000000000000000000000000000000000000001",
+  "input": {
+    "domain": "https://overlay.example.com",
+    "topic": "tm_some_very_specific_descriptor_topic"
+  },
+  "expected": {
+    "locking_script_hex": "2102d7245996c0abb8323c4780f4e7c5f7938e5498e35daa5325641df6fa5129f86bac0453484950210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f817981b68747470733a2f2f6f7665726c61792e6578616d706c652e636f6d26746d5f736f6d655f766572795f73706563696669635f64657363726970746f725f746f70696346304402205bd5be4bc2d1066c9914004d88b0fa4e89c89463ca2785655bb1456dac3d926f02202c02a36656a72081deb5287a3c3cff6a2aa73c2c49f05997443cfa093d5a460c6d6d75"
+  }
+}

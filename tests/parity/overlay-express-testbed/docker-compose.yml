@@ -1,0 +1,40 @@
+# Local MongoDB + MySQL for the overlay-express testbed. Both containers
+# are ephemeral (tmpfs-backed) — `docker compose down -v` returns the
+# stack to a clean slate. We avoid in-process SQLite because native
+# bindings (`better-sqlite3`, `sqlite3`) keep failing to link on recent
+# Node/darwin-arm64 builds; MySQL in a container works everywhere.
+services:
+  mongo:
+    image: mongo:7
+    container_name: parity-overlay-mongo
+    # Non-standard host port so this doesn't clash with a default
+    # :27017 you may already have running.
+    ports:
+      - "127.0.0.1:27018:27017"
+    command: ["--noauth", "--bind_ip_all"]
+    tmpfs:
+      - /data/db
+
+  mysql:
+    # Pin to 8.0 (not 8.4) — 8.4 removed `default-authentication-plugin`
+    # and several knex-facing defaults changed. 8.0 is widely deployed
+    # and what most production stacks still run.
+    image: mysql:8.0
+    container_name: parity-overlay-mysql
+    ports:
+      - "127.0.0.1:13306:3306"
+    environment:
+      # Empty root password is fine — the port only binds on 127.0.0.1
+      # and all data is tmpfs. This container is disposable.
+      MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+      MYSQL_DATABASE: overlay
+    tmpfs:
+      - /var/lib/mysql
+    healthcheck:
+      # Mysql takes ~10s to get past init. The overlay boot-script
+      # waits on this before connecting via Knex.
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+      start_period: 20s

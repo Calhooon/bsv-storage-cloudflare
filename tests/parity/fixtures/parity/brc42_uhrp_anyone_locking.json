@@ -1,0 +1,22 @@
+{
+  "_meta": {
+    "ts_sdk_version": "1.10.1",
+    "generated_at": "2026-04-21T15:14:25.914Z",
+    "generator_script": "tests/parity/ts-fixtures/generate.mjs",
+    "seed": "brc42_uhrp_anyone_locking",
+    "note": "BRC-42 child pubkey derivation"
+  },
+  "admin_priv_hex": "0000000000000000000000000000000000000000000000000000000000000001",
+  "input": {
+    "protocol": [
+      2,
+      "uhrp advertisement"
+    ],
+    "key_id": "1",
+    "counterparty": "anyone",
+    "for_self": true
+  },
+  "expected": {
+    "derived_pubkey_hex": "03e8ecdfc6d3ed41b6794073a311666837fbc9946b49050263d37ab98c2c877c96"
+  }
+}

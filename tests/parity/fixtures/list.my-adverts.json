@@ -1,0 +1,1 @@
+{"request":{"method":"GET","path":"/list"},"response":{"body":{"status":"success","uploads":[]},"status_code":200},"route":"/list","scenario":"my-adverts"}

@@ -1,0 +1,10 @@
+{
+  "name": "one_mib_plus_one_byte_repeating",
+  "description": "oracle: @bsv/sdk v1.8.2 StorageUtils.getURLForFile",
+  "uhrp_url": "XUTNUhYdSQo62uifs995WSJg9vye8qQyhoybKTAXf7tiuxfQGeWh",
+  "hash_hex": "3ee3f8980540c09b7751e902004b8db5f37ec956d369ff22ff602dd5b3e06621",
+  "file_pattern": {
+    "repeat_byte": 163,
+    "count": 1048577
+  }
+}

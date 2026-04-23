@@ -1,0 +1,14 @@
+{
+  "_meta": {
+    "ts_sdk_version": "1.10.1",
+    "generated_at": "2026-04-21T15:14:25.948Z",
+    "generator_script": "tests/parity/ts-fixtures/generate.mjs",
+    "seed": "non_pushdrop_rejects",
+    "note": "tm_uhrp admission case: script is not a PushDrop shape at all (OP_RETURN + data)"
+  },
+  "admin_pub_hex": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+  "label": "non_pushdrop_rejects",
+  "expected_admit": false,
+  "reason": "script is not a PushDrop shape at all (OP_RETURN + data)",
+  "locking_script_hex": "6a04deadbeef"
+}

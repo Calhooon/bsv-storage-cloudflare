@@ -1,0 +1,14 @@
+{
+  "_meta": {
+    "ts_sdk_version": "1.10.1",
+    "generated_at": "2026-04-21T15:14:25.948Z",
+    "generator_script": "tests/parity/ts-fixtures/generate.mjs",
+    "seed": "too_many_fields_rejects",
+    "note": "tm_uhrp admission case: 6 data fields + sig = 7 pushed fields; Rust validator requires exactly 6"
+  },
+  "admin_pub_hex": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+  "label": "too_many_fields_rejects",
+  "expected_admit": false,
+  "reason": "6 data fields + sig = 7 pushed fields; Rust validator requires exactly 6",
+  "locking_script_hex": "210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798ac210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f8179820dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd2268747470733a2f2f7075622d6162632e72322e6465762f63646e2f746f6f6d616e7905fe00b33f7103fdf401030102030830060201010201016d6d6d75"
+}

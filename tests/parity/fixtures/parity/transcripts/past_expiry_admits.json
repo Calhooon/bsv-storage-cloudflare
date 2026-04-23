@@ -1,0 +1,14 @@
+{
+  "_meta": {
+    "ts_sdk_version": "1.10.1",
+    "generated_at": "2026-04-21T15:14:25.947Z",
+    "generator_script": "tests/parity/ts-fixtures/generate.mjs",
+    "seed": "past_expiry_admits",
+    "note": "tm_uhrp admission case: TS tm_uhrp only rejects expiry<1; past expiry admits"
+  },
+  "admin_pub_hex": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+  "label": "past_expiry_admits",
+  "expected_admit": true,
+  "reason": "TS tm_uhrp only rejects expiry<1; past expiry admits",
+  "locking_script_hex": "2103e8ecdfc6d3ed41b6794073a311666837fbc9946b49050263d37ab98c2c877c96ac210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f817982022222222222222222222222222222222222222222222222222222222222222221f68747470733a2f2f7075622d6162632e72322e6465762f63646e2f7061737405fe00ca9a3b03fdf401473045022100e93e6e2579c35f1b74592c50a4bf5effe4398219d041277ed47dd612aaed52e202207c1c58dce43d268e195dacd76e18ae5aef3383b4ac9c3f11aa3933bf1b7f250d6d6d6d"
+}

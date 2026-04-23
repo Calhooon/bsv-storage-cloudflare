@@ -1,0 +1,21 @@
+{
+  "name": "bsv-storage-parity-fixtures",
+  "version": "1.0.0",
+  "description": "Generates canonical protocol-byte fixtures from the exact @bsv/* versions nanostore.babbage.systems runs.",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "generate": "node generate.mjs",
+    "generate:verbose": "node generate.mjs --verbose"
+  },
+  "dependencies": {
+    "@bsv/sdk": "1.10.1",
+    "@bsv/overlay": "0.6.0"
+  },
+  "bsvStorageParity": {
+    "matchingNanostoreDeployment": {
+      "source": "~/bsv/uhrp-services/backend/package.json + package-lock.json",
+      "verified_at": "2026-04-21"
+    }
+  }
+}

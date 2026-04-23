@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Refuses the commit if the local quality gates fail.
+# Install with: ./scripts/install-hooks.sh
+set -euo pipefail
+
+./scripts/check.sh

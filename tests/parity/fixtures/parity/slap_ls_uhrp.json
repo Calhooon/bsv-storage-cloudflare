@@ -1,0 +1,17 @@
+{
+  "_meta": {
+    "ts_sdk_version": "1.10.1",
+    "generated_at": "2026-04-21T15:14:25.911Z",
+    "generator_script": "tests/parity/ts-fixtures/generate.mjs",
+    "seed": "slap_ls_uhrp",
+    "note": "SLAP advertisement PushDrop — protocol=[2,\"service lookup availability\"]"
+  },
+  "admin_priv_hex": "0000000000000000000000000000000000000000000000000000000000000001",
+  "input": {
+    "domain": "https://overlay.example.com",
+    "service": "ls_uhrp"
+  },
+  "expected": {
+    "locking_script_hex": "2102b333cd66503a8e369c238e71e3559133fb9a216c81564dafc640c94989cfe06fac04534c4150210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f817981b68747470733a2f2f6f7665726c61792e6578616d706c652e636f6d076c735f75687270463044022012010a941d8ad94b3fffad4ca69a17d34921b119d076983b5c7832a66965e055022020fb4aa5aa5d7acccfcb284f34f65cb5f30be999b3dc8b86be378980d5e008656d6d75"
+  }
+}

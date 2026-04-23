@@ -1,0 +1,21 @@
+{
+  "_meta": {
+    "ts_sdk_version": "1.10.1",
+    "generated_at": "2026-04-21T15:14:25.900Z",
+    "generator_script": "tests/parity/ts-fixtures/generate.mjs",
+    "seed": "uhrp_past_expiry_ts_parity",
+    "note": "UHRP advertisement PushDrop — protocol=[2,\"uhrp advertisement\"] keyID=\"1\" counterparty=\"anyone\" forSelf=true"
+  },
+  "admin_priv_hex": "0000000000000000000000000000000000000000000000000000000000000001",
+  "admin_pub_hex": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+  "input": {
+    "url": "https://pub-abc.r2.dev/cdn/expired",
+    "hash_hex": "0101010101010101010101010101010101010101010101010101010101010101",
+    "expiry_time": 1700000000,
+    "content_length": 100
+  },
+  "expected": {
+    "locking_script_hex": "2103e8ecdfc6d3ed41b6794073a311666837fbc9946b49050263d37ab98c2c877c96ac210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f817982001010101010101010101010101010101010101010101010101010101010101012268747470733a2f2f7075622d6162632e72322e6465762f63646e2f6578706972656405fe00f1536501644630440220158bff2aca7b0277cd92d7a24156762944a5f847f51bd3951cff46b43cf1bd3202200b898d834a29458c7827f7ed54e0f2bc9b1688ff17a6e566a8591ceadc903a736d6d6d",
+    "script_length": 219
+  }
+}

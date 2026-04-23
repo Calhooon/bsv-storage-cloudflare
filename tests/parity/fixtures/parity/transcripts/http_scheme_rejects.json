@@ -1,0 +1,14 @@
+{
+  "_meta": {
+    "ts_sdk_version": "1.10.1",
+    "generated_at": "2026-04-21T15:14:25.948Z",
+    "generator_script": "tests/parity/ts-fixtures/generate.mjs",
+    "seed": "http_scheme_rejects",
+    "note": "tm_uhrp admission case: URL scheme must be https; http:// rejects"
+  },
+  "admin_pub_hex": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+  "label": "http_scheme_rejects",
+  "expected_admit": false,
+  "reason": "URL scheme must be https; http:// rejects",
+  "locking_script_hex": "2103e8ecdfc6d3ed41b6794073a311666837fbc9946b49050263d37ab98c2c877c96ac210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f8179820444444444444444444444444444444444444444444444444444444444444444422687474703a2f2f7075622d6162632e72322e6465762f63646e2f696e73656375726505fe00b33f7103fdf40146304402201f6d303fed108531e29bb6ff50de78dff9f4718b16c28bcb1ab15c9b8c942b960220070fd3a15b6857909bb4c5c85fa8a5a968f1a91454aba5a0d8a9a4bb414b4f396d6d6d"
+}

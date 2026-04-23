@@ -1,0 +1,94 @@
+name = "bsv-storage-cloudflare"
+main = "build/worker/shim.mjs"
+compatibility_date = "2024-01-01"
+# account_id = "<your-cloudflare-account-id>"
+
+# Custom domain — configure after initial deploy
+# routes = [
+#   { pattern = "storage.example.com", custom_domain = true }
+# ]
+
+[vars]
+BSV_NETWORK = "mainnet"
+# wallet-infra JSON-RPC endpoint. Spin up your own rust-wallet-infra
+# deployment and put its URL here.
+WALLET_STORAGE_URL = "https://<your-wallet-infra-host>"
+# Overlay submit HOST (no `/submit` suffix). The broadcaster appends `/submit`
+# itself; setting `.../submit` here would silently produce `.../submit/submit`
+# and 404 every advert. Point at your own rust-overlay deployment for a
+# self-hosted round-trip. If unset, falls back to the canonical BSVA mainnet
+# overlay (see DEFAULT_OVERLAY_URL in src/overlay/mod.rs).
+OVERLAY_SUBMIT_URL = "https://<your-overlay-host>"
+# Public base URL for UHRP file downloads. Set to an R2 custom domain for
+# production, or use Cloudflare's auto-generated r2.dev URL
+# (`wrangler r2 bucket dev-url enable <bucket>`).
+PUBLIC_URL_BASE = "https://<your-r2-public-host>"
+# R2 S3-compat API endpoint host used by the /upload SigV4 presigner.
+# Format: `<CLOUDFLARE_ACCOUNT_ID>.r2.cloudflarestorage.com`.
+R2_S3_ENDPOINT_HOST = "<your-cloudflare-account-id>.r2.cloudflarestorage.com"
+# R2 bucket name (mirrors the `UHRP_FILES` r2_buckets binding below).
+# Set here as a var because SigV4 needs the name in the presigned URL path.
+R2_BUCKET = "uhrp-prod"
+# Monthly USD price per GB (string-parsed to f64). See PROTOCOL.md §D.
+# nanostore.babbage.systems uses "0.03"; this deployment pockets R2's
+# zero-egress advantage as margin by defaulting to "0.05". Tune to taste.
+PRICE_PER_GB_MO = "0.05"
+# Minimum retention in minutes (integer). 0 = no floor. See PROTOCOL.md §1.
+# nanostore.babbage.systems uses "15" — keep for wire parity on error strings.
+MIN_HOSTING_MINUTES = "15"
+
+[build]
+command = "worker-build --release"
+
+# Cross-worker invocation. Cloudflare returns error 1042 on Worker→Worker
+# `*.workers.dev` fetches (the "fetch to a workers.dev URL from a Worker is
+# restricted" path). A service binding uses CF's internal RPC rail instead
+# of the public HTTPS edge, so it's the canonical solution. Point this at
+# a rust-overlay Worker on the SAME Cloudflare account as this Worker.
+[[services]]
+binding = "OVERLAY"
+service = "rust-overlay"
+
+[[kv_namespaces]]
+binding = "AUTH_SESSIONS"
+id = "<your-kv-namespace-id>"
+
+[[r2_buckets]]
+binding = "UHRP_FILES"
+bucket_name = "uhrp-prod"
+
+# Queue consumer for post-upload work (R2 event → tm_uhrp advert + indexing).
+# The R2 bucket `uhrp-prod` must be configured (dashboard or wrangler) to
+# emit PutObject/CompleteMultipartUpload events onto the `uhrp-post-upload`
+# queue. The consumer handler lives in `src/lib.rs` (#[event(queue)]);
+# processing is in `src/queue/mod.rs`.
+#
+# max_batch_size=10 + max_batch_timeout=30s is a conservative default: each
+# message triggers a full wallet-infra + overlay round-trip (~3-5s wall time),
+# so larger batches risk hitting the 30s Worker CPU cap under burst load.
+# The producer binding is kept for manual enqueue fallback (tests, reprocess
+# tooling) even though the primary writer is R2 itself.
+[[queues.producers]]
+binding = "POST_UPLOAD_QUEUE"
+queue = "uhrp-post-upload"
+
+[[queues.consumers]]
+queue = "uhrp-post-upload"
+max_batch_size = 10
+max_batch_timeout = 30
+max_retries = 3
+
+# Secrets (set via `npx wrangler secret put <NAME>`):
+#   SERVER_PRIVATE_KEY       — BRC-31 server identity (hex)
+#   ADMIN_WALLET_PRIVATE_KEY — signs PushDrop UHRP advertisements
+#   ADMIN_IDENTITY_KEYS      — comma-separated hex pubkeys allowed to call
+#                              /advertise. Case-sensitive (lowercase). Whitespace
+#                              around commas is trimmed; empty entries are
+#                              ignored. Consumed by src/routes/advertise.rs.
+#   R2_ACCESS_KEY_ID         — R2 S3-API access key (for the presigner)
+#   R2_SECRET_ACCESS_KEY     — R2 S3-API secret key (for the presigner)
+
+# OVERLAY_SUBMIT_URL (set above under [vars]): overlay HOST url (no path).
+# Consumed by src/overlay/mod.rs for both /advertise and /renew. The Worker
+# POSTs raw tx bytes to `{OVERLAY_SUBMIT_URL}/submit` with
+# `X-Topics: ["tm_uhrp"]` for UHRP-advert admission.

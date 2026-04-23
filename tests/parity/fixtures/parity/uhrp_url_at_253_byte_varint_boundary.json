@@ -1,0 +1,21 @@
+{
+  "_meta": {
+    "ts_sdk_version": "1.10.1",
+    "generated_at": "2026-04-21T15:14:25.894Z",
+    "generator_script": "tests/parity/ts-fixtures/generate.mjs",
+    "seed": "uhrp_url_at_253_byte_varint_boundary",
+    "note": "UHRP advertisement PushDrop — protocol=[2,\"uhrp advertisement\"] keyID=\"1\" counterparty=\"anyone\" forSelf=true"
+  },
+  "admin_priv_hex": "0000000000000000000000000000000000000000000000000000000000000001",
+  "admin_pub_hex": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+  "input": {
+    "url": "https://pub-abc.r2.dev/cdn/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    "hash_hex": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "expiry_time": 1900000000,
+    "content_length": 1024
+  },
+  "expected": {
+    "locking_script_hex": "2103e8ecdfc6d3ed41b6794073a311666837fbc9946b49050263d37ab98c2c877c96ac210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f8179820bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb4cfd68747470733a2f2f7075622d6162632e72322e6465762f63646e2f7878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787805fe00b33f7103fd000446304402202a555ba68938d6af65bd2d591aca5cde67e5e2196d850b3c9b4da2859f589bc50220664754e9bf7d52cb54ce5618c76f2fb743f9164845ba79ebf4b78a0bde1c96946d6d6d",
+    "script_length": 441
+  }
+}

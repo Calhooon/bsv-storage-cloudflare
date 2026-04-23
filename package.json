@@ -1,0 +1,15 @@
+{
+  "name": "bsv-storage-cloudflare",
+  "version": "0.1.0",
+  "private": true,
+  "description": "UHRP file-storage server on Cloudflare Workers (Rust/WASM).",
+  "scripts": {
+    "dev": "wrangler dev",
+    "build": "worker-build --release",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail"
+  },
+  "devDependencies": {
+    "wrangler": "^3.80.0"
+  }
+}

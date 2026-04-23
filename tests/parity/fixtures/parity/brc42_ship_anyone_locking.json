@@ -1,0 +1,22 @@
+{
+  "_meta": {
+    "ts_sdk_version": "1.10.1",
+    "generated_at": "2026-04-21T15:14:25.916Z",
+    "generator_script": "tests/parity/ts-fixtures/generate.mjs",
+    "seed": "brc42_ship_anyone_locking",
+    "note": "BRC-42 child pubkey derivation"
+  },
+  "admin_priv_hex": "0000000000000000000000000000000000000000000000000000000000000001",
+  "input": {
+    "protocol": [
+      2,
+      "service host interconnect"
+    ],
+    "key_id": "1",
+    "counterparty": "anyone",
+    "for_self": true
+  },
+  "expected": {
+    "derived_pubkey_hex": "02d7245996c0abb8323c4780f4e7c5f7938e5498e35daa5325641df6fa5129f86b"
+  }
+}

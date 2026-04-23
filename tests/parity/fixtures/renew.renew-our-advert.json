@@ -1,0 +1,1 @@
+{"request":{"body":{"additionalMinutes":43200,"uhrpUrl":"uhrp://XUT76BxnjKMchLyNe1VuQRxkvLVSLD21QXwM4JywLKabu"},"method":"POST","path":"/renew"},"response":{"body":{"code":"ERR_OLD_ADVERTISEMENT_NOT_FOUND","description":"Couldn't find old advertisement output.","status":"error"},"status_code":404},"route":"/renew","scenario":"renew-our-advert"}
