@@ -150,20 +150,21 @@ src/
 │   ├── upload.rs          # R2 SigV4 presign
 │   ├── find.rs            # metadata lookup
 │   ├── list.rs            # caller's files
-│   ├── renew.rs           # BRC-29-paid expiry extension
+│   ├── renew.rs           # BRC-29-paid expiry extension, priced from the on-chain advert
 │   └── advertise.rs       # admin-gated tm_uhrp SHIP broadcast
 ├── uhrp/
 │   ├── hash.rs            # UHRP URL derivation (PROTOCOL.md §A)
 │   └── pushdrop.rs        # PushDrop field construction (§B)
 ├── storage/
 │   ├── presign.rs         # R2 S3-compatible SigV4 signer
+│   ├── custom_time.rs     # /renew extends R2 custom-time via same-key copy
 │   └── head.rs            # R2 HEAD → metadata
 ├── wallet/
 │   ├── client.rs          # JSON-RPC to wallet-infra (createAction)
 │   ├── signer.rs          # ECDSA signing via bsv-rs (WASM-safe)
 │   └── brc42.rs           # BRC-42 key derivation
 ├── overlay/mod.rs          # SHIP /submit with Steak-body admission check
-├── queue/mod.rs            # R2 event → post-upload processing
+├── queue/mod.rs            # R2 event → post-upload processing (dup-advert guard)
 ├── validation.rs           # request validation; never trust raw bytes
 ├── types.rs                # every wire shape is a named struct
 └── error.rs                # project-wide error codes
@@ -257,7 +258,7 @@ cargo fmt --all -- --check
 cargo clippy --target wasm32-unknown-unknown --all-targets -- -D warnings
 cargo check  --target wasm32-unknown-unknown
 cargo test   --lib
-worker-build --release
+cargo install -q worker-build@0.8.4 && worker-build --release
 ```
 
 Non-negotiables:

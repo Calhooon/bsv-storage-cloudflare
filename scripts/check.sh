@@ -21,6 +21,6 @@ echo "==> cargo test --lib"
 cargo test --lib
 
 echo "==> worker-build --release"
-worker-build --release
+cargo install -q worker-build@0.8.4 && worker-build --release
 
 echo "all gates green"

@@ -28,7 +28,7 @@ echo "==> Pre-deploy quality gates"
 ./scripts/check.sh
 
 echo "==> worker-build --release"
-worker-build --release
+cargo install -q worker-build@0.8.4 && worker-build --release
 
 echo "==> wrangler deploy"
 # Capture output so we can extract the worker URL and echo it back.

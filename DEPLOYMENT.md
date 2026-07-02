@@ -12,11 +12,11 @@ Operator guide for a first deploy, DNS cutover from `nanostore.babbage.systems`,
 - **CF API token** with these scopes: `Workers Scripts:Edit`, `Workers KV Storage:Edit`, `Workers R2 Storage:Edit`, `Queues:Edit`. Store in `secrets.md` (gitignored). The token value lives there; this doc only references `CLOUDFLARE_API_TOKEN` by name.
 - **Tools**:
   - Rust stable + the `wasm32-unknown-unknown` target: `rustup target add wasm32-unknown-unknown`
-  - `worker-build` 0.1.x: `cargo install worker-build`
+  - `worker-build` 0.8.4 (exactly — `check.sh`/`deploy.sh` self-pin it; 0.8.5 is NOT compatible with this repo's toolchain pairing): `cargo install worker-build@0.8.4`
   - Node + `wrangler` 3.x: `npm install` (this repo's `devDependencies` pins it)
   - `jq` (for `deploy-setup.sh` output parsing)
 
-Success: `wrangler --version` prints `⛅️ wrangler 3.x.x`, `worker-build --version` prints `worker-build 0.1.x`, and `cargo check --target wasm32-unknown-unknown` succeeds at the repo root.
+Success: `wrangler --version` prints `⛅️ wrangler 3.x.x`, `worker-build --version` prints `worker-build 0.8.4`, and `cargo check --target wasm32-unknown-unknown` succeeds at the repo root.
 
 ---
 
@@ -123,7 +123,7 @@ Why `object-create` specifically: our queue consumer (`src/queue/mod.rs`) only a
 ./scripts/deploy.sh
 # or equivalently:
 export CLOUDFLARE_API_TOKEN="<from secrets.md>"
-worker-build --release
+cargo install -q worker-build@0.8.4 && worker-build --release
 npm run deploy
 ```
 

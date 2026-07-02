@@ -22,7 +22,7 @@ pitch, architecture diagram, and deploy steps.
 ```bash
 npm install              # installs wrangler
 npm run dev              # local dev server (R2 emulated)
-worker-build --release   # build WASM binary
+cargo install -q worker-build@0.8.4 && worker-build --release   # build WASM binary (0.8.4 exactly)
 npm run deploy           # deploy to Cloudflare
 ```
 
@@ -47,6 +47,13 @@ Request → lib.rs (fetch) → BRC-31 auth → route dispatch → R2 + wallet-in
 - **`overlay/mod.rs`** — SHIP `/submit` client with the Steak-body admission
   check (an overlay that HTTP-200s with an empty `outputsToAdmit` for your
   topic has silently dropped you, and the client must learn about it).
+- **`queue/mod.rs`** — post-upload consumer. Carries a dup-advert guard:
+  `/renew`'s custom-time copy re-fires the R2 object-create event, and the
+  guard asks the wallet whether an unexpired advert already covers the
+  object before minting a new one (also makes advert creation idempotent
+  under at-least-once queue redelivery).
+- **`storage/custom_time.rs`** — `/renew` extends an object's R2
+  `custom-time` via a same-key copy (R2 has no metadata-patch API).
 - **`validation.rs`** — request-body validation; never trust raw bytes in
   handlers.
 - **`types.rs`** — every request/response shape is a named struct (no
@@ -90,7 +97,7 @@ cargo fmt --all -- --check                                            # 1. Forma
 cargo clippy --target wasm32-unknown-unknown --all-targets -- -D warnings  # 2. Zero warnings
 cargo check --target wasm32-unknown-unknown                           # 3. Compiles to WASM
 cargo test --lib                                                      # 4. Unit tests
-worker-build --release                                                # 5. WASM binary builds
+cargo install -q worker-build@0.8.4 && worker-build --release        # 5. WASM binary builds
 ```
 
 Install the pre-commit hook once:
