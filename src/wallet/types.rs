@@ -251,6 +251,10 @@ pub struct ListOutputsRequest {
     /// Include tag list on each output.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub include_tags: Option<bool>,
+    /// Include each output's locking script (wallet-toolbox
+    /// `includeLockingScripts`) — /renew prices from PushDrop field 4.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include_locking_scripts: Option<bool>,
     /// Max rows to return. wallet-infra caps this server-side.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,

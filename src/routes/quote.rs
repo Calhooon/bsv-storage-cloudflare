@@ -181,7 +181,9 @@ pub async fn compute_price_from_env(file_size: f64, retention_period: f64, env: 
 }
 
 /// Compute satoshi price per PROTOCOL.md §D. Pure — no I/O, unit-testable.
-fn compute_sat_price(
+/// `pub(crate)` so `/renew`'s tests can assert the field-4-derived file size
+/// feeds the exact same formula `/quote` and `/upload` charge with.
+pub(crate) fn compute_sat_price(
     file_size_bytes: f64,
     retention_minutes: f64,
     price_per_gb_mo_usd: f64,

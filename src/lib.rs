@@ -239,18 +239,61 @@ async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
         }
     }
 
-    // `/renew` is the second paid route (PROTOCOL.md §5). Pricing depends on
-    // `fileSize` derived from the on-chain advertisement (not the request
-    // body). In this first cut, we pass a flat 0 price into the payment
-    // middleware so the client can reach the handler without payment — the
-    // handler itself returns `amount: 0` in the response (see the
-    // route-module doc note). The parity harness will flag this if TS
-    // sends a non-zero amount; that's a known follow-up.
+    // `/renew` is the second paid route (PROTOCOL.md §5). `fileSize` is NOT
+    // in the request body — `routes::renew::prepare` reads it from field 4
+    // of the old advertisement's PushDrop (bound to on-chain data, never
+    // client claims) in a single pre-payment listOutputs round-trip. The
+    // prepared context is threaded into the handler so the lookup never
+    // runs twice. Price uses the exact `/quote` formula, and the
+    // 402/payment plumbing below mirrors `/upload`'s line for line.
     if method == Method::Post && path == "/renew" {
-        let calc_price = move |_: &Request| -> u64 { 0 };
+        let prepared = routes::renew::prepare(&request_body, &env).await;
+        // `None` = free pass (malformed body / advert not found / lookup
+        // failure) — the handler then emits the correct 400/404/500 without
+        // the client having paid for it.
+        let price = match prepared.price_inputs() {
+            Some((fs, minutes)) => routes::quote::compute_price_from_env(fs, minutes, &env).await,
+            None => 0,
+        };
+        // Short-circuit: if the client didn't provide `x-bsv-payment`, build
+        // and sign the 402 inline (poc-server pattern). Skipping process_payment
+        // here is intentional — wrapping its pre-built Response forces a
+        // serde_json round-trip that produces body bytes ≠ what we sign, which
+        // @bsv/sdk rejects via MetaNet Client's verifySignature RPC.
+        if price > 0
+            && req
+                .headers()
+                .get(payment_headers::PAYMENT)
+                .ok()
+                .flatten()
+                .is_none()
+        {
+            return match session {
+                Some(ref s) => build_signed_402(price, s, &server_key).await,
+                None => {
+                    // No session means AuthFetch wouldn't be able to verify
+                    // either way — fall through to middleware's unsigned 402
+                    // as a minimal error surface.
+                    let payment_options = PaymentMiddlewareOptions::new(
+                        server_key.clone(),
+                        move |_: &Request| -> u64 { price },
+                    );
+                    match process_payment(&req, &auth_context, &payment_options)
+                        .await
+                        .map_err(|e| Error::from(e.to_string()))?
+                    {
+                        PaymentResult::Required(r) | PaymentResult::Failed(r) => Ok(r),
+                        _ => Ok(Response::from_json(&json!({"status": "error"}))?.with_status(500)),
+                    }
+                }
+            };
+        }
+        // Annotate closure arg type explicitly so the HRTB on
+        // `process_payment::<F>`'s `F: Fn(&Request) -> u64` bound is satisfied.
+        let calc_price = move |_: &Request| -> u64 { price };
         // Payment must internalize against the SAME wallet server /advertise
         // draws funds from. Middleware default is storage.babbage.systems; override
-        // with our WALLET_STORAGE_URL so /upload payments land where /advertise
+        // with our WALLET_STORAGE_URL so /renew payments land where /advertise
         // can see them.
         let wallet_url = env
             .var("WALLET_STORAGE_URL")
@@ -264,7 +307,15 @@ async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
             .map_err(|e| Error::from(e.to_string()))?;
         match payment_result {
             PaymentResult::Free | PaymentResult::Verified(_) => {
-                let (body, status) = routes::renew::handle(&request_body, identity_key, &env).await;
+                if let PaymentResult::Verified(ref ctx) = payment_result {
+                    console_error!(
+                        "renew: payment verified, accepted={} sats_paid={}",
+                        ctx.accepted,
+                        ctx.satoshis_paid
+                    );
+                }
+                let (body, status) =
+                    routes::renew::handle(&request_body, identity_key, price, prepared, &env).await;
                 return match session {
                     Some(ref s) => sign_json_response(&body, status, &[], s)
                         .map_err(|e| Error::from(e.to_string())),
@@ -296,7 +347,6 @@ async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
             let url = req.url().map_err(|e| Error::from(e.to_string()))?;
             routes::list::handle(&url, &request_body, identity_key, &env).await
         }
-        (Method::Post, "/renew") => routes::renew::handle(&request_body, identity_key, &env).await,
         (Method::Post, "/advertise") => {
             routes::advertise::handle(&request_body, identity_key, &env).await
         }

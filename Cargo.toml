@@ -1,6 +1,6 @@
 [package]
 name = "bsv-storage-cloudflare"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "UHRP file-storage server on Cloudflare Workers. Protocol-compatible Rust/WASM port of @bsv/uhrp-storage-server (nanostore.babbage.systems)."
 license = "MIT OR Apache-2.0"
@@ -13,7 +13,10 @@ categories = ["web-programming", "wasm"]
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-worker = { version = "0.7", features = ["queue"] }
+# 0.8 to match bsv-middleware-cloudflare 0.2 (its worker-0.8 line). Two
+# simultaneous `worker` versions cannot coexist — the middleware's
+# `Response`/`Env` types must be THIS crate's types.
+worker = { version = "0.8", features = ["queue"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 serde-wasm-bindgen = "0.6"
@@ -29,8 +32,8 @@ sha2 = "0.10"
 # SigV4 for R2 S3-compatible presigned URLs.
 hmac = "0.12"
 
-bsv-middleware-cloudflare = "0.1.2"
-bsv-rs = { version = "0.3.7", features = ["auth", "wallet", "transaction", "script", "overlay", "wasm"] }
+bsv-middleware-cloudflare = "0.2.0"
+bsv-rs = { version = "0.3.13", features = ["auth", "wallet", "transaction", "script", "overlay", "wasm"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }

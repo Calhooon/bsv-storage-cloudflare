@@ -74,6 +74,7 @@ pub async fn handle(_url: &Url, body: &[u8], identity_key: &str, env: &Env) -> (
         tag_query_mode: Some("all".to_string()),
         include: None,
         include_tags: Some(true),
+        include_locking_scripts: None,
         limit: Some(limit),
         offset: Some(offset),
     };

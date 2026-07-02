@@ -506,26 +506,33 @@ fn build_advert_bundle(
 /// We inline this here rather than exposing a helper from `uhrp::hash`
 /// because `/advertise` is the first caller that needs URL → hash (hash.rs
 /// is bytes → URL only). If a third caller shows up, promote to `uhrp::hash`.
-fn uhrp_url_to_hash(url: &str) -> Option<[u8; 32]> {
+pub(crate) fn uhrp_url_to_hash(url: &str) -> Option<[u8; 32]> {
     let body = url.strip_prefix(UHRP_SCHEME).unwrap_or(url);
     let decoded = from_base58(body).ok()?;
-    // Expected layout: 2-byte prefix + 32-byte hash + 4-byte checksum.
-    if decoded.len() != UHRP_VERSION_PREFIX.len() + 32 + 4 {
-        return None;
-    }
-    if decoded[..UHRP_VERSION_PREFIX.len()] != UHRP_VERSION_PREFIX {
-        return None;
-    }
-    let hash_start = UHRP_VERSION_PREFIX.len();
-    let hash_end = hash_start + 32;
-    // Validate checksum so we don't silently accept a mangled URL.
     use bsv_rs::primitives::hash::sha256d;
+    // Canonical layout: 2-byte ce00 prefix + 32-byte hash + 4-byte checksum
+    // (@bsv/sdk StorageUtils.getURLForHash). A 1-byte 0x01 legacy form also
+    // circulated (an early overlay index used it — observed live 2026-07-02
+    // when a renewal 404'd on a perfectly valid hash); accept it too, with
+    // its own checksum validated, so any faithful encoding of the same hash
+    // renews. Tags/advertisements are always built from the CANONICAL form.
+    let prefix_len = if decoded.len() == UHRP_VERSION_PREFIX.len() + 32 + 4
+        && decoded[..UHRP_VERSION_PREFIX.len()] == UHRP_VERSION_PREFIX
+    {
+        UHRP_VERSION_PREFIX.len()
+    } else if decoded.len() == 1 + 32 + 4 && decoded[0] == 0x01 {
+        1
+    } else {
+        return None;
+    };
+    let hash_end = prefix_len + 32;
+    // Validate checksum so we don't silently accept a mangled URL.
     let checksum = sha256d(&decoded[..hash_end]);
     if checksum[..4] != decoded[hash_end..] {
         return None;
     }
     let mut out = [0u8; 32];
-    out.copy_from_slice(&decoded[hash_start..hash_end]);
+    out.copy_from_slice(&decoded[prefix_len..hash_end]);
     Some(out)
 }
 
@@ -607,6 +614,30 @@ mod tests {
     }
 
     // ── uhrp_url_to_hash: round-trip with derive_uhrp_url ──────────────────
+
+    #[test]
+    fn uhrp_url_to_hash_accepts_legacy_0x01_form() {
+        // The 1-byte 0x01 legacy encoding must decode to the same hash as
+        // the canonical ce00 form (live 2026-07-02 interop fix).
+        let hash = [0x5au8; 32];
+        let canonical = format!("uhrp://{}", crate::uhrp::hash::url_from_hash(&hash));
+        let mut legacy_payload = vec![0x01];
+        legacy_payload.extend_from_slice(&hash);
+        let checksum = bsv_rs::primitives::hash::sha256d(&legacy_payload);
+        legacy_payload.extend_from_slice(&checksum[..4]);
+        let legacy = format!(
+            "uhrp://{}",
+            bsv_rs::primitives::encoding::to_base58(&legacy_payload)
+        );
+        assert_eq!(uhrp_url_to_hash(&canonical), Some(hash));
+        assert_eq!(uhrp_url_to_hash(&legacy), Some(hash));
+        // A mangled legacy checksum still refuses.
+        let mut bad = legacy_payload.clone();
+        let n = bad.len();
+        bad[n - 1] ^= 0xff;
+        let bad_url = format!("uhrp://{}", bsv_rs::primitives::encoding::to_base58(&bad));
+        assert_eq!(uhrp_url_to_hash(&bad_url), None);
+    }
 
     #[test]
     fn uhrp_url_to_hash_roundtrips() {

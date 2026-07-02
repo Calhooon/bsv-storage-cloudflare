@@ -336,6 +336,7 @@ mod tests {
             tag_query_mode: Some("all".to_string()),
             include: Some("entire transactions".to_string()),
             include_tags: Some(true),
+            include_locking_scripts: None,
             limit: Some(200),
             offset: None,
         };

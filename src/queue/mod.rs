@@ -40,8 +40,11 @@ use serde::{Deserialize, Serialize};
 use worker::{console_log, Env, MessageBatch, MessageExt};
 
 use crate::routes::advertise::create_advertisement;
+use crate::routes::upload::CUSTOM_TIME_BUFFER_SECONDS;
 use crate::storage::head::{head_object, UHRP_BINDING};
 use crate::uhrp::hash::url_from_hash;
+use crate::wallet::client::Wallet;
+use crate::wallet::types::{ListOutputsRequest, OutputItem};
 
 /// R2 custom metadata key carrying the BRC-31 identity key of the uploader.
 /// Set on the PUT via `x-amz-meta-uploaderidentitykey`. R2 lowercases custom
@@ -58,6 +61,13 @@ const METADATA_KEY_CUSTOM_TIME: &str = "custom-time";
 /// Key prefix for UHRP-advertised objects. Matches TS notifier's
 /// `if (!file.name.startsWith('cdn/'))` guard in `notifier/notifier.js:30`.
 const UHRP_KEY_PREFIX: &str = "cdn/";
+
+/// Basket + tag prefixes for the dup-advert guard's `listOutputs` query.
+/// Mirrors the private constants in `routes::renew` / `routes::advertise`
+/// (kept local per module by house convention).
+const UHRP_BASKET: &str = "uhrp advertisements";
+const OBJECT_ID_TAG_PREFIX: &str = "object_identifier_";
+const EXPIRY_TAG_PREFIX: &str = "expiry_time_";
 
 /// Minimum length of an object identifier past the `cdn/` prefix. Base58 of
 /// 16 random bytes produces 22 characters; anything shorter is either a
@@ -256,6 +266,41 @@ pub async fn process_message(event: &R2EventMessage, env: &Env) -> ProcessOutcom
         }
     };
 
+    // ── Dup-advert guard ──────────────────────────────────────────────────
+    // `/renew` extends the object's `custom-time` via a same-key copy
+    // (`storage::custom_time`), and that copy re-fires this object-create
+    // event. Without a guard we'd mint a second on-chain advert for an
+    // object whose renewed advert already exists. Ground truth lives in the
+    // wallet: skip when an unexpired, unspent advert for this object
+    // already covers the object's custom-time horizon. Checking the wallet
+    // (rather than a metadata marker stamped by the copy) also makes advert
+    // creation idempotent under CF Queues' at-least-once redelivery and
+    // under client re-PUTs through a still-valid presigned URL — any event
+    // whose advert already exists is skipped regardless of who wrote the
+    // object. Runs BEFORE the full-body SHA-256 so renewal copies never pay
+    // the memory-heavy hash.
+    match advert_already_covers(env, object_identifier, expiry_time).await {
+        Ok(true) => {
+            console_log!(
+                "queue: advert already covers custom-time={expiry_time} key={} — skipping (renewal copy or redelivery)",
+                event.object.key
+            );
+            return ProcessOutcome::Skipped;
+        }
+        Ok(false) => {}
+        Err(code) => {
+            // Fail closed: a transient wallet failure here must not mint a
+            // possibly-duplicate advert. Retry re-runs the guard; if the
+            // wallet is genuinely down, `create_advertisement` would have
+            // failed into the same retry path anyway.
+            console_log!(
+                "queue: dup-advert guard failed code={code} key={}",
+                event.object.key
+            );
+            return ProcessOutcome::Retry;
+        }
+    }
+
     // ── Stream bytes and SHA-256 them (UHRP hash derivation) ─────────────
     let hash = match hash_r2_object(env, UHRP_BINDING, &event.object.key).await {
         Ok(h) => h,
@@ -341,6 +386,68 @@ fn parse_custom_time_to_unix_seconds(raw: &str) -> Option<u64> {
         return None;
     }
     Some(secs as u64)
+}
+
+/// Ask wallet-infra whether an advert for `object_identifier` already
+/// covers the object's `custom-time` horizon (the dup-advert guard's I/O
+/// half; the predicate itself is [`covering_advert_exists`]).
+///
+/// Queries the `uhrp advertisements` basket by `object_identifier_<hex>`
+/// tag — the same tag both `/advertise`-created and `/renew`-created
+/// adverts carry — with `include_tags` so the predicate can read each
+/// output's `expiry_time_*`.
+async fn advert_already_covers(
+    env: &Env,
+    object_identifier: &str,
+    custom_time_secs: u64,
+) -> Result<bool, &'static str> {
+    let wallet = Wallet::from_env(env)?;
+    let list_req = ListOutputsRequest {
+        basket: UHRP_BASKET.to_string(),
+        tags: vec![format!(
+            "{OBJECT_ID_TAG_PREFIX}{}",
+            hex::encode(object_identifier.as_bytes())
+        )],
+        tag_query_mode: Some("all".to_string()),
+        // Tags only — no locking scripts / transactions; this is the cheap
+        // query variant (cf. `/renew`'s "entire transactions").
+        include: None,
+        include_tags: Some(true),
+        include_locking_scripts: None,
+        limit: Some(200),
+        offset: Some(0),
+    };
+    let list_result = wallet.list_outputs(&list_req).await?;
+    let now_secs = (js_sys::Date::now() / 1000.0) as u64;
+    Ok(covering_advert_exists(
+        &list_result.outputs,
+        custom_time_secs,
+        now_secs,
+    ))
+}
+
+/// Pure dup-advert predicate: does any unexpired, unspent advert already
+/// cover `custom_time_secs`?
+///
+/// The advert this consumer would mint from the event carries
+/// `expiryTime == custom_time_secs` verbatim (see `process_message`),
+/// while `/renew`'s on-chain expiry EXCLUDES the 300 s buffer that
+/// custom-time carries (`custom-time = newExpiry + 300`). Tolerate the
+/// buffer: any spendable advert whose expiry reaches
+/// `custom_time_secs − 300` — and hasn't already lapsed — covers this
+/// object, so a fresh advert would be a duplicate.
+fn covering_advert_exists(outputs: &[OutputItem], custom_time_secs: u64, now_secs: u64) -> bool {
+    let threshold = custom_time_secs.saturating_sub(CUSTOM_TIME_BUFFER_SECONDS);
+    outputs.iter().any(|out| {
+        out.spendable
+            && out.tags.as_ref().is_some_and(|tags| {
+                tags.iter().any(|t| {
+                    t.strip_prefix(EXPIRY_TAG_PREFIX)
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .is_some_and(|expiry| expiry >= threshold && expiry > now_secs)
+                })
+            })
+    })
 }
 
 /// SHA-256 of an R2 object's bytes. The object must already exist (caller
@@ -525,6 +632,84 @@ mod tests {
             parse_custom_time_to_unix_seconds("1900-01-01T00:00:00Z"),
             None
         );
+    }
+
+    // ── Dup-advert guard predicate ────────────────────────────────────────
+
+    use crate::wallet::types::Outpoint;
+
+    fn advert_output(expiry_tag: Option<u64>, spendable: bool) -> OutputItem {
+        let mut tags = vec![format!(
+            "{OBJECT_ID_TAG_PREFIX}{}",
+            hex::encode("obj1".as_bytes())
+        )];
+        if let Some(e) = expiry_tag {
+            tags.push(format!("{EXPIRY_TAG_PREFIX}{e}"));
+        }
+        OutputItem {
+            satoshis: 1,
+            outpoint: Outpoint {
+                txid: "00".repeat(32),
+                vout: 0,
+            },
+            spendable,
+            tags: Some(tags),
+            locking_script: None,
+        }
+    }
+
+    #[test]
+    fn dup_guard_skips_when_unexpired_advert_covers_custom_time() {
+        // Renewal shape: /renew minted expiry=10_000, then stamped
+        // custom-time = 10_300. The renewed advert covers the copy event.
+        let outputs = vec![advert_output(Some(10_000), true)];
+        assert!(covering_advert_exists(&outputs, 10_300, 5_000));
+    }
+
+    #[test]
+    fn dup_guard_skips_on_redelivery_of_original_upload_event() {
+        // Original upload shape: the queue-created advert's expiry equals
+        // the custom-time verbatim. At-least-once redelivery must skip.
+        let outputs = vec![advert_output(Some(10_300), true)];
+        assert!(covering_advert_exists(&outputs, 10_300, 5_000));
+    }
+
+    #[test]
+    fn dup_guard_allows_when_no_advert_exists() {
+        // Fresh upload: nothing in the basket yet — advertise it.
+        assert!(!covering_advert_exists(&[], 10_300, 5_000));
+    }
+
+    #[test]
+    fn dup_guard_allows_when_advert_already_lapsed() {
+        // An advert that covers the horizon on paper but is already past
+        // expiry doesn't serve anyone — mint a fresh one.
+        let outputs = vec![advert_output(Some(10_000), true)];
+        assert!(!covering_advert_exists(&outputs, 10_300, 11_000));
+    }
+
+    #[test]
+    fn dup_guard_allows_when_advert_below_buffer_threshold() {
+        // Advert expiry short of (custom-time − 300 s buffer): the object
+        // was re-stamped past what's advertised — a new advert is due.
+        let outputs = vec![advert_output(Some(9_999), true)];
+        assert!(!covering_advert_exists(&outputs, 10_300, 5_000));
+    }
+
+    #[test]
+    fn dup_guard_tolerates_exactly_the_custom_time_buffer() {
+        // Boundary: expiry == custom-time − 300 (the exact /renew shape).
+        let outputs = vec![advert_output(Some(10_000), true)];
+        assert!(covering_advert_exists(&outputs, 10_300, 9_999));
+    }
+
+    #[test]
+    fn dup_guard_ignores_spent_and_untagged_outputs() {
+        // A spent (renewed-away) advert or one without an expiry tag never
+        // counts as coverage.
+        let spent = advert_output(Some(999_999), false);
+        let untagged = advert_output(None, true);
+        assert!(!covering_advert_exists(&[spent, untagged], 10_300, 5_000));
     }
 
     // ── ProcessOutcome is a pure enum; assert the triage logic ────────────

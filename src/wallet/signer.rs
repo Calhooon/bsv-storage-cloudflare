@@ -154,15 +154,28 @@ pub fn sign_transaction(
         .zip(decoded_inputs.iter())
         .map(
             |(template_input, di)| -> Result<(PrivateKey, Vec<u8>, Vec<u8>), SignError> {
-                // Try BRC-29 derivation if metadata is present.
+                // Try BRC-29 derivation if prefix+suffix are present. The
+                // sender identity can be MISSING on self-send change UTXOs
+                // (observed live: aborted-broadcast advert rounds left
+                // change whose wallet-infra row carries derivation
+                // prefix/suffix but sender=None → the old code fell back to
+                // the root key and died on WrongKey). Self-change derivation
+                // is symmetric (sender == receiver == us, exactly as the
+                // Step-0 reconstruct above documents), so when the sender is
+                // absent we try OUR OWN identity as the sender candidate.
+                // The hash160-vs-script check below adjudicates — a wrong
+                // guess can never sign.
                 let has_derivation = template_input.derivation_prefix.is_some()
-                    && template_input.derivation_suffix.is_some()
-                    && template_input.sender_identity_key.is_some();
+                    && template_input.derivation_suffix.is_some();
 
                 let signing_key = if has_derivation {
                     let prefix = template_input.derivation_prefix.as_deref().unwrap_or("");
                     let suffix = template_input.derivation_suffix.as_deref().unwrap_or("");
-                    let sender = template_input.sender_identity_key.as_deref().unwrap_or("");
+                    let admin_self_hex = hex::encode(admin_root_pubkey.to_compressed());
+                    let sender = template_input
+                        .sender_identity_key
+                        .as_deref()
+                        .unwrap_or(&admin_self_hex);
                     crate::wallet::brc42::derive_brc29_input_key(admin_key, prefix, suffix, sender)
                         .map_err(|_| SignError::WrongKey)?
                 } else {
@@ -539,16 +552,41 @@ pub fn sign_transaction_mixed(
     let decoded_outputs = decode_outputs(&outputs_patched)?;
 
     // For P2PKH inputs we still enforce the admin-owns-it check so a misconfig
-    // can't silently sign someone else's UTXO. PushDrop inputs have their own
-    // key binding (the locking pubkey in the old advert); we trust the caller
-    // to pass the right derived key.
+    // can't silently sign someone else's UTXO — but "owns" includes BRC-29
+    // children of the admin key: wallet-infra freely allocates derived
+    // payment/change UTXOs as fee inputs, and (observed live on the advert
+    // path) their `sender` metadata can be missing on self-send change, in
+    // which case the sender IS us and the derivation is symmetric. The
+    // hash160 check adjudicates every candidate — a wrong key can never sign.
     let admin_hash160 = admin_key.public_key().hash160();
+    let admin_self_hex = hex::encode(admin_key.public_key().to_compressed());
+    let mut p2pkh_keys: Vec<Option<PrivateKey>> = vec![None; decoded_inputs.len()];
     for (i, di) in decoded_inputs.iter().enumerate() {
         if matches!(unlocks[i], InputUnlock::P2pkh) {
             let input_hash = extract_p2pkh_hash(&di.locking_script)?;
-            if input_hash != admin_hash160 {
-                return Err(SignError::WrongKey);
+            if input_hash == admin_hash160 {
+                p2pkh_keys[i] = Some(admin_key.clone());
+                continue;
             }
+            let template_input = &template.inputs[i];
+            if let (Some(prefix), Some(suffix)) = (
+                template_input.derivation_prefix.as_deref(),
+                template_input.derivation_suffix.as_deref(),
+            ) {
+                let sender = template_input
+                    .sender_identity_key
+                    .as_deref()
+                    .unwrap_or(&admin_self_hex);
+                if let Ok(child) =
+                    crate::wallet::brc42::derive_brc29_input_key(admin_key, prefix, suffix, sender)
+                {
+                    if child.public_key().hash160() == input_hash {
+                        p2pkh_keys[i] = Some(child);
+                        continue;
+                    }
+                }
+            }
+            return Err(SignError::WrongKey);
         }
     }
 
@@ -571,7 +609,6 @@ pub fn sign_transaction_mixed(
 
     let version_i32 = i32::try_from(template.version).map_err(|_| SignError::Parse("version"))?;
 
-    let admin_pubkey_bytes = admin_key.public_key().to_compressed();
     let mut unlocking_scripts: Vec<Vec<u8>> = Vec::with_capacity(decoded_inputs.len());
     for (i, di) in decoded_inputs.iter().enumerate() {
         let params = SighashParams {
@@ -588,10 +625,12 @@ pub fn sign_transaction_mixed(
 
         let unlock_bytes = match &unlocks[i] {
             InputUnlock::P2pkh => {
-                let ecdsa_sig = admin_key.sign(&sighash).map_err(|_| SignError::Crypto)?;
+                let key = p2pkh_keys[i].as_ref().unwrap_or(admin_key);
+                let ecdsa_sig = key.sign(&sighash).map_err(|_| SignError::Crypto)?;
                 let tx_sig = TransactionSignature::new(ecdsa_sig, SCOPE);
                 let sig_bytes = tx_sig.to_checksig_format();
-                build_p2pkh_unlock(&sig_bytes, &admin_pubkey_bytes)?
+                let pubkey_bytes = key.public_key().to_compressed().to_vec();
+                build_p2pkh_unlock(&sig_bytes, &pubkey_bytes)?
             }
             InputUnlock::PushDrop { key } => {
                 let ecdsa_sig = key.sign(&sighash).map_err(|_| SignError::Crypto)?;
@@ -1027,5 +1066,48 @@ mod tests {
             patched[0].locking_script, outputs[0].locking_script,
             "explicit locking_script must pass through unchanged"
         );
+    }
+
+    /// Live regression (2026-07-02): wallet-infra hands back self-send
+    /// change whose row has BRC-29 derivation prefix/suffix but NO sender
+    /// identity (debris from aborted-broadcast rounds). Self-change
+    /// derivation is symmetric — sender == us — so the signer must try our
+    /// own identity, adjudicated by the hash160 check.
+    #[test]
+    fn signs_self_change_input_with_missing_sender() {
+        let admin = admin_key();
+        let prefix = "8nEVJp4ImG7xAruNBQhfDA==";
+        let suffix = "ZGrDCR61UIOfWKemPXg3xA==";
+        let self_hex = hex_encode(&admin.public_key().to_compressed());
+        let child = crate::wallet::brc42::derive_brc29_input_key(&admin, prefix, suffix, &self_hex)
+            .unwrap();
+
+        let mut template = sample_template(&admin);
+        template.inputs[0].source_locking_script = hex_encode(&p2pkh_for_key(&child));
+        template.inputs[0].derivation_prefix = Some(prefix.to_string());
+        template.inputs[0].derivation_suffix = Some(suffix.to_string());
+        template.inputs[0].sender_identity_key = None; // ← the poison
+
+        let signed = sign_transaction(&template, &admin);
+        assert!(
+            signed.is_ok(),
+            "self-change with missing sender must sign: {:?}",
+            signed.err()
+        );
+
+        // A script owned by nobody we can derive must still refuse.
+        let mut foreign = sample_template(&admin);
+        foreign.inputs[0].source_locking_script = {
+            let mut l = vec![0x76, 0xa9, 0x14];
+            l.extend_from_slice(&[0u8; 20]);
+            l.extend_from_slice(&[0x88, 0xac]);
+            hex_encode(&l)
+        };
+        foreign.inputs[0].derivation_prefix = Some(prefix.to_string());
+        foreign.inputs[0].derivation_suffix = Some(suffix.to_string());
+        assert!(matches!(
+            sign_transaction(&foreign, &admin),
+            Err(SignError::WrongKey)
+        ));
     }
 }
