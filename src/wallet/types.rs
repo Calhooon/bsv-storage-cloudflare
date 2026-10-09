@@ -304,7 +304,16 @@ pub struct ListOutputsResult {
     pub outputs: Vec<OutputItem>,
     /// BEEF (raw bytes) covering every output in `outputs` when `include` is
     /// `"entire transactions"`. Empty otherwise.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    ///
+    /// Wire key is the BRC-100 standard uppercase `BEEF` (what wallet-infra
+    /// sends); the lowercase `beef` alias keeps legacy camelCase payloads
+    /// readable.
+    #[serde(
+        default,
+        rename = "BEEF",
+        alias = "beef",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub beef: Vec<u8>,
 }
 

@@ -1,7 +1,7 @@
 //! BRC-103/104 JSON-RPC client to `wallet-infra`.
 //!
 //! The Worker talks to a remote wallet storage service (default:
-//! `https://<your-wallet-infra-host>`) over authenticated JSON-RPC. The
+//! `https://wallet-infra.x402agency.com`) over authenticated JSON-RPC. The
 //! authentication identity is the Worker's `ADMIN_WALLET_PRIVATE_KEY` — the
 //! same key that later signs BEEFs for broadcast, so wallet-infra and the
 //! Worker agree on what "our" outputs are.
@@ -46,11 +46,8 @@ use crate::wallet::types::{
 /// so `parity` and staging can point at different backends.
 pub const WALLET_STORAGE_URL_VAR: &str = "WALLET_STORAGE_URL";
 
-/// Placeholder fallback if `WALLET_STORAGE_URL` is unset. Uses the RFC 2606
-/// reserved `.invalid` TLD so a misconfigured deployment fails loudly on DNS
-/// rather than silently talking to the wrong host. Production deployments
-/// MUST set `WALLET_STORAGE_URL` in `wrangler.toml` to their rust-wallet-infra.
-pub const DEFAULT_WALLET_STORAGE_URL: &str = "https://wallet-infra.invalid";
+/// Production default. Mirrors the value checked in to `wrangler.toml`.
+pub const DEFAULT_WALLET_STORAGE_URL: &str = "https://wallet-infra.x402agency.com";
 
 /// Admin wallet client.
 ///
@@ -68,7 +65,7 @@ pub struct Wallet<'a> {
     ///
     /// Not `Copy`; callers borrow via [`Wallet::private_key`].
     private_key: PrivateKey,
-    /// Wallet-infra endpoint — the rust-wallet-infra JSON-RPC host.
+    /// Wallet-infra endpoint, e.g. `https://wallet-infra.x402agency.com`.
     endpoint_url: String,
     /// Phantom borrow so the type carries the env's lifetime.
     _phantom: core::marker::PhantomData<&'a ()>,
@@ -349,6 +346,41 @@ mod tests {
         // `offset: None` must be omitted, not `null`, to avoid
         // wallet-infra's serde strict-mode tripping on the `i32` type.
         assert!(v.get("offset").is_none());
+    }
+
+    #[test]
+    fn list_outputs_result_reads_uppercase_beef_key() {
+        // wallet-infra sends the BRC-100 standard uppercase `BEEF` key.
+        let v = json!({
+            "totalOutputs": 1,
+            "outputs": [],
+            "BEEF": [1, 2, 3, 4]
+        });
+        let result: ListOutputsResult = serde_json::from_value(v).unwrap();
+        assert_eq!(result.total_outputs, 1);
+        assert_eq!(result.beef, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn list_outputs_result_reads_legacy_lowercase_beef_alias() {
+        // Legacy camelCase payloads stay readable via the serde alias.
+        let v = json!({
+            "totalOutputs": 1,
+            "outputs": [],
+            "beef": [5, 6, 7]
+        });
+        let result: ListOutputsResult = serde_json::from_value(v).unwrap();
+        assert_eq!(result.beef, vec![5, 6, 7]);
+    }
+
+    #[test]
+    fn list_outputs_result_missing_beef_defaults_empty() {
+        let v = json!({
+            "totalOutputs": 0,
+            "outputs": []
+        });
+        let result: ListOutputsResult = serde_json::from_value(v).unwrap();
+        assert!(result.beef.is_empty());
     }
 
     #[test]

@@ -12,7 +12,8 @@
 // under @bsv/sdk are deterministic (RFC 6979), so output is stable across
 // runs — an essential property for a golden fixture.
 //
-// Run from the repo root:
+// Run:
+//     cd /Users/johncalhoun/bsv/bsv-storage-cloudflare
 //     node scripts/gen-pushdrop-fixtures.mjs
 
 import { writeFileSync, mkdirSync } from 'node:fs'

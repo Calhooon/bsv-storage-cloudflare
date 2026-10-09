@@ -493,7 +493,7 @@ mod tests {
     fn parses_real_r2_put_event() {
         // Shape from Cloudflare's R2 event-notification docs as of 2026-04.
         let raw = r#"{
-            "account": "0000000000000000000000000000000000000000000000000000000000000000",
+            "account": "ea3e6d176ed3893258fe34281f710c7f",
             "action": "PutObject",
             "bucket": "uhrp-prod",
             "object": {

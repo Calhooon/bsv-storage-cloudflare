@@ -3,19 +3,16 @@ name = "bsv-storage-cloudflare"
 version = "0.2.0"
 edition = "2021"
 description = "UHRP file-storage server on Cloudflare Workers. Protocol-compatible Rust/WASM port of @bsv/uhrp-storage-server (nanostore.babbage.systems)."
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/calhooon/bsv-storage-cloudflare"
-readme = "README.md"
-keywords = ["bsv", "uhrp", "cloudflare", "workers", "wasm"]
-categories = ["web-programming", "wasm"]
+license = "MIT"
+repository = "https://github.com/Calgooon/bsv-storage-cloudflare"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-# 0.8 to match bsv-middleware-cloudflare 0.2 (its worker-0.8 line). Two
-# simultaneous `worker` versions cannot coexist — the middleware's
-# `Response`/`Env` types must be THIS crate's types.
+# 0.8 to match ../bsv-middleware-cloudflare-public (worker 0.7 → 0.8 there,
+# commit bdb484f). Two simultaneous `worker` versions cannot coexist — the
+# middleware's `Response`/`Env` types must be THIS crate's types.
 worker = { version = "0.8", features = ["queue"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
@@ -29,11 +26,27 @@ js-sys = "0.3"
 hex = "0.4"
 base64 = "0.22"
 sha2 = "0.10"
-# SigV4 for R2 S3-compatible presigned URLs.
+
+bsv-middleware-cloudflare = "=0.4.1"
+bsv-rs = { version = "0.3", features = ["auth", "wallet", "transaction", "script", "wasm"] }
+# SigV4 for R2 S3-compatible presigned URLs (task #4).
 hmac = "0.12"
 
-bsv-middleware-cloudflare = "0.2.0"
-bsv-rs = { version = "0.3.13", features = ["auth", "wallet", "transaction", "script", "overlay", "wasm"] }
+# Overlay wire types — `TaggedBEEF` + `Steak` (via `bsv_rs::overlay::types`)
+# are re-exported by `overlay-engine::types`. Consuming them here lets us
+# drop our duplicate `OverlaySubmitResponse` / `OverlayTopicAdmission`
+# and keep the UHRP advert submit wire-format in lockstep with
+# `rust-overlay`. Compiles cleanly on wasm32-unknown-unknown (the overlay
+# crate is itself deployed as a CF Worker).
+#
+# `overlay-cloudflare::WorkerBroadcaster` is intentionally NOT pulled in
+# here: its `broadcast_to_host` consumes the HTTP response without
+# exposing the body, so we can't run the empty-`outputsToAdmit`
+# rejection check on top. `src/overlay/mod.rs` replicates the same wire
+# contract (headers + Uint8Array body + `/submit` path suffix) and adds
+# the Steak-body check that rust-overlay's own `/submit` endpoint needs
+# (it returns HTTP 200 + empty Steak on silent topic-manager rejection).
+overlay-engine = { path = "../rust-overlay/crates/overlay-engine" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }
@@ -48,9 +61,9 @@ panic = "warn"
 
 # Parity harness — native binary that hits nanostore.babbage.systems and
 # compares against the local worker. Kept as a workspace member so its
-# native-only deps (reqwest, tokio runtime) do NOT leak into the
+# native-only deps (reqwest, tokio runtime, similar) do NOT leak into the
 # wasm32-unknown-unknown build of the root crate. `cargo check --target
 # wasm32-unknown-unknown` at the repo root only builds the root package
-# unless `--workspace` is passed explicitly, so the wasm gate stays green.
+# unless `--workspace` is passed explicitly, so the wasm gate remains green.
 [workspace]
 members = ["tests/parity"]

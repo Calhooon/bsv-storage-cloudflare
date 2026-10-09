@@ -10,48 +10,52 @@ compatibility_date = "2024-01-01"
 
 [vars]
 BSV_NETWORK = "mainnet"
-# wallet-infra JSON-RPC endpoint. Spin up your own rust-wallet-infra
-# deployment and put its URL here.
-WALLET_STORAGE_URL = "https://<your-wallet-infra-host>"
-# Overlay submit HOST (no `/submit` suffix). The broadcaster appends `/submit`
-# itself; setting `.../submit` here would silently produce `.../submit/submit`
-# and 404 every advert. Point at your own rust-overlay deployment for a
-# self-hosted round-trip. If unset, falls back to the canonical BSVA mainnet
-# overlay (see DEFAULT_OVERLAY_URL in src/overlay/mod.rs).
-OVERLAY_SUBMIT_URL = "https://<your-overlay-host>"
+WALLET_STORAGE_URL = "https://wallet-infra.x402agency.com"
+# Overlay submit HOST (no `/submit` suffix). Our `WorkerBroadcaster`-style
+# submit appends `/submit` itself; setting `...foo/submit` here would
+# silently produce `...foo/submit/submit` and 404 every advert.
+# rust-overlay at dev-a3e.workers.dev now registers tm_uhrp + ls_uhrp
+# (see rust-overlay commit feat(uhrp): tm_uhrp + ls_uhrp topic manager
+# and lookup service). Adverts go there instead of bsvb.tech so the
+# round-trip is entirely Calgooon-owned. overlay-us-1.bsvb.tech remains
+# in `bsv_rs::overlay::types::DEFAULT_MAINNET_TRACKERS` as a fallback
+# SLAP tracker but is no longer our primary submit target.
+OVERLAY_SUBMIT_URL = "https://your-worker.your-account.workers.dev"
 # Public base URL for UHRP file downloads. Set to an R2 custom domain for
-# production, or use Cloudflare's auto-generated r2.dev URL
-# (`wrangler r2 bucket dev-url enable <bucket>`).
-PUBLIC_URL_BASE = "https://<your-r2-public-host>"
-# R2 S3-compat API endpoint host used by the /upload SigV4 presigner.
-# Format: `<CLOUDFLARE_ACCOUNT_ID>.r2.cloudflarestorage.com`.
-R2_S3_ENDPOINT_HOST = "<your-cloudflare-account-id>.r2.cloudflarestorage.com"
+# production. For the initial deploy we use Cloudflare's auto-generated
+# r2.dev public URL for bucket `uhrp-prod` (enabled via
+# `wrangler r2 bucket dev-url enable uhrp-prod`).
+PUBLIC_URL_BASE = "https://pub-0c965344954142909622d4c2aed91f87.r2.dev"
+# R2 S3-compat API endpoint host used by the /upload SigV4 presigner
+# (task #4). Format: `<ACCOUNT_ID>.r2.cloudflarestorage.com`.
+R2_S3_ENDPOINT_HOST = "ea3e6d176ed3893258fe34281f710c7f.r2.cloudflarestorage.com"
 # R2 bucket name (mirrors the `UHRP_FILES` r2_buckets binding below).
 # Set here as a var because SigV4 needs the name in the presigned URL path.
 R2_BUCKET = "uhrp-prod"
 # Monthly USD price per GB (string-parsed to f64). See PROTOCOL.md §D.
-# nanostore.babbage.systems uses "0.03"; this deployment pockets R2's
-# zero-egress advantage as margin by defaulting to "0.05". Tune to taste.
+# Diverges from nanostore ($0.03) — R2's zero-egress advantage is pocketed as
+# margin. At $0.05 we profit $0.035/GB-mo (vs $0.015 at parity pricing).
 PRICE_PER_GB_MO = "0.05"
 # Minimum retention in minutes (integer). 0 = no floor. See PROTOCOL.md §1.
-# nanostore.babbage.systems uses "15" — keep for wire parity on error strings.
+# nanostore.babbage.systems uses "15" — matching for wire parity on error strings.
 MIN_HOSTING_MINUTES = "15"
 
 [build]
 command = "worker-build --release"
 
-# Cross-worker invocation. Cloudflare returns error 1042 on Worker→Worker
-# `*.workers.dev` fetches (the "fetch to a workers.dev URL from a Worker is
-# restricted" path). A service binding uses CF's internal RPC rail instead
-# of the public HTTPS edge, so it's the canonical solution. Point this at
-# a rust-overlay Worker on the SAME Cloudflare account as this Worker.
+# Cross-worker invocation. CF returns error 1042 on Worker→Worker *.workers.dev
+# fetches (the "fetch to a workers.dev URL from a Worker is restricted" path).
+# A service binding uses CF's internal RPC rail instead of the public HTTPS
+# edge, so it's the canonical solution. Pinned to the `rust-overlay` Worker
+# on the same account — both run under dev@calhounjohn.com / account
+# ea3e6d176ed3893258fe34281f710c7f.
 [[services]]
 binding = "OVERLAY"
 service = "rust-overlay"
 
 [[kv_namespaces]]
 binding = "AUTH_SESSIONS"
-id = "<your-kv-namespace-id>"
+id = "<your-account-id>"
 
 [[r2_buckets]]
 binding = "UHRP_FILES"
@@ -85,8 +89,8 @@ max_retries = 3
 #                              /advertise. Case-sensitive (lowercase). Whitespace
 #                              around commas is trimmed; empty entries are
 #                              ignored. Consumed by src/routes/advertise.rs.
-#   R2_ACCESS_KEY_ID         — R2 S3-API access key (for the presigner)
-#   R2_SECRET_ACCESS_KEY     — R2 S3-API secret key (for the presigner)
+#   R2_ACCESS_KEY_ID         — R2 S3-API access key (task #4 presigner)
+#   R2_SECRET_ACCESS_KEY     — R2 S3-API secret key (task #4 presigner)
 
 # OVERLAY_SUBMIT_URL (set above under [vars]): overlay HOST url (no path).
 # Consumed by src/overlay/mod.rs for both /advertise and /renew. The Worker

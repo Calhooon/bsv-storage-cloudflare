@@ -156,6 +156,14 @@ uploadURL = bucketFile.getSignedUrl({
 - Route handler: `src/routes/upload.ts:29–98`
 - URL generation: `src/utils/getUploadURL.ts:33–73`
 
+**Rust-port hardening deviation (the-composer #43)**: the R2 presigned PUT
+additionally signs `content-length = fileSize`, and `requiredHeaders` gains a
+third `content-length` entry. The TS reference signs nothing about body size,
+so a client could pay for `fileSize=1` and PUT up to 11 GB; with the size in
+`X-Amz-SignedHeaders`, R2 rejects any PUT whose `Content-Length` differs from
+the quoted-and-paid byte count. Wire shape is otherwise unchanged (parity
+fixtures treat `requiredHeaders` as a volatile string map).
+
 ---
 
 ### 3. `/find` (GET, BRC-31 authenticated)
@@ -1240,5 +1248,5 @@ Response:
 ---
 
 **Document generated**: 2025-04-20  
-**Source codebase**: [`@bsv/uhrp-storage-server`](https://github.com/bsv-blockchain/storage-server) (TS v0.2.1)  
+**Source codebase**: `/Users/johncalhoun/bsv/storage-server/` (TS v0.2.1)  
 **Target port**: Cloudflare Workers (Rust)

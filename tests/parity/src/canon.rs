@@ -848,7 +848,7 @@ mod tests {
                 "x-amz-meta-uploaderidentitykey":
                     "027c0f60f2c5f70788a4b2331c58cc37515fa3ff4ee7acaa16593764e334edde0a",
             },
-            "uploadURL": "https://your-worker.workers.dev/cdn/abc?X-Amz-Signature=...",
+            "uploadURL": "https://your-worker.your-account.workers.dev/cdn/abc?X-Amz-Signature=...",
             "amount": 197,
             "description": "File can now be uploaded.",
         });

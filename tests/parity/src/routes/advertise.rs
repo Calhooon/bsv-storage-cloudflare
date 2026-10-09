@@ -1,11 +1,11 @@
 //! `/advertise` scenarios — see PROTOCOL.md §6.
 //!
 //! **Ours-only**: nanostore's `/advertise` is admin-gated on a shared
-//! `ADMIN_TOKEN` we don't possess. This worker gates on a BRC-31
-//! identity-key allowlist (`ADMIN_IDENTITY_KEYS`). If the parity identity
-//! is added to that allowlist, we can live-fire against the local
-//! deployment (`PARITY_STORAGE_URL`) and prove the response shape
-//! matches the TS-pinned contract.
+//! `ADMIN_TOKEN` we don't possess. Our worker gates on a BRC-31
+//! identity-key allowlist (`ADMIN_IDENTITY_KEYS`). As of 2026-04-21 the
+//! parity identity is added to that allowlist, so we can live-fire
+//! against our deployed worker (`your-worker.your-account.workers.dev`)
+//! and prove the response shape matches the TS-pinned contract.
 //!
 //! The scenario uses an intentionally-malformed `uhrpUrl` so we hit
 //! `ERR_INVALID_REQUEST` without spending any admin-wallet sats or

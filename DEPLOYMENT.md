@@ -12,11 +12,11 @@ Operator guide for a first deploy, DNS cutover from `nanostore.babbage.systems`,
 - **CF API token** with these scopes: `Workers Scripts:Edit`, `Workers KV Storage:Edit`, `Workers R2 Storage:Edit`, `Queues:Edit`. Store in `secrets.md` (gitignored). The token value lives there; this doc only references `CLOUDFLARE_API_TOKEN` by name.
 - **Tools**:
   - Rust stable + the `wasm32-unknown-unknown` target: `rustup target add wasm32-unknown-unknown`
-  - `worker-build` 0.8.4 (exactly — `check.sh`/`deploy.sh` self-pin it; 0.8.5 is NOT compatible with this repo's toolchain pairing): `cargo install worker-build@0.8.4`
+  - `worker-build` 0.1.x: `cargo install worker-build`
   - Node + `wrangler` 3.x: `npm install` (this repo's `devDependencies` pins it)
   - `jq` (for `deploy-setup.sh` output parsing)
 
-Success: `wrangler --version` prints `⛅️ wrangler 3.x.x`, `worker-build --version` prints `worker-build 0.8.4`, and `cargo check --target wasm32-unknown-unknown` succeeds at the repo root.
+Success: `wrangler --version` prints `⛅️ wrangler 3.x.x`, `worker-build --version` prints `worker-build 0.1.x`, and `cargo check --target wasm32-unknown-unknown` succeeds at the repo root.
 
 ---
 
@@ -93,7 +93,7 @@ Edit `wrangler.toml`:
 | Line (approx) | Var | Value |
 |---|---|---|
 | 20 | `PUBLIC_URL_BASE` | Your R2 custom-domain origin — e.g. `"https://storage.example.com"`. Until you cut DNS in Step 9, you can leave this as the R2-default `https://pub-<hash>.r2.dev/uhrp-prod` which R2 gives you when you enable the public bucket — **but only for non-prod testing**. Production must be a custom domain you control. |
-| 23 | `R2_S3_ENDPOINT_HOST` | `"<account_id>.r2.cloudflarestorage.com"` — your Cloudflare account ID followed by `.r2.cloudflarestorage.com`. Get it from the Cloudflare dashboard (URL) or `wrangler whoami`. |
+| 23 | `R2_S3_ENDPOINT_HOST` | `"<account_id>.r2.cloudflarestorage.com"` — e.g. `"ea3e6d176ed3893258fe34281f710c7f.r2.cloudflarestorage.com"`. The account ID is also in `secrets.md`. |
 | 37 | `kv_namespaces[].id` | From Step 1's output. |
 
 ---
@@ -123,7 +123,7 @@ Why `object-create` specifically: our queue consumer (`src/queue/mod.rs`) only a
 ./scripts/deploy.sh
 # or equivalently:
 export CLOUDFLARE_API_TOKEN="<from secrets.md>"
-cargo install -q worker-build@0.8.4 && worker-build --release
+worker-build --release
 npm run deploy
 ```
 

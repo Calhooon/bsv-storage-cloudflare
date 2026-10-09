@@ -28,7 +28,7 @@
 
 #![allow(dead_code)] // Some helpers are consumed only by /advertise or /renew.
 
-use bsv_rs::overlay::types::{Steak, TaggedBEEF};
+use overlay_engine::types::{Steak, TaggedBEEF};
 use worker::{Fetch, Headers, Method, Request, RequestInit};
 
 use crate::error::ERR_OVERLAY_BROADCAST;
@@ -42,11 +42,9 @@ pub const TM_UHRP_TOPIC: &str = "tm_uhrp";
 pub const OVERLAY_SUBMIT_URL_VAR: &str = "OVERLAY_SUBMIT_URL";
 
 /// Production default. Host only; the trailing `/submit` is added by
-/// [`submit_uhrp_advert`]. Set `OVERLAY_SUBMIT_URL` to your own rust-overlay
-/// deployment to keep the round-trip self-hosted; this default falls back to
-/// the public BSVA mainnet overlay so an out-of-the-box deployment still
-/// propagates adverts to the canonical SLAP trackers.
-pub const DEFAULT_OVERLAY_URL: &str = "https://overlay-us-1.bsvb.tech";
+/// [`submit_uhrp_advert`]. Points at the user's deployed rust-overlay so
+/// the port is self-hosted end-to-end by default.
+pub const DEFAULT_OVERLAY_URL: &str = "https://your-worker.your-account.workers.dev";
 
 /// Classification of overlay-submit failures, mapped 1-to-1 onto project
 /// error codes at the route boundary.
@@ -100,7 +98,7 @@ pub fn overlay_url_from_env(env: &worker::Env) -> String {
 /// only if the topic manager admitted at least one output.
 ///
 /// `overlay_host` is the host-only URL (e.g.
-/// `https://your-overlay.workers.dev`); `/submit` is appended by
+/// `https://your-worker.your-account.workers.dev`); `/submit` is appended by
 /// this function, matching [`overlay_cloudflare::broadcaster::WorkerBroadcaster`].
 ///
 /// After the primary submission succeeds, also fans out the same BEEF to any
@@ -450,8 +448,11 @@ mod tests {
         // The URL MUST NOT include a trailing `/submit` — we append it
         // inside `submit_tagged`, matching WorkerBroadcaster's contract.
         // A `/submit/submit` double-path would silently 404 every advert.
+        assert_eq!(
+            DEFAULT_OVERLAY_URL,
+            "https://your-worker.your-account.workers.dev"
+        );
         assert!(!DEFAULT_OVERLAY_URL.ends_with("/submit"));
-        assert!(DEFAULT_OVERLAY_URL.starts_with("https://"));
     }
 
     #[test]

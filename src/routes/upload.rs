@@ -5,6 +5,14 @@
 //! verbatim from the TS source so the parity harness against
 //! nanostore.babbage.systems stays green.
 //!
+//! **One deliberate hardening deviation** (the-composer #43): the presigned
+//! PUT additionally signs `content-length = fileSize`, so R2 rejects any
+//! upload whose size differs from what was quoted and paid. The TS reference
+//! binds nothing about size (see [`required_put_headers`]). `requiredHeaders`
+//! in the response gains a third `content-length` entry accordingly (the
+//! parity fixture treats the map as `$VOLATILE:string_map$`, so the parity
+//! contract is unaffected).
+//!
 //! **Payment ordering**: BRC-29 payment verification runs in `lib.rs` BEFORE
 //! this handler. By the time we're here, the client has paid (or this is a
 //! zero-price free pass, which lib.rs produces for malformed bodies — matching
@@ -138,11 +146,18 @@ pub async fn handle(body: &[u8], identity_key: &str, amount: u64, env: &Env) -> 
 
     // ── Generate presigned URL ───────────────────────────────────────────────
 
-    let (upload_url, required_headers) =
-        match build_presigned_upload(env, &object_identifier, identity_key, expiry_time) {
-            Ok(pair) => pair,
-            Err(_) => return internal_error(),
-        };
+    // `file_size` is a validated positive integer ≤ 11e9, so the cast is
+    // lossless. Signing it into the PUT binds the paid-for size (#43).
+    let (upload_url, required_headers) = match build_presigned_upload(
+        env,
+        &object_identifier,
+        identity_key,
+        expiry_time,
+        file_size as u64,
+    ) {
+        Ok(pair) => pair,
+        Err(_) => return internal_error(),
+    };
 
     // ── Success response (field order: status, uploadURL, requiredHeaders,
     // amount, description — matches TS upload.ts:83–89 exactly) ─────────────
@@ -171,6 +186,42 @@ fn internal_error() -> (Value, u16) {
     )
 }
 
+/// Headers that are part of the presigned-PUT signature and MUST therefore
+/// be echoed (or, for `content-length`, matched) by the client's PUT.
+///
+/// The two `x-amz-meta-*` headers mirror the TS reference's GCS extension
+/// headers (`getUploadURL.ts:59–66`). `content-length` is a **deliberate
+/// hardening deviation** from the TS reference (the-composer #43): the TS
+/// presign signs nothing about body size, so a client could quote+pay for
+/// `fileSize=1` and PUT up to 11 GB at the owner's expense. Signing the
+/// exact paid-for byte count makes R2 itself refuse any PUT whose
+/// `Content-Length` differs — SigV4 verifies every header listed in
+/// `X-Amz-SignedHeaders` against the actual request (AWS SigV4 query-auth
+/// spec; Cloudflare's R2 presigned-URL docs document exactly this pattern
+/// for constraining upload size). HTTP clients set `Content-Length` from
+/// the real body, so an honest upload of exactly `fileSize` bytes needs no
+/// extra work, while a mismatched body fails at R2 with 403 — before any
+/// storage or advertisement cost exists.
+///
+/// Pure so the binding is unit-testable.
+fn required_put_headers(
+    identity_key: &str,
+    custom_time: &str,
+    file_size: u64,
+) -> Vec<(String, String)> {
+    vec![
+        (
+            "x-amz-meta-uploaderidentitykey".to_string(),
+            identity_key.to_string(),
+        ),
+        (
+            "x-amz-meta-custom-time".to_string(),
+            custom_time.to_string(),
+        ),
+        ("content-length".to_string(), file_size.to_string()),
+    ]
+}
+
 /// Assemble R2 SigV4 params from env vars + call [`presign_put`]. Returns
 /// `(uploadURL, requiredHeaders)` on success.
 fn build_presigned_upload(
@@ -178,6 +229,7 @@ fn build_presigned_upload(
     object_identifier: &str,
     identity_key: &str,
     expiry_time: u64,
+    file_size: u64,
 ) -> Result<(String, serde_json::Map<String, Value>), ()> {
     // R2 credentials — set via `wrangler secret put`.
     let access_key_id = env.secret("R2_ACCESS_KEY_ID").map_err(|_| ())?.to_string();
@@ -200,14 +252,9 @@ fn build_presigned_upload(
     // Backend-mapped from TS GCS names:
     //   x-goog-meta-uploaderidentitykey → x-amz-meta-uploaderidentitykey
     //   x-goog-custom-time              → x-amz-meta-custom-time
+    // plus the size-binding `content-length` (see `required_put_headers`).
     // See PROTOCOL.md §C and the ambiguity note in `storage/mod.rs`.
-    let signed_headers = [
-        (
-            "x-amz-meta-uploaderidentitykey".to_string(),
-            identity_key.to_string(),
-        ),
-        ("x-amz-meta-custom-time".to_string(), custom_time.clone()),
-    ];
+    let signed_headers = required_put_headers(identity_key, &custom_time, file_size);
 
     let now_secs = (js_sys::Date::now() / 1000.0) as u64;
     let (amz_date, date_stamp) = format_amz_date(now_secs);
@@ -225,6 +272,10 @@ fn build_presigned_upload(
     });
 
     // Use serde_json::Map to preserve insertion order for the JSON output.
+    // `content-length` rides along in `requiredHeaders` so non-browser
+    // clients know the PUT must carry exactly the paid-for byte count;
+    // browsers ignore it as a forbidden header name and set the real
+    // Content-Length from the body, which is what the signature checks.
     let mut required_headers = serde_json::Map::new();
     for (k, v) in signed_headers {
         required_headers.insert(k, Value::String(v));
@@ -325,6 +376,41 @@ mod tests {
     fn parse_pricing_inputs_invalid_json_returns_none() {
         assert_eq!(parse_pricing_inputs(b"not json"), None);
         assert_eq!(parse_pricing_inputs(b""), None);
+    }
+
+    // ── #43: the presigned PUT binds the paid-for object size ────────────
+
+    #[test]
+    fn required_put_headers_bind_the_exact_content_length() {
+        let headers = required_put_headers("02abc", "2025-05-10T12:00:00.000Z", 1_048_576);
+        assert_eq!(headers.len(), 3);
+        assert_eq!(
+            headers[0],
+            (
+                "x-amz-meta-uploaderidentitykey".to_string(),
+                "02abc".to_string()
+            )
+        );
+        assert_eq!(
+            headers[1],
+            (
+                "x-amz-meta-custom-time".to_string(),
+                "2025-05-10T12:00:00.000Z".to_string()
+            )
+        );
+        assert_eq!(
+            headers[2],
+            ("content-length".to_string(), "1048576".to_string())
+        );
+    }
+
+    #[test]
+    fn required_put_headers_one_byte_quote_binds_one_byte() {
+        // The audit's abuse case: quote fileSize=1 (1000-sat floor), then
+        // PUT gigabytes. With content-length signed, the presigned URL only
+        // admits a body of exactly 1 byte.
+        let headers = required_put_headers("02abc", "t", 1);
+        assert!(headers.contains(&("content-length".to_string(), "1".to_string())));
     }
 
     #[test]

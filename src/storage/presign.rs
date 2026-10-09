@@ -61,8 +61,11 @@ pub struct PresignParams<'a> {
     /// provides it rather than deriving to avoid out-of-sync bugs.
     pub date_stamp: &'a str,
     /// Extra headers that are part of the signature and MUST be echoed by the
-    /// client. `Host` is added automatically — don't include it here.
-    /// Keys are lowercased when signing; values are trimmed.
+    /// client (`x-amz-meta-*` user metadata, and `content-length` to pin the
+    /// exact object size — R2 verifies every header in `X-Amz-SignedHeaders`
+    /// against the actual PUT, so a mismatched body size fails the signature
+    /// check server-side). `Host` is added automatically — don't include it
+    /// here. Keys are lowercased when signing; values are trimmed.
     pub signed_headers: &'a [(String, String)],
 }
 
@@ -73,8 +76,9 @@ pub struct PresignParams<'a> {
 /// params.
 pub fn presign_put(p: &PresignParams<'_>) -> String {
     // ── Step 1: canonical headers ───────────────────────────────────────────
-    // Always include `host`. Extra headers are prefixed with `x-amz-meta-*`
-    // for user metadata (R2 accepts the same convention as S3).
+    // Always include `host`. Extra headers are `x-amz-meta-*` user metadata
+    // (R2 accepts the same convention as S3) plus `content-length`, which
+    // pins the object size into the signature (the-composer #43).
     let mut headers: Vec<(String, String)> = Vec::with_capacity(p.signed_headers.len() + 1);
     headers.push(("host".to_string(), p.host.to_string()));
     for (k, v) in p.signed_headers {
@@ -427,6 +431,64 @@ mod tests {
         let sig = &url[sig_start + "X-Amz-Signature=".len()..];
         assert_eq!(sig.len(), 64, "signature must be 64 hex chars");
         assert!(sig.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn presign_put_binds_content_length_into_signed_headers() {
+        // #43: with content-length among the signed headers, R2 verifies the
+        // PUT's actual Content-Length against the signature — an oversize
+        // upload fails at R2 before costing the owner anything.
+        let extra = vec![
+            ("content-length".to_string(), "1048576".to_string()),
+            (
+                "x-amz-meta-uploaderidentitykey".to_string(),
+                "0379abcd".to_string(),
+            ),
+        ];
+        let p = PresignParams {
+            access_key_id: "AKIAIOSFODNN7EXAMPLE",
+            secret_access_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+            host: "acct.r2.cloudflarestorage.com",
+            bucket: "uhrp-prod",
+            key: "cdn/abc123",
+            expires_in_seconds: 604_000,
+            amz_date: "20250510T123456Z",
+            date_stamp: "20250510",
+            signed_headers: &extra,
+        };
+        let url = presign_put(&p);
+        // SignedHeaders is sorted ASCII ascending: content-length < host.
+        assert!(
+            url.contains(
+                "X-Amz-SignedHeaders=content-length%3Bhost%3Bx-amz-meta-uploaderidentitykey"
+            ),
+            "content-length must be part of the signed header set: {url}"
+        );
+    }
+
+    #[test]
+    fn different_content_lengths_produce_different_signatures() {
+        // The size is load-bearing in the signature: changing only the
+        // declared byte count must change the URL's X-Amz-Signature, i.e. a
+        // URL presigned for 1 byte cannot admit any other size.
+        let sig_for = |len: &str| {
+            let extra = vec![("content-length".to_string(), len.to_string())];
+            let p = PresignParams {
+                access_key_id: "AKIAIOSFODNN7EXAMPLE",
+                secret_access_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+                host: "acct.r2.cloudflarestorage.com",
+                bucket: "uhrp-prod",
+                key: "cdn/abc123",
+                expires_in_seconds: 604_000,
+                amz_date: "20250510T123456Z",
+                date_stamp: "20250510",
+                signed_headers: &extra,
+            };
+            let url = presign_put(&p);
+            let at = url.find("X-Amz-Signature=").expect("signature present");
+            url[at..].to_string()
+        };
+        assert_ne!(sig_for("1"), sig_for("11000000000"));
     }
 
     #[test]

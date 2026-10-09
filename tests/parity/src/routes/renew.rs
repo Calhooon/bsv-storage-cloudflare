@@ -4,10 +4,10 @@
 //! extend hosting; the lookup filters by `uhrp_url` alone), but the
 //! advert must exist in the SERVER's wallet basket — and nanostore's
 //! admin wallet is separate, so live-fire against nanostore is still
-//! structurally unreachable. We live-fire against the locally-deployed
-//! worker (`PARITY_STORAGE_URL`) instead, exercising the "advert not
-//! found" error path with a well-formed uhrpUrl that doesn't correspond
-//! to anything in the local deployment.
+//! structurally unreachable. We live-fire against our deployed worker
+//! (`your-worker.your-account.workers.dev`) instead, exercising
+//! the "advert not found" error path with a well-formed uhrpUrl that
+//! doesn't correspond to anything in our D1.
 //!
 //! # Payment
 //!

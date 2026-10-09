@@ -6,10 +6,12 @@
 // the Rust test suite — any Rust-side drift from the TS implementation fails
 // the build.
 //
-// Run from the repo root:
+// Run:
+//     cd /Users/johncalhoun/bsv/bsv-storage-cloudflare
 //     node scripts/gen-uhrp-hash-fixtures.mjs
 //
-// Requires @bsv/sdk available on your NODE_PATH or installed locally.
+// Requires @bsv/sdk. We resolve it from a sibling project that already has it
+// installed (chaintracks-server) — no deps for this repo itself.
 
 import { writeFileSync, mkdirSync } from 'node:fs'
 import { createRequire } from 'node:module'

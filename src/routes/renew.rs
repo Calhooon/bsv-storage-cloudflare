@@ -1,8 +1,7 @@
 //! POST /renew — see PROTOCOL.md §5.
 //!
 //! Port of `storage-server/src/routes/renew.ts`, redesigned for real
-//! pricing (the price is derived from on-chain advert data rather than
-//! client-supplied claims). BRC-31 auth + BRC-29 payment are wired in
+//! pricing (the-composer #45). BRC-31 auth + BRC-29 payment are wired in
 //! `lib.rs`; this handler assumes both have been verified by the time it
 //! runs.
 //!
@@ -35,7 +34,7 @@
 //! 9. Return `{status, prevExpiryTime, newExpiryTime, amount}` where
 //!    `amount` echoes the satoshis the payment middleware charged.
 //!
-//! # Pricing
+//! # Pricing (the-composer #45)
 //!
 //! `fileSize` is NOT in the renew body — it is read from field 4 of the
 //! old advertisement's PushDrop, so the price is bound to on-chain data,

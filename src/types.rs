@@ -201,10 +201,121 @@ pub struct AdvertiseResponse {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// /drafts (composer-storage instance only — not part of nanostore parity)
+// ────────────────────────────────────────────────────────────────────────────
+//
+// Score-draft sync for github.com/Calgooon/the-composer (issue #16). Drafts
+// are small per-identity JSON blobs in the `COMPOSER_DRAFTS` KV namespace,
+// scoped by the BRC-103/104-authenticated identity key. These routes only
+// exist where that binding is configured (wrangler.composer.toml); on the
+// primary deployment they answer 404 like any unknown path.
+
+/// Request body for `PUT /drafts/:id` (the id rides in the path).
+///
+/// Every field optional at parse time so validation can name the exact
+/// missing/invalid field (mirrors the `QuoteRequest` pattern). Numbers are
+/// `f64` because JSON numbers arrive as doubles; integer-ness is checked in
+/// `routes::drafts::validate_put_body`. `state` is the one intentionally
+/// opaque interior — the builder UI owns its shape; the server only derives
+/// summary counts from it when the well-known shape is recognizable.
+///
+/// `sectionCount`/`partCount` are client-supplied fallbacks used only when
+/// the counts are NOT derivable from `state` (bound-checked: integers ≥ 0).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PutDraftRequest {
+    pub title: Option<String>,
+    pub updated_at: Option<f64>,
+    /// Opaque builder state. JSON `null` and a missing field both
+    /// deserialize to `None` and are rejected — a draft without state is
+    /// not worth syncing (slight tightening vs. "present" checks that
+    /// admit `null`; the real client always sends an object).
+    #[serde(default)]
+    pub state: Option<serde_json::Value>,
+    pub section_count: Option<f64>,
+    pub part_count: Option<f64>,
+}
+
+/// A full draft — the stored KV value and the `GET /drafts/:id` response
+/// body, byte-identical. Field order is load-bearing (serde preserves
+/// struct order; the client signs/verifies exact body bytes via AuthFetch).
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DraftBody {
+    /// Lowercase RFC 4122 UUID (client-chosen, validated server-side).
+    pub id: String,
+    /// Display title; may be empty. ≤ 256 UTF-8 bytes, no control chars.
+    pub title: String,
+    /// Client-clock ms epoch of the last edit — the conflict ordinal.
+    pub updated_at: u64,
+    /// Opaque builder state, echoed back verbatim.
+    pub state: serde_json::Value,
+}
+
+/// One row of `GET /drafts` (sorted `updatedAt` descending).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DraftSummaryBody {
+    pub id: String,
+    pub title: String,
+    pub updated_at: u64,
+    pub section_count: u64,
+    pub part_count: u64,
+}
+
+/// Success response for `GET /drafts`.
+#[derive(Debug, Serialize)]
+pub struct DraftsListResponse {
+    pub drafts: Vec<DraftSummaryBody>,
+}
+
+/// A delete tombstone — the KV value at `tombstone:<identityKey>:<id>`
+/// (the-composer #27; contract documented in `routes::drafts`).
+///
+/// `deletedAt` is the delete's last-write-wins ordinal (ms epoch): the
+/// server clock at delete time, floored strictly above the deleted
+/// version's `updatedAt`, so the tombstone dominates the copy it deleted
+/// even against a client clock running ahead of the server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DraftTombstone {
+    pub deleted_at: u64,
+}
+
+/// Error body for `PUT /drafts/:id` refused by a strictly-newer tombstone
+/// (410 `ERR_DRAFT_DELETED`). The repo error shape plus the tombstone's
+/// ordinal, so the client can reconcile (drop its stale local copy, or
+/// re-save the work under a fresh id).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DraftDeletedBody {
+    pub status: &'static str,
+    pub code: &'static str,
+    pub description: String,
+    pub deleted_at: u64,
+}
+
+/// Summary fields stored as KV metadata next to each draft so `GET /drafts`
+/// lists without an N+1 read of every value. The draft id is NOT stored
+/// here — it is recovered from the KV key, keeping the serialized metadata
+/// comfortably under Cloudflare's 1024-byte cap (title ≤ 256 UTF-8 bytes,
+/// control characters rejected so JSON escaping cannot inflate it past the
+/// budget).
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DraftKvMetadata {
+    pub title: String,
+    pub updated_at: u64,
+    pub section_count: u64,
+    pub part_count: u64,
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // Overlay SHIP broadcaster types
 // ────────────────────────────────────────────────────────────────────────────
 //
-// Earlier revisions defined `OverlaySubmitResponse` and `OverlayTopicAdmission`
-// here. They are exactly `bsv_rs::overlay::types::Steak`
-// (= `HashMap<String, AdmittanceInstructions>`), which `src/overlay/mod.rs`
-// consumes directly.
+// Historical note: earlier revisions defined `OverlaySubmitResponse` and
+// `OverlayTopicAdmission` here. Task #14 dropped both — they are exactly
+// `overlay_engine::types::Steak` (a re-export of `bsv_rs::overlay::types::Steak`
+// = `HashMap<String, AdmittanceInstructions>`), which `src/overlay/mod.rs`
+// now consumes directly via the `overlay-engine` crate.

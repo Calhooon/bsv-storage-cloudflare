@@ -1,0 +1,87 @@
+# wrangler.composer.toml — dedicated "composer-storage" instance for
+# github.com/Calgooon/the-composer (issue #7). Deployed from the same source
+# tree as the primary `bsv-storage-cloudflare` worker but with fully separate
+# composer-prefixed resources (bucket, KV, queue). Deploy with:
+#   npm run deploy:composer   (= wrangler deploy -c wrangler.composer.toml)
+# Tracked in git so the composer-storage deploy is reproducible from commit
+# (issue #39). Contains only public resource IDs — secrets stay in secrets.md
+# and are set via `wrangler secret put -c wrangler.composer.toml`.
+name = "composer-storage"
+main = "build/worker/shim.mjs"
+compatibility_date = "2024-01-01"
+
+[vars]
+BSV_NETWORK = "mainnet"
+WALLET_STORAGE_URL = "https://wallet-infra.x402agency.com"
+# Overlay submit HOST (no `/submit` suffix — the submitter appends it).
+# composer-overlay is the Composer-dedicated overlay node (issue #3).
+OVERLAY_SUBMIT_URL = "https://your-worker.your-account.workers.dev"
+# Public base URL for UHRP file downloads. R2 custom domain attached to
+# bucket `composer-files` (the-composer #41 production cutover; verified
+# serving before the swap). The old r2.dev dev URL
+# (https://pub-d288a5a150e0446983d774422de00b0c.r2.dev) keeps serving
+# concurrently for already-minted adverts; /renew rebuilds advert URLs
+# from this base, so old adverts migrate here whenever they are renewed.
+# Must change in lockstep with PUBLIC_DOWNLOAD_BASE in
+# the-composer/app/src/lib/composer/upload.ts.
+PUBLIC_URL_BASE = "https://composer-files.calhouninfra.com"
+# R2 S3-compat API endpoint host used by the /upload SigV4 presigner.
+R2_S3_ENDPOINT_HOST = "ea3e6d176ed3893258fe34281f710c7f.r2.cloudflarestorage.com"
+# R2 bucket name (mirrors the `UHRP_FILES` r2_buckets binding below).
+R2_BUCKET = "composer-files"
+# Monthly USD price per GB (string-parsed to f64). See PROTOCOL.md §D.
+PRICE_PER_GB_MO = "0.05"
+# Minimum retention in minutes (integer). 0 = no floor. See PROTOCOL.md §1.
+MIN_HOSTING_MINUTES = "15"
+
+[build]
+# Pin worker-build to the worker/wasm-bindgen pairing (worker 0.8.4 /
+# wasm-bindgen 0.2.123 / worker-build 0.8.4 — NOT 0.8.5, which targets
+# wasm-bindgen 0.2.125). The global install flips between repos
+# (overlay/chaintracks pin 0.7.5); a mismatched trio fails at deploy.
+command = "cargo install -q worker-build@0.8.4 && worker-build --release"
+
+# Cross-worker invocation: service binding to the composer-overlay Worker
+# (same account) — avoids CF error 1042 on Worker→Worker *.workers.dev fetch.
+[[services]]
+binding = "OVERLAY"
+service = "composer-overlay"
+
+[[kv_namespaces]]
+binding = "AUTH_SESSIONS"
+id = "<your-account-id>"
+
+# Score drafts for the-composer issue #16 (`/drafts` routes,
+# src/routes/drafts.rs). Account-level namespace `composer-drafts`, created
+# 2026-06-11 via the Cloudflare REST API. Keys: `draft:<identityKey>:<id>`
+# with summary fields in KV metadata. This binding is composer-instance-only:
+# wrangler.toml (the nanostore-parity instance) deliberately omits it, which
+# makes `/drafts*` answer 404 there (see drafts_store()).
+[[kv_namespaces]]
+binding = "COMPOSER_DRAFTS"
+id = "<your-account-id>"
+
+[[r2_buckets]]
+binding = "UHRP_FILES"
+bucket_name = "composer-files"
+
+# Queue consumer for post-upload work (R2 event → tm_uhrp advert + indexing).
+# The R2 bucket `composer-files` emits object-create events onto the
+# `composer-post-upload` queue (wired via
+# `wrangler r2 bucket notification create`).
+[[queues.producers]]
+binding = "POST_UPLOAD_QUEUE"
+queue = "composer-post-upload"
+
+[[queues.consumers]]
+queue = "composer-post-upload"
+max_batch_size = 10
+max_batch_timeout = 30
+max_retries = 3
+
+# Secrets (set via `npx wrangler secret put <NAME> -c wrangler.composer.toml`):
+#   SERVER_PRIVATE_KEY       — BRC-31 server identity (hex)
+#   ADMIN_WALLET_PRIVATE_KEY — signs PushDrop UHRP advertisements
+#   ADMIN_IDENTITY_KEYS      — comma-separated hex pubkeys allowed to call /advertise
+#   R2_ACCESS_KEY_ID         — R2 S3-API access key (presigner)
+#   R2_SECRET_ACCESS_KEY     — R2 S3-API secret key (presigner)

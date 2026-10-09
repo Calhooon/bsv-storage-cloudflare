@@ -30,7 +30,7 @@
 //! storage.babbage.systems' BRC-29 verifier + real GCS). Override:
 //!
 //! ```bash
-//! PARITY_STORAGE_URL=https://your-worker.workers.dev \
+//! PARITY_STORAGE_URL=https://your-worker.your-account.workers.dev \
 //!   cargo test live_upload_roundtrip -- --ignored --nocapture
 //! ```
 

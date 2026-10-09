@@ -53,3 +53,16 @@ pub const ERR_ADVERTISE_INTERNAL: &str = "ERR_INTERNAL";
 
 // Overlay broadcast failures (shared by /renew and /advertise).
 pub const ERR_OVERLAY_BROADCAST: &str = "ERR_OVERLAY_BROADCAST";
+
+// /drafts (composer-storage instance only; no TS-parity constraint — these
+// codes are ours). `ERR_INVALID_REQUEST`, `ERR_NOT_FOUND`, `ERR_INTERNAL`,
+// and `ERR_MISSING_IDENTITY_KEY` above are re-used for the matching cases.
+pub const ERR_DRAFT_TOO_LARGE: &str = "ERR_DRAFT_TOO_LARGE";
+/// Per-identity draft-count quota exceeded (the-composer #42). 413, like
+/// `ERR_DRAFT_TOO_LARGE` — the API's "cap exceeded" status family. NOT 409,
+/// which /drafts reserves for the conflict-carries-stored-draft contract.
+pub const ERR_DRAFT_LIMIT: &str = "ERR_DRAFT_LIMIT";
+/// PUT refused because a strictly-newer delete tombstone exists for the id
+/// (the-composer #27). 410 Gone, with the tombstone's `deletedAt` in the
+/// body (`DraftDeletedBody`).
+pub const ERR_DRAFT_DELETED: &str = "ERR_DRAFT_DELETED";
