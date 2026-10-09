@@ -27,8 +27,8 @@ hex = "0.4"
 base64 = "0.22"
 sha2 = "0.10"
 
-bsv-middleware-cloudflare = "=0.4.1"
-bsv-rs = { version = "0.3", features = ["auth", "wallet", "transaction", "script", "wasm"] }
+bsv-middleware-cloudflare = "=0.5.0"
+bsv-rs = { version = "0.4.1", features = ["auth", "wallet", "transaction", "script", "wasm"] }
 # SigV4 for R2 S3-compatible presigned URLs (task #4).
 hmac = "0.12"
 

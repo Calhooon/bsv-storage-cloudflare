@@ -122,14 +122,14 @@ dependencies = [
 
 [[package]]
 name = "bsv-middleware-cloudflare"
-version = "0.4.1"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a1b9e6e2c1adbd5bb9c620f36840d1911f25fc194775d4fff0a057c0f7c558a7"
+checksum = "d8afd1a28ce57eeb69aa5486d87d3bb4effd6347bf1a011f387e803c19a54b59"
 dependencies = [
  "async-trait",
  "base64",
  "bsv-middleware-core",
- "bsv-rs 0.3.35",
+ "bsv-rs 0.4.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "console_error_panic_hook",
  "futures",
  "getrandom 0.2.17",
@@ -147,11 +147,11 @@ dependencies = [
 
 [[package]]
 name = "bsv-middleware-core"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d195a392f9e9118effd87c72f2fcd91332bf1adf1be46b879d43ccdcdf6f1144"
+checksum = "4f9c7fc9420eb1ae014400de7eaf7529b66a3105ef9df0016f0d8b1f5c8a1006"
 dependencies = [
- "bsv-rs 0.3.35",
+ "bsv-rs 0.4.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "getrandom 0.2.17",
  "hex",
  "hmac",
@@ -162,7 +162,7 @@ dependencies = [
 
 [[package]]
 name = "bsv-rs"
-version = "0.3.13"
+version = "0.4.1"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -182,7 +182,6 @@ dependencies = [
  "p256",
  "pbkdf2",
  "rand 0.8.6",
- "reqwest",
  "ripemd",
  "serde",
  "serde_json",
@@ -196,9 +195,9 @@ dependencies = [
 
 [[package]]
 name = "bsv-rs"
-version = "0.3.35"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3aa51cd864c80eb5d67d275faeca6d7bdf9d33e8081edf65bea305309724dbe"
+checksum = "fd2df2d47d3b8b34a45e328088b98f2292e528e3ba342948c03573b928ead3c6"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -220,6 +219,7 @@ dependencies = [
  "p256",
  "pbkdf2",
  "rand 0.8.6",
+ "reqwest",
  "ripemd",
  "serde",
  "serde_json",
@@ -237,7 +237,7 @@ version = "0.2.0"
 dependencies = [
  "base64",
  "bsv-middleware-cloudflare",
- "bsv-rs 0.3.35",
+ "bsv-rs 0.4.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "chrono",
  "console_error_panic_hook",
  "getrandom 0.2.17",
@@ -1247,7 +1247,7 @@ name = "overlay-engine"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "bsv-rs 0.3.13",
+ "bsv-rs 0.4.1",
  "js-sys",
  "serde",
  "serde_json",
@@ -1272,7 +1272,7 @@ name = "parity"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "bsv-rs 0.3.13",
+ "bsv-rs 0.4.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "chrono",
  "hex",
  "rand 0.8.6",

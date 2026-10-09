@@ -38,11 +38,11 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 sha2 = "0.10"
 hex = "0.4"
 
-# Path dep, matches root crate. Parity harness uses bsv-rs for:
+# The registry bsv-rs at the root crate's version. Parity harness uses bsv-rs for:
 # - test identity keypair (PrivateKey::random + PublicKey hex export, default features)
 # - BRC-31 mutual auth client (auth + http features — SimplifiedFetchTransport
 #   does the wire-level work against nanostore.babbage.systems and our worker)
-bsv-rs = { path = "../../../bsv-rs", features = ["auth", "http", "overlay"] }
+bsv-rs = { version = "0.4.1", features = ["auth", "http", "overlay"] }
 
 # Request correlation IDs for the BRC-31 client (`src/auth.rs`) — 32 random
 # bytes per in-flight General message so the transport callback can route
