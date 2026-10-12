@@ -1,15 +1,77 @@
 # bsv-storage-cloudflare
 
-UHRP file-storage server on Cloudflare Workers. Rust/WASM.
+UHRP file-storage service **0.2.1** on Cloudflare Workers, written in Rust
+and compiled to WASM. It implements the six client routes of
+[`@bsv/uhrp-storage-server`](https://github.com/bsv-blockchain/storage-server)
+with Cloudflare R2 for file bytes and a post-upload Queue consumer for
+advertisements. See the [wire specification](./PROTOCOL.md).
 
-Protocol-compatible Rust port of [`@bsv/uhrp-storage-server`](https://github.com/bsv-blockchain/storage-server)
-(a.k.a. [nanostore.babbage.systems](https://nanostore.babbage.systems)).
-HTTP request/response shapes, UHRP hash derivation, PushDrop advertisement
-encoding, and public file URLs are byte-for-byte identical to the TS original —
-clients switch with zero code changes.
+## Client routes
 
-Backs storage with Cloudflare R2 instead of Google Cloud Storage; replaces the
-GCP notifier Cloud Function with a Cloudflare Queue consumer.
+| Method | Path | Access | Purpose |
+|---|---|---|---|
+| POST | `/quote` | Public | Return the satoshi cost for a file size and retention period. |
+| POST | `/upload` | BRC-31 + BRC-29 payment | Return a presigned R2 PUT URL and required headers for the paid upload. |
+| GET | `/find` | BRC-31 | Look up metadata for a UHRP URL. |
+| GET | `/list` | BRC-31 | List the caller's uploaded files. |
+| POST | `/advertise` | BRC-31 + admin allowlist | Publish a UHRP advertisement for an uploaded object. |
+| POST | `/renew` | BRC-31 + BRC-29 payment | Redeem the old advertisement and publish one with an extended expiry. |
+
+The authenticated routes use the BRC-31 handshake through
+`bsv-middleware-cloudflare`. On the paid routes, `/upload` and `/renew`,
+a priced request without payment receives a signed **402 Payment Required**
+challenge; the middleware verifies the BRC-29 payment before the handler runs.
+See [request dispatch](./src/lib.rs) and the [route handlers](./src/routes/).
+
+After `/upload`, the client PUTs bytes directly to R2 using the returned URL
+and required headers, including the signed content length. Downloads are
+public GETs at the configured public file URL. R2 object-create events feed
+`POST_UPLOAD_QUEUE`; the consumer hashes the uploaded object and reuses the
+advertisement creation flow to sign a UHRP PushDrop advertisement and submit
+it to `tm_uhrp` on the bound overlay. Wallet storage supplies transaction
+construction and storage. See the [upload handler](./src/routes/upload.rs),
+[queue consumer](./src/queue/mod.rs) and [overlay submitter](./src/overlay/mod.rs).
+The queue currently buffers file bytes for hashing; multi-GB hashing can
+exceed Worker memory, as recorded in the queue source.
+
+## Health and release status
+
+Public GET `/health` and `/` retain the success status and message and add a
+`build` object in 0.2.1: `lib_rev`, `dirty`, `built_at` (UTC), and `crates`
+with five locked crate versions. This describes the build, rather than
+establishing wallet, overlay or storage readiness. See the
+[health implementation](./src/health.rs) and [0.2.1 release notes](./CHANGELOG.md#021).
+
+The beta from the public tag
+[`v0.2.1`](https://github.com/Calhooon/bsv-storage-cloudflare/releases/tag/v0.2.1)
+exists. A live upload, public GET, hash check, advertisement and renewal round
+trip on the current line is pending. The historical checks below do not
+establish current deployment readiness.
+
+## Recorded parity (2026-04-21)
+
+The [per-route matrix](./PARITY-STATUS.md#per-route-matrix) records all six
+client routes as live-fire exercised, with distinct evidence scopes:
+
+- `/find` (three error paths), `/list` and `/upload` were byte-identical
+  against nanostore in the recorded comparisons, including the cross-backend
+  upload response comparison.
+- `/quote` was shape-identical, with pricing divergent by design.
+- `/advertise` and `/renew` were checked against this service only, using
+  pinned reference-contract fixtures. These checked admin authentication,
+  validation and error shapes, rather than successful advertisement or renewal.
+
+The [advertise and renew record](./PARITY-STATUS.md#2-advertise--renew-live-fire--proven-ours-only)
+explicitly leaves their happy paths pending. The
+[primitive layer](./PARITY-STATUS.md#primitive-layer-what-every-route-above-depends-on)
+records SDK 1.10.1 vector evidence for BRC-42, BRC-29, BRC-31, PushDrop,
+UHRP URL derivation, sighash and AtomicBEEF. The
+[SHIP admission record](./PARITY-STATUS.md#1-shipslap-advertisement-admission--proven)
+records admission against a local canonical overlay-express testbed.
+These are dated, scoped records, not a blanket compatibility guarantee.
+[PARITY-CLAIMS.md](./PARITY-CLAIMS.md) supplies detailed evidence pointers;
+its older gap list is superseded for the two error-path checks by the dated
+PARITY-STATUS record.
 
 ## Pricing
 
@@ -26,17 +88,30 @@ The higher `PRICE_PER_GB_MO` pockets R2's zero-egress advantage as margin. The
 upload incurs. See [`PROTOCOL.md §D`](./PROTOCOL.md#d-pricing-formula) for the
 formula.
 
-See [`PROTOCOL.md`](./PROTOCOL.md) for the wire spec and [`CLAUDE.md`](./CLAUDE.md)
-for architecture, bindings, and quality gates.
+## Build and dependencies
 
-## Quickstart
+The [manifest](./Cargo.toml) pins registry dependencies:
+
+| Crate | Exact version |
+|---|---|
+| `bsv-rs` | `=0.4.5` |
+| `bsv-middleware-cloudflare` | `=0.5.1` |
+| `bsv-overlay-engine` | `=0.1.0` |
+| `bsv-worker-build-info` | `=0.1.0` |
+
+The lock resolves middleware core 0.2.1. No sibling checkout or path dependency
+is required, as recorded in the [0.2.0 de-path notes](./CHANGELOG.md#020-unreleased-registry-de-path-e0c7971).
 
 ```bash
 npm install
-./scripts/install-hooks.sh   # pre-commit quality gate
-npm run dev                  # local worker on :8787
+npm run dev                  # local Worker on :8787
 ```
 
-## Status
+The [local quality gate](./scripts/check.sh) and
+[hosted gate](./.github/workflows/ci.yml) define formatting, clippy, tests,
+WASM checks and the release Worker build. The hosted test job covers the
+Worker and parity harness with the committed registry lock.
 
-Scaffold only. Routes return `501 ERR_NOT_IMPLEMENTED`. See open tasks.
+For resource setup, R2 event notification wiring, deployment and rollback,
+see [DEPLOYMENT.md](./DEPLOYMENT.md). Use your own service URL, for example
+`https://your-worker.your-account.workers.dev`.

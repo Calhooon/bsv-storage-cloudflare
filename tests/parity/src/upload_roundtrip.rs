@@ -1,4 +1,4 @@
-//! Full-stack UHRP upload round-trip — the "does this actually work for
+//! Full-stack UHRP upload round-trip: the "does this actually work for
 //! a real user" smoke test.
 //!
 //! Flow:
@@ -8,8 +8,8 @@
 //!    build envelope → retry → 200 with `{uploadURL, requiredHeaders,
 //!    amount, description, status}`.
 //! 3. `PUT <uploadURL>` with the server's required headers → 200.
-//! 4. `GET <public CDN URL>` (same path as `uploadURL` minus the
-//!    presign query) → 200 with the exact bytes we uploaded.
+//! 4. `GET <public CDN URL>` (public base plus the object key from
+//!    `uploadURL`) → 200 with the exact bytes we uploaded.
 //! 5. `sha256(downloaded_bytes) == sha256(original_bytes)` —
 //!    proves the round-trip is content-integrity preserving.
 //!
@@ -31,8 +31,12 @@
 //!
 //! ```bash
 //! PARITY_STORAGE_URL=https://your-worker.your-account.workers.dev \
+//! PARITY_PUBLIC_URL_BASE=https://files.example.com \
 //!   cargo test live_upload_roundtrip -- --ignored --nocapture
 //! ```
+//!
+//! `PARITY_PUBLIC_URL_BASE` must match the Worker's `PUBLIC_URL_BASE`.
+//! If unset, the download uses `uploadURL` with its query removed.
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -205,10 +209,25 @@ mod tests {
         eprintln!("PUT: {put_status}");
 
         // ─── Step 4: GET the file back from the public CDN URL ────────
-        // The presigned URL includes the canonical object path +
-        // signature query. Stripping the query gives the public
-        // CDN URL (GCS allow-list for uhrp-prod is public-read).
-        let cdn_url = upload_url.split('?').next().unwrap().to_string();
+        // R2 presigned PUT URLs use /<bucket>/<object key> on the S3 host.
+        // Public downloads use the Worker's public base plus the object key.
+        let cdn_url = match std::env::var("PARITY_PUBLIC_URL_BASE") {
+            Ok(public_base) => {
+                let presigned = reqwest::Url::parse(&upload_url).unwrap();
+                let (_, object_key) = presigned
+                    .path()
+                    .trim_start_matches('/')
+                    .split_once('/')
+                    .expect("presigned upload URL missing bucket/object key path");
+                format!("{}/{}", public_base.trim_end_matches('/'), object_key)
+            }
+            Err(_) => {
+                eprintln!(
+                    "PARITY_PUBLIC_URL_BASE is unset; using uploadURL without its query for GET"
+                );
+                upload_url.split('?').next().unwrap().to_string()
+            }
+        };
         eprintln!("GET: {cdn_url}");
         let got = http.get(&cdn_url).send().await.unwrap();
         assert!(
