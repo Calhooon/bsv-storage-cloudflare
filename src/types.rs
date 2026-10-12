@@ -316,6 +316,6 @@ pub struct DraftKvMetadata {
 //
 // Historical note: earlier revisions defined `OverlaySubmitResponse` and
 // `OverlayTopicAdmission` here. Task #14 dropped both — they are exactly
-// `overlay_engine::types::Steak` (a re-export of `bsv_rs::overlay::types::Steak`
+// `bsv_overlay_engine::types::Steak` (a re-export of `bsv_rs::overlay::types::Steak`
 // = `HashMap<String, AdmittanceInstructions>`), which `src/overlay/mod.rs`
 // now consumes directly via the `overlay-engine` crate.

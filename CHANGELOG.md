@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased: registry dependencies and the L2 re-pin
+
+The Worker builds without sibling checkouts: `bsv-middleware-cloudflare = "=0.5.1"`
+(locked core 0.2.1), `bsv-overlay-engine = "=0.1.0"`, and `bsv-rs = "=0.4.5"`
+in both workspace manifests. The lock contains one registry SDK and one registry
+engine, with no path or patch dependencies. The crate version stays 0.2.0.
+
+- The engine import becomes `bsv_overlay_engine::types`; the `Steak` and
+  `TaggedBEEF` wire types remain the SDK's re-exports. Existing endpoint values,
+  request construction and response handling stay unchanged.
+- bsv-rs 0.4.5 accepts a lone hashed Merkle leaf only at offset 0 and adds an
+  opt-in LOCAL script work bound. This Worker constructs no Merkle paths in
+  memory and sets no work bound; no resource match needs another arm.
+- The machine gate uses the committed registry lock and tests the parity crate
+  alongside the Worker. No private sibling repository is cloned in CI.
+
 ## Unreleased: the 0.4 line
 
 The Worker moves to the 0.4 line of the stack: `bsv-middleware-cloudflare = "=0.5.0"` (on
@@ -16,6 +32,5 @@ registry's 0.4.1 now). The crate version stays 0.2.0.
   `500 ERR_SERVER_MISCONFIGURED` (0.4.x answered 400).
 - bsv-rs 0.4.1 reads a transaction with no input as invalid bytes; no fixture of this repository
   is one (the suite is green unchanged).
-- `overlay-engine` still comes from `../rust-overlay` by path and takes `bsv-rs` from `../bsv-rs`
-  by path; with `v0.4.1` checked out there the lock holds that path copy of 0.4.1 beside the
-  registry's. Closing it is `rust-overlay`'s manifest, not this one.
+- That alignment retained the legacy engine path pin and its separate SDK copy.
+  The registry dependency entry above supersedes that build requirement.

@@ -10,9 +10,9 @@ repository = "https://github.com/Calgooon/bsv-storage-cloudflare"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-# 0.8 to match ../bsv-middleware-cloudflare-public (worker 0.7 → 0.8 there,
-# commit bdb484f). Two simultaneous `worker` versions cannot coexist — the
-# middleware's `Response`/`Env` types must be THIS crate's types.
+# 0.8 to match bsv-middleware-cloudflare. Two simultaneous `worker` versions
+# cannot coexist: middleware and Worker `Response`/`Env` types must match.
+# Keep both on the same worker major version.
 worker = { version = "0.8", features = ["queue"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
@@ -27,16 +27,16 @@ hex = "0.4"
 base64 = "0.22"
 sha2 = "0.10"
 
-bsv-middleware-cloudflare = "=0.5.0"
-bsv-rs = { version = "0.4.1", features = ["auth", "wallet", "transaction", "script", "wasm"] }
+bsv-middleware-cloudflare = "=0.5.1"
+bsv-rs = { version = "=0.4.5", features = ["auth", "wallet", "transaction", "script", "wasm"] }
 # SigV4 for R2 S3-compatible presigned URLs (task #4).
 hmac = "0.12"
 
 # Overlay wire types — `TaggedBEEF` + `Steak` (via `bsv_rs::overlay::types`)
-# are re-exported by `overlay-engine::types`. Consuming them here lets us
+# are re-exported by `bsv_overlay_engine::types`. Consuming them here lets us
 # drop our duplicate `OverlaySubmitResponse` / `OverlayTopicAdmission`
 # and keep the UHRP advert submit wire-format in lockstep with
-# `rust-overlay`. Compiles cleanly on wasm32-unknown-unknown (the overlay
+# `bsv-overlay-cloudflare`. Compiles cleanly on wasm32-unknown-unknown (the overlay
 # crate is itself deployed as a CF Worker).
 #
 # `overlay-cloudflare::WorkerBroadcaster` is intentionally NOT pulled in
@@ -44,9 +44,9 @@ hmac = "0.12"
 # exposing the body, so we can't run the empty-`outputsToAdmit`
 # rejection check on top. `src/overlay/mod.rs` replicates the same wire
 # contract (headers + Uint8Array body + `/submit` path suffix) and adds
-# the Steak-body check that rust-overlay's own `/submit` endpoint needs
+# the Steak-body check that the overlay's own `/submit` endpoint needs
 # (it returns HTTP 200 + empty Steak on silent topic-manager rejection).
-overlay-engine = { path = "../rust-overlay/crates/overlay-engine" }
+bsv-overlay-engine = "=0.1.0"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }

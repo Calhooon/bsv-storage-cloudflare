@@ -28,7 +28,7 @@
 
 #![allow(dead_code)] // Some helpers are consumed only by /advertise or /renew.
 
-use overlay_engine::types::{Steak, TaggedBEEF};
+use bsv_overlay_engine::types::{Steak, TaggedBEEF};
 use worker::{Fetch, Headers, Method, Request, RequestInit};
 
 use crate::error::ERR_OVERLAY_BROADCAST;
@@ -486,7 +486,7 @@ mod tests {
     #[test]
     fn steak_parses_outputs_to_admit() {
         // Steak is `HashMap<String, AdmittanceInstructions>` per
-        // `overlay_engine::types::Steak` (re-exported from `bsv_rs`). Lock
+        // `bsv_overlay_engine::types::Steak` (re-exported from `bsv_rs`). Lock
         // the wire-format parity we rely on in submit_tagged.
         let body = r#"{"tm_uhrp":{"outputsToAdmit":[0],"coinsToRetain":[]}}"#;
         let parsed: Steak = serde_json::from_str(body).unwrap();

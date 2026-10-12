@@ -1,201 +1,77 @@
-name: CI
-
-# Three jobs:
-#   - quality-gates : runs on every PR + push to main. 5 gates from scripts/check.sh.
-#   - parity-smoke  : push-to-main only. Diffs rust worker against nanostore.babbage.systems.
-#                      Requires repo secret PARITY_IDENTITY_KEY (hex private key for BRC-31).
-#   - deploy        : workflow_dispatch (manual) only.
-#                      Requires repo secrets CLOUDFLARE_API_TOKEN + CLOUDFLARE_ACCOUNT_ID.
-#
-# Sibling path-dep strategy:
-#   Cargo.toml has `bsv-middleware-cloudflare = { path = "../bsv-middleware-cloudflare-public" }`.
-#   The matching GitHub repo is at https://github.com/Calhooon/bsv-middleware-cloudflare.git
-#   (note: "Calhooon", three o's — NOT the "Calgooon" org). We clone it one level
-#   above $GITHUB_WORKSPACE into a directory named `bsv-middleware-cloudflare-public`
-#   so the `../bsv-middleware-cloudflare-public` path dep resolves.
-#   The repo is PUBLIC (verified: unauthenticated GET on info/refs returns 200),
-#   so the clone works from PRs originating from forks with no extra credentials.
-#   If it ever flips to private, these steps will fail loudly on the git clone line
-#   (which is intentional — silent fallback would let CI "pass" on a broken tree).
-#
-#   Task #14 may introduce additional path deps on rust-overlay (overlay-engine,
-#   overlay-cloudflare). The clone of rust-overlay is CONDITIONAL on a path dep
-#   appearing in Cargo.toml, so this workflow works before AND after #14 lands.
-#   NOTE: rust-overlay is currently PRIVATE — clone will require GITHUB_TOKEN auth.
-#   We use the default GITHUB_TOKEN, which works for same-org repos on push and on
-#   PRs from branches within the same repo, but NOT for PRs from forks. That
-#   limitation is acceptable: contributors don't fork Calgooon internal repos.
-
-on:
+# Shared Worker gate: PR head, read-only token, pinned Rust, cached cargo.
+# Host clippy covers both workspace crates; wasm clippy checks the Worker's targets.
+# scripts/check.sh gates, split into required jobs; install is pinned and locked.
+# Dependencies resolve from the committed registry lockfile. No sibling clones.
+name: ci
+'on':
+  pull_request: null
   push:
-    branches: [main]
-  pull_request:
-  workflow_dispatch:
-
+    branches:
+    - main
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 env:
   CARGO_TERM_COLOR: always
-
 jobs:
-  quality-gates:
+  test:
+    name: test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Clone sibling path deps
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          # bsv-middleware-cloudflare-public: required path dep. Public repo.
-          echo "==> cloning bsv-middleware-cloudflare -> $RUNNER_WORKSPACE/bsv-middleware-cloudflare-public"
-          git clone --depth=1 \
-            https://github.com/Calhooon/bsv-middleware-cloudflare.git \
-            "$RUNNER_WORKSPACE/bsv-middleware-cloudflare-public"
-
-          # rust-overlay: optional, only if Cargo.toml references it (task #14).
-          if grep -q 'path = "\.\./rust-overlay' Cargo.toml; then
-            echo "==> Cargo.toml references rust-overlay; cloning (private repo, using GITHUB_TOKEN)"
-            git clone --depth=1 \
-              "https://x-access-token:${GH_TOKEN}@github.com/Calgooon/rust-overlay.git" \
-              "$RUNNER_WORKSPACE/rust-overlay"
-          else
-            echo "==> rust-overlay path dep not present in Cargo.toml; skipping clone"
-          fi
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-          targets: wasm32-unknown-unknown
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          # Include siblings in the cache key so a sibling-repo change busts it.
-          shared-key: quality-gates
-
-      - name: Install worker-build
-        run: cargo install worker-build --locked
-
-      - name: Gate 1 — cargo fmt
-        # Scope to OUR packages only; path-dep siblings have their own fmt CIs.
-        run: cargo fmt -p bsv-storage-cloudflare -p parity -- --check
-
-      - name: Gate 2 — cargo clippy (wasm32, -D warnings)
-        run: cargo clippy --target wasm32-unknown-unknown --all-targets -- -D warnings
-
-      - name: Gate 3 — cargo check (wasm32)
-        run: cargo check --target wasm32-unknown-unknown
-
-      - name: Gate 4 — cargo test --lib
-        run: cargo test --lib
-
-      - name: Gate 5 — worker-build --release
-        run: worker-build --release
-
-  parity-smoke:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: 1.95.0
+        components: rustfmt, clippy
+        targets: wasm32-unknown-unknown
+    - uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: . -> target
+    - run: cargo test --locked --workspace --no-fail-fast
+  fmt:
+    name: fmt
     runs-on: ubuntu-latest
-    needs: quality-gates
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    # REQUIRED SECRET: PARITY_IDENTITY_KEY — hex-encoded BRC-31 identity private key
-    # used by the parity harness when calling nanostore.babbage.systems. Configure in
-    # Settings → Secrets and variables → Actions before this job can succeed.
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Clone sibling path deps
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          git clone --depth=1 \
-            https://github.com/Calhooon/bsv-middleware-cloudflare.git \
-            "$RUNNER_WORKSPACE/bsv-middleware-cloudflare-public"
-          if grep -q 'path = "\.\./rust-overlay' Cargo.toml; then
-            git clone --depth=1 \
-              "https://x-access-token:${GH_TOKEN}@github.com/Calgooon/rust-overlay.git" \
-              "$RUNNER_WORKSPACE/rust-overlay"
-          fi
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: parity-smoke
-
-      - name: parity diff — all 6 routes vs nanostore + our live worker
-        # Iterates every route's default scenario. Scenarios that require
-        # BRC-31 auth / admin identity / BRC-29 payment (all routes except
-        # /quote today) are marked `skip_reason` in src/routes/*.rs and
-        # emit a SKIPPED line while still validating the on-disk fixture's
-        # shape. Flipping `skip_reason = None` on a scenario turns it into
-        # live-fire without any other code or workflow change.
-        env:
-          PARITY_IDENTITY_KEY: ${{ secrets.PARITY_IDENTITY_KEY }}
-          PARITY_REFERENCE_URL: https://nanostore.babbage.systems
-          PARITY_LOCAL_URL: https://your-worker.your-account.workers.dev
-        run: |
-          set -euo pipefail
-          if [ -z "${PARITY_IDENTITY_KEY:-}" ]; then
-            echo "::error::PARITY_IDENTITY_KEY secret is not set. Configure it in repo Settings → Secrets and variables → Actions."
-            exit 1
-          fi
-          for route in /quote /find /list /upload /advertise /renew; do
-            echo "==> parity diff --route $route"
-            cargo run -p parity --bin parity -- diff \
-              --route "$route" \
-              --reference "$PARITY_REFERENCE_URL" \
-              --local "$PARITY_LOCAL_URL"
-          done
-
-  deploy:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: 1.95.0
+        components: rustfmt, clippy
+        targets: wasm32-unknown-unknown
+    - uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: . -> target
+    - run: cargo fmt -p bsv-storage-cloudflare -p parity -- --check
+  clippy:
+    name: clippy
     runs-on: ubuntu-latest
-    needs: parity-smoke
-    if: github.event_name == 'workflow_dispatch'
-    # REQUIRED SECRETS: CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID — must be configured in repo Settings → Secrets and variables → Actions before dispatching this job.
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Clone sibling path deps
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          git clone --depth=1 \
-            https://github.com/Calhooon/bsv-middleware-cloudflare.git \
-            "$RUNNER_WORKSPACE/bsv-middleware-cloudflare-public"
-          if grep -q 'path = "\.\./rust-overlay' Cargo.toml; then
-            git clone --depth=1 \
-              "https://x-access-token:${GH_TOKEN}@github.com/Calgooon/rust-overlay.git" \
-              "$RUNNER_WORKSPACE/rust-overlay"
-          fi
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: deploy
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-
-      - name: Install worker-build
-        run: cargo install worker-build --locked
-
-      - name: npm ci
-        run: npm ci
-
-      - name: npm run deploy
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: |
-          set -euo pipefail
-          if [ -z "${CLOUDFLARE_API_TOKEN:-}" ] || [ -z "${CLOUDFLARE_ACCOUNT_ID:-}" ]; then
-            echo "::error::CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID must both be set in repo secrets."
-            exit 1
-          fi
-          npm run deploy
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: 1.95.0
+        components: rustfmt, clippy
+        targets: wasm32-unknown-unknown
+    - uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: . -> target
+    - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+    - run: cargo clippy --locked --target wasm32-unknown-unknown --all-targets -- -D warnings
+  wasm32:
+    name: wasm32
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: 1.95.0
+        components: rustfmt, clippy
+        targets: wasm32-unknown-unknown
+    - uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: . -> target
+    - run: cargo check --locked --target wasm32-unknown-unknown
+    - run: cargo install worker-build@0.8.4 --locked
+    - run: worker-build --release

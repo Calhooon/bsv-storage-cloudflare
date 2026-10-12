@@ -354,13 +354,11 @@ drifts.
 
 ## Version alignment
 
-- `bsv-rs` v0.3.7 — published to crates.io 2026-04-21,
+- `bsv-rs` 0.4.5: pinned exactly in both workspace manifests,
   https://crates.io/crates/bsv-rs .
-- `bsv-storage-cloudflare` Cargo.toml pins `bsv-rs = { version = "0.3", ... }` — the
-  workspace's `Cargo.lock` resolves to 0.3.7 (via the workspace's shared
-  path-dep graph).
-- `rust-overlay` crates depend on `bsv-rs` via the workspace path dep —
-  pinned at 0.3.7 in the lockfile.
+- The workspace lock resolves one registry `bsv-rs` 0.4.5 shared by the Worker,
+  parity harness, middleware 0.5.1 (core 0.2.1), and `bsv-overlay-engine` 0.1.0.
+  No path dependencies or sibling checkout are required.
 - TS SDK reference: `@bsv/sdk` 1.10.1 + `@bsv/overlay` 0.6.0, matching
   `nanostore.babbage.systems` + `overlay-us-1.bsvb.tech` production.
 
