@@ -215,12 +215,13 @@ dependencies = [
 
 [[package]]
 name = "bsv-storage-cloudflare"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "base64",
  "bsv-middleware-cloudflare",
  "bsv-overlay-engine",
  "bsv-rs",
+ "bsv-worker-build-info",
  "chrono",
  "console_error_panic_hook",
  "getrandom 0.2.17",
@@ -235,6 +236,15 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "worker",
+]
+
+[[package]]
+name = "bsv-worker-build-info"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ad7a2cffb2d19f9364497aa9678ad3d16310d76348cd1562e3b14ff697501a5d"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]

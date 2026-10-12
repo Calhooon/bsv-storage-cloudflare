@@ -33,6 +33,7 @@ const PAYMENT_ORIGINATOR: &str = "bsv-auth-cloudflare";
 const SESSION_TTL_SECONDS: u64 = 3600;
 
 mod error;
+mod health;
 mod overlay;
 mod queue;
 mod routes;
@@ -237,10 +238,7 @@ async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
         (&method, path.as_str()),
         (Method::Get, "/") | (Method::Get, "/health")
     ) {
-        let resp = Response::from_json(&json!({
-            "status": "success",
-            "message": "bsv-storage-cloudflare running",
-        }))?;
+        let resp = Response::from_json(&health::body())?;
         return Ok(add_cors_headers(resp));
     }
 
