@@ -42,7 +42,7 @@ hex = "0.4"
 # - test identity keypair (PrivateKey::random + PublicKey hex export, default features)
 # - BRC-31 mutual auth client (auth + http features — SimplifiedFetchTransport
 #   does the wire-level work against nanostore.babbage.systems and our worker)
-bsv-rs = { version = "0.4.1", features = ["auth", "http", "overlay"] }
+bsv-rs = { version = "=0.4.5", features = ["auth", "http", "overlay"] }
 
 # Request correlation IDs for the BRC-31 client (`src/auth.rs`) — 32 random
 # bytes per in-flight General message so the transport callback can route
