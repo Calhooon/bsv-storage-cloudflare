@@ -1,6 +1,14 @@
 # Changelog
 
-## Unreleased: registry dependencies and the L2 re-pin
+## 0.2.1
+
+- Add build provenance to GET `/health` and `/`: the checkout's full revision,
+  dirty flag, UTC build time and five crate versions from Cargo.lock, through
+  `bsv-worker-build-info = "=0.1.0"`. Retain status, message and CORS.
+- No caller, stored-data or resource migration. Health describes a build;
+  it does not establish wallet, overlay or storage readiness.
+
+## 0.2.0: unreleased registry de-path (e0c7971)
 
 The Worker builds without sibling checkouts: `bsv-middleware-cloudflare = "=0.5.1"`
 (locked core 0.2.1), `bsv-overlay-engine = "=0.1.0"`, and `bsv-rs = "=0.4.5"`

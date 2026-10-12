@@ -1,6 +1,6 @@
 [package]
 name = "bsv-storage-cloudflare"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "UHRP file-storage server on Cloudflare Workers. Protocol-compatible Rust/WASM port of @bsv/uhrp-storage-server (nanostore.babbage.systems)."
 license = "MIT"
@@ -47,6 +47,11 @@ hmac = "0.12"
 # the Steak-body check that the overlay's own `/submit` endpoint needs
 # (it returns HTTP 200 + empty Steak on silent topic-manager rejection).
 bsv-overlay-engine = "=0.1.0"
+
+bsv-worker-build-info = "=0.1.0"
+
+[build-dependencies]
+bsv-worker-build-info = { version = "=0.1.0", features = ["build"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }
