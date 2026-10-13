@@ -48,6 +48,51 @@ exists. A live upload, public GET, hash check, advertisement and renewal round
 trip on the current line is pending. The historical checks below do not
 establish current deployment readiness.
 
+## Discovery
+
+Public GET `/.well-known/x402-info` returns the fleet's JSON discovery shape
+without authentication, payment or a response signature. It uses the same
+CORS headers as `/health`, `Content-Type: application/json`, and
+`Cache-Control: public, max-age=300`.
+
+The manifest describes BRC-103/104 authentication at `/.well-known/auth`,
+the server's compressed public identity key, capabilities, and the seven
+health and client routes with their access, payment and delivery fields.
+`/upload` and `/renew` advertise dynamic BRC-29 payment through the
+`x-bsv-payment` header and the signed 402 challenge flow. `/advertise`
+also requires the configured admin allowlist. Discovery itself is unsigned.
+
+`SERVICE_NAME` supplies the name, defaulting to `bsv-storage-cloudflare`.
+`SERVER_PRIVATE_KEY` supplies only the derived public identity in the JSON.
+`PRICE_PER_GB_MO` and `MIN_HOSTING_MINUTES` supply the pricing configuration.
+The manifest shares the quote's 1,000-satoshi floor and rate fetch, including
+the 15 USD/BSV fallback, and computes one-year examples at that request's
+rate. `margin: "0%"` means no extra multiplier beyond `PRICE_PER_GB_MO`.
+Use `/quote` for a current amount; discovery may be cached for five minutes.
+
+Limits identify their enforcement route: `/upload` caps file size at
+11,000,000,000 bytes; `/quote` caps retention at 69,000,000 minutes.
+The quote does not enforce that upload size cap, and upload does not enforce
+the quote's retention maximum or integer-retention rule.
+
+`publicUrlFormat.pattern` is `PUBLIC_URL_BASE` with trailing slashes removed,
+plus `/cdn/{base58id}`. The x402 upload helper replaces `{base58id}` with
+the last segment of the object key in the presigned `uploadURL`. The ID
+encodes 16 random bytes, not the content hash. Set `PUBLIC_URL_BASE` to
+the public file-serving base; changing it requires no source edit.
+
+See [protocol discovery](./PROTOCOL.md#d1-service-discovery) and the
+[fallback-rate golden](./tests/fixtures/manifest/fallback.json), which uses
+synthetic configuration and a public test key. Native tests supply the rate
+directly and perform no HTTP requests. The health test is also a native
+body test; this repository has no HTTP harness for `/health`.
+
+The offline mirror check scans added `src/` lines against the pinned 0.2.1
+base, including unstaged and untracked additions, for hostnames and account
+identifiers. Run `python3 tests/scan_source_hosts.py` from a clone containing
+that base. Existing source literals are outside this check. Scanner regressions
+run with `python3 -m unittest discover -s tests -p test_scan_source_hosts.py`.
+
 ## Recorded parity (2026-04-21)
 
 The [per-route matrix](./PARITY-STATUS.md#per-route-matrix) records all six
@@ -111,6 +156,9 @@ The [local quality gate](./scripts/check.sh) and
 [hosted gate](./.github/workflows/ci.yml) define formatting, clippy, tests,
 WASM checks and the release Worker build. The hosted test job covers the
 Worker and parity harness with the committed registry lock.
+When the release keeper owns the Worker build, `scripts/check.sh --cargo-only`
+runs the five cargo workflow legs. The default gate still includes the
+Worker build.
 
 For resource setup, R2 event notification wiring, deployment and rollback,
 see [DEPLOYMENT.md](./DEPLOYMENT.md). Use your own service URL, for example

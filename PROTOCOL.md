@@ -884,6 +884,71 @@ const satPrice = Math.max(MIN_SATOSHI_PRICE, Math.floor(usdPrice * exchangeRateI
 
 ---
 
+### D.1 Service Discovery
+
+`GET /.well-known/x402-info` is public, unpaid and unsigned. Dispatch occurs
+before the BRC-103/104 adapter, with the same CORS headers as `/health`.
+A configured service returns status 200, `Content-Type: application/json`
+and `Cache-Control: public, max-age=300`.
+
+The JSON has `name`, `description`, `authProtocol` (`brc-103/104`),
+`authEndpoint` (`/.well-known/auth`), `serverIdentityKey`, `capabilities`,
+`endpoints`, `pricing` and `publicUrlFormat`. The name comes from
+`SERVICE_NAME` (default `bsv-storage-cloudflare`); the identity is the
+compressed public key derived from `SERVER_PRIVATE_KEY`, with no private
+material in the response. A discovery identity is an unsigned hint for the
+authenticated protocol, not a signed discovery document.
+
+Each of the seven endpoint entries has `method`, `path`, `description`,
+`auth`, `payment` and `delivery: "instant"`. Health lists `/health` and
+describes `/` as an alias. Health and quote require neither auth nor payment.
+Upload and renew require auth and advertise payment with `protocol: "brc-29"`,
+`dynamic: true`, `transport: "header-only"` and the 402 retry flow. Find,
+list and advertise require auth and have `payment: null`; advertise also
+checks the admin allowlist. Any authenticated identity may pay for renewal.
+Capabilities report BRC-103/104 auth, BRC-29 payment, `refunds: false` and
+header-only payment, including the note that body payment is unsupported.
+
+Pricing reports `model: "per-GB-month"`, `currency: "USD"`, `margin: "0%"`,
+`PRICE_PER_GB_MO`, `bsv_usd`, `rates`, `formula`, `formula_notes`, `examples`,
+`note`, and these bounds:
+
+| Key | Source and enforcement |
+|---|---|
+| `minimum_satoshis` | Shared `quote::MIN_SATOSHI_PRICE`, 1,000. |
+| `minimum_retention_minutes` | `MIN_HOSTING_MINUTES`, using quote's parser; missing, unparseable or NaN values yield zero. |
+| `maximum_file_size_bytes`, `maximum_file_size_human` | Shared `upload::MAX_UPLOAD_BYTES`, 11,000,000,000 bytes; enforced by `/upload`. |
+| `maximum_retention_minutes`, `maximum_retention_human` | Shared `quote::MAX_RETENTION_MINUTES`, 69,000,000 minutes; enforced by `/quote`. |
+
+`src/validation.rs` contains no validators. Quote requires integer, positive
+file sizes and integer, nonzero retention; upload has a size cap but no
+integer-retention check or maximum-retention check. These existing differences
+are described in the manifest rather than introducing new validation.
+
+`bsv_usd` comes from one call to the quote's WhatsOnChain fetch per discovery
+request, with the same 15 USD/BSV fallback on failure or an invalid rate.
+The source and fallback are named in `pricing.note`. `rates.USD_per_GB_month`
+equals `PRICE_PER_GB_MO`; `margin` adds no multiplier. Each of `1_MB_1_year`,
+`10_MB_1_year`, `100_MB_1_year` and `1_GB_1_year` contains `usd` and `satoshis`
+computed by the quote's helpers for 525,600 minutes. USD is the amount before
+the satoshi minimum. The rate is a trusted external price, not chain evidence.
+
+`publicUrlFormat` has `pattern` and `note`. The pattern is the configured
+`PUBLIC_URL_BASE`, with trailing slashes removed, followed by
+`/cdn/{base58id}`. The upload helper substitutes the last segment of the
+object key in `uploadURL`. The identifier encodes 16 random bytes; it is
+separate from the UHRP content hash. Public bytes are available after the
+object upload. No deployment hostname is embedded by the discovery builder.
+
+The fallback JSON fixture is `tests/fixtures/manifest/fallback.json`.
+Native unit tests inject the exchange rate, derive a public key from an
+in-memory test scalar, and compare the full JSON to that fixture. Route
+source checks guard dispatch before auth, CORS, one rate fetch, and headers.
+There is no Worker HTTP harness for health or discovery; status and actual
+edge header behavior require the keeper's runtime gate.
+
+---
+
 ### E. Output Tags on Advertisement Outputs
 
 **TL;DR**: 4 tags per advertisement output. Three use hex encoding for values; one (uploader identity) does not.
