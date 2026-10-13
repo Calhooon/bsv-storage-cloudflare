@@ -19,16 +19,16 @@ const WOC_EXCHANGE_RATE_URL: &str = "https://api.whatsonchain.com/v1/bsv/main/ex
 /// Hard-coded fallback if the WoC fetch fails. Diverges from TS (was 30.0) —
 /// current BSV/USD is ~$16, so a 30.0 fallback would under-charge users in
 /// sats terms whenever WoC is unreachable.
-const FALLBACK_EXCHANGE_RATE_USD_PER_BSV: f64 = 15.0;
+pub(crate) const FALLBACK_EXCHANGE_RATE_USD_PER_BSV: f64 = 15.0;
 
 /// Minimum satoshi price. Diverges from TS (was 10). The per-upload overlay
 /// broadcast costs ~500 sats in miner fees regardless of file size; a 10-sat
 /// floor meant every tiny upload was a net loss. 1000 sats ≈ $0.00016 at
 /// BSV=$16 — trivial to users, covers the broadcast with 2× margin.
-const MIN_SATOSHI_PRICE: u64 = 1000;
+pub(crate) const MIN_SATOSHI_PRICE: u64 = 1000;
 
 /// Hard-coded maximum retention (PROTOCOL.md §1 validation, TS line 69).
-const MAX_RETENTION_MINUTES: f64 = 69_000_000.0;
+pub(crate) const MAX_RETENTION_MINUTES: f64 = 69_000_000.0;
 
 #[derive(Debug, Deserialize)]
 struct WocRate {
@@ -122,12 +122,7 @@ fn validate(
 
     // TS: `const minHostingMinutes = Number(MIN_HOSTING_MINUTES) || 0`.
     // If env var is missing/blank/NaN, `Number(...) || 0` yields 0.
-    let min_hosting_minutes: f64 = min_hosting_minutes_raw.parse().ok().unwrap_or(0.0);
-    let min_hosting_minutes = if min_hosting_minutes.is_nan() {
-        0.0
-    } else {
-        min_hosting_minutes
-    };
+    let min_hosting_minutes = minimum_retention_minutes(min_hosting_minutes_raw);
 
     // TS: `!Number.isInteger(Number(retentionPeriod)) || retentionPeriod < minHostingMinutes`.
     if retention_period.fract() != 0.0 || retention_period < min_hosting_minutes {
@@ -189,9 +184,7 @@ pub(crate) fn compute_sat_price(
     price_per_gb_mo_usd: f64,
     exchange_rate_usd_per_bsv: f64,
 ) -> u64 {
-    let file_size_gb = file_size_bytes / 1_000_000_000.0;
-    let retention_months = retention_minutes / (60.0 * 24.0 * 30.0);
-    let usd_price = file_size_gb * retention_months * price_per_gb_mo_usd;
+    let usd_price = compute_usd_price(file_size_bytes, retention_minutes, price_per_gb_mo_usd);
     let exchange_rate_in_satoshis = 1.0 / (exchange_rate_usd_per_bsv / 100_000_000.0);
     let raw = (usd_price * exchange_rate_in_satoshis).floor();
     // `Math.max(10, floor(...))` in TS — never negative in practice, but clamp
@@ -203,9 +196,30 @@ pub(crate) fn compute_sat_price(
     }
 }
 
+/// The configured lower bound used by `/quote`, also published in discovery.
+pub(crate) fn minimum_retention_minutes(raw: &str) -> f64 {
+    let minutes: f64 = raw.parse().ok().unwrap_or(0.0);
+    if minutes.is_nan() {
+        0.0
+    } else {
+        minutes
+    }
+}
+
+/// The USD portion of the quote calculation, before conversion and the floor.
+pub(crate) fn compute_usd_price(
+    file_size_bytes: f64,
+    retention_minutes: f64,
+    price_per_gb_mo_usd: f64,
+) -> f64 {
+    let file_size_gb = file_size_bytes / 1_000_000_000.0;
+    let retention_months = retention_minutes / (60.0 * 24.0 * 30.0);
+    file_size_gb * retention_months * price_per_gb_mo_usd
+}
+
 /// Hit WhatsOnChain for the live BSV/USD rate. On ANY failure (network, HTTP
-/// non-2xx, parse error, NaN), fall back to 30 USD/BSV — matches TS line 46.
-async fn fetch_exchange_rate() -> f64 {
+/// non-2xx, parse error, nonpositive or nonfinite rate), use the shared fallback.
+pub(crate) async fn fetch_exchange_rate() -> f64 {
     match fetch_exchange_rate_inner().await {
         Some(rate) if rate.is_finite() && rate > 0.0 => rate,
         _ => FALLBACK_EXCHANGE_RATE_USD_PER_BSV,

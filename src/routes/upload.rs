@@ -36,7 +36,7 @@ use serde_json::{json, Value};
 use worker::Env;
 
 /// TS `src/routes/upload.ts:63` — explicit upper bound beyond what `/quote` enforces.
-const MAX_UPLOAD_BYTES: f64 = 11_000_000_000.0;
+pub(crate) const MAX_UPLOAD_BYTES: f64 = 11_000_000_000.0;
 
 /// GCS presigned URL validity in TS (`getUploadURL.ts:59`: `Date.now() + 604000 * 1000`).
 /// Preserved verbatim — note this is 604000 seconds, NOT the full 604800 (7d) S3 max.

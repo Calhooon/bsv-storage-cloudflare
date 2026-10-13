@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.2.2 (2026-10-13)
+
+- Add public, unsigned GET `/.well-known/x402-info` with fleet discovery
+  fields, seven endpoint descriptions, BRC-103/104 identity and BRC-29
+  header payment capabilities, CORS and a five-minute cache policy.
+- Derive the public download pattern from `PUBLIC_URL_BASE`; the upload
+  helper substitutes the object key's final base58 segment. `SERVICE_NAME`
+  optionally overrides the default service name.
+- Share the quote's rate fetch, fallback, minimum, USD and satoshi arithmetic
+  with discovery. Publish the existing upload and quote limits with their
+  enforcement scope and deterministic one-year examples.
+- Add an offline golden, configuration and pricing tests, dispatch checks,
+  and a source-addition hostname and account scanner against the pinned base.
+  Existing source literals are outside this change's mirror gate.
+- Align the local gate with all five cargo workflow legs. Keep the Worker
+  build in the default gate; `--cargo-only` leaves it to the release keeper.
+- No dependency or version move, caller migration, or stored-data change.
+  The keeper sets the release version and verifies the Worker runtime.
+
 ## 0.2.1
 
 - Add build provenance to GET `/health` and `/`: the checkout's full revision,

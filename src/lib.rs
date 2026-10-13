@@ -242,6 +242,11 @@ async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
         return Ok(add_cors_headers(resp));
     }
 
+    if method == Method::Get && path == "/.well-known/x402-info" {
+        let resp = routes::manifest::handle(&env).await?;
+        return Ok(add_cors_headers(resp));
+    }
+
     // /quote is unauthenticated per PROTOCOL.md §1.
     if method == Method::Post && path == "/quote" {
         let body = req.bytes().await?;

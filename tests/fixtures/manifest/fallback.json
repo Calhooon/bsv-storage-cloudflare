@@ -1,0 +1,129 @@
+{
+  "name": "bsv-storage-cloudflare",
+  "description": "UHRP file hosting on Cloudflare R2 with BRC-103/104 authentication, BRC-29 payments and public downloads.",
+  "authProtocol": "brc-103/104",
+  "authEndpoint": "/.well-known/auth",
+  "serverIdentityKey": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+  "capabilities": {
+    "auth": "brc-103/104",
+    "payment": "brc-29",
+    "refunds": false,
+    "paymentTransport": "header-only",
+    "paymentTransportNote": "Payment must be sent as JSON in the x-bsv-payment header; body mode (x-bsv-payment: body) is not supported."
+  },
+  "endpoints": [
+    {
+      "method": "GET",
+      "path": "/health",
+      "description": "Build provenance and health message; / is an alias.",
+      "auth": false,
+      "payment": null,
+      "delivery": "instant"
+    },
+    {
+      "method": "POST",
+      "path": "/quote",
+      "description": "Quote a file size and retention period in satoshis without authentication or payment.",
+      "auth": false,
+      "payment": null,
+      "delivery": "instant"
+    },
+    {
+      "method": "POST",
+      "path": "/upload",
+      "description": "Return a presigned R2 PUT URL and required headers for a paid upload; PUT the bytes directly to R2.",
+      "auth": true,
+      "payment": {
+        "protocol": "brc-29",
+        "dynamic": true,
+        "transport": "header-only",
+        "description": "Send the authenticated request without payment to receive a signed 402 with the exact satoshi amount, then retry with payment JSON in the x-bsv-payment header; body mode is not supported."
+      },
+      "delivery": "instant"
+    },
+    {
+      "method": "POST",
+      "path": "/renew",
+      "description": "Pay to extend an existing advertisement using its recorded file size; any authenticated identity may renew.",
+      "auth": true,
+      "payment": {
+        "protocol": "brc-29",
+        "dynamic": true,
+        "transport": "header-only",
+        "description": "Send the authenticated request without payment to receive a signed 402 with the exact satoshi amount, then retry with payment JSON in the x-bsv-payment header; body mode is not supported."
+      },
+      "delivery": "instant"
+    },
+    {
+      "method": "GET",
+      "path": "/find",
+      "description": "Find metadata for a UHRP URL belonging to the authenticated uploader.",
+      "auth": true,
+      "payment": null,
+      "delivery": "instant"
+    },
+    {
+      "method": "GET",
+      "path": "/list",
+      "description": "List files belonging to the authenticated uploader.",
+      "auth": true,
+      "payment": null,
+      "delivery": "instant"
+    },
+    {
+      "method": "POST",
+      "path": "/advertise",
+      "description": "Create a UHRP advertisement; the authenticated identity must also be in ADMIN_IDENTITY_KEYS.",
+      "auth": true,
+      "payment": null,
+      "delivery": "instant"
+    }
+  ],
+  "pricing": {
+    "model": "per-GB-month",
+    "currency": "USD",
+    "margin": "0%",
+    "PRICE_PER_GB_MO": 0.05,
+    "bsv_usd": 15.0,
+    "rates": {
+      "USD_per_GB_month": 0.05
+    },
+    "minimum_satoshis": 1000,
+    "minimum_retention_minutes": 15.0,
+    "maximum_file_size_bytes": 11000000000,
+    "maximum_file_size_human": "11 GB (11000000000 bytes, SI); enforced by /upload",
+    "maximum_retention_minutes": 69000000,
+    "maximum_retention_human": "~131 years; enforced by /quote",
+    "formula": "max(minimum_satoshis, floor((fileSize / 1e9) * (retentionPeriod / 43200) * PRICE_PER_GB_MO * (1 / (bsv_usd / 1e8))))",
+    "formula_notes": {
+      "fileSize": "bytes (1 GB = 1,000,000,000, SI)",
+      "retentionPeriod": "minutes (1 month = 43,200 = 60*24*30); examples use 525,600 minutes (365 days)",
+      "bsvUsdRate": "Live from WhatsOnChain; fallback 15 USD/BSV on a failed fetch or invalid rate",
+      "rounding": "floor, then the minimum satoshi price",
+      "minimum": "1000 satoshis"
+    },
+    "examples": {
+      "1_MB_1_year": {
+        "usd": 0.0006083333333333333,
+        "satoshis": 4055
+      },
+      "10_MB_1_year": {
+        "usd": 0.006083333333333333,
+        "satoshis": 40555
+      },
+      "100_MB_1_year": {
+        "usd": 0.06083333333333334,
+        "satoshis": 405555
+      },
+      "1_GB_1_year": {
+        "usd": 0.6083333333333334,
+        "satoshis": 4055555
+      }
+    },
+    "note": "Live from WhatsOnChain; fallback 15 USD/BSV on a failed fetch or invalid rate. bsv_usd and all examples use one call to the quote's rate fetch. Use /quote for current pricing; this unsigned manifest may be cached for 300 seconds. No additional margin multiplier is applied to PRICE_PER_GB_MO. USD examples are before the satoshi minimum. MIN_HOSTING_MINUTES supplies the configured lower bound (missing, unparseable or NaN values become zero). /quote requires positive integer file sizes and integer, nonzero retention and caps retention; /upload caps file size but does not enforce that retention maximum or integer retention. /quote does not enforce the upload size cap."
+  },
+  "publicUrlFormat": {
+    "pattern": "https://files.invalid/cdn/{base58id}",
+    "note": "Replace {base58id} with the last segment of the object key in uploadURL, a base58 encoding of 16 random bytes; public downloads use PUBLIC_URL_BASE after the object is uploaded."
+  }
+}
