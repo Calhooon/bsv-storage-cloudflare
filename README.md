@@ -1,6 +1,6 @@
 # bsv-storage-cloudflare
 
-UHRP file-storage service **0.2.1** on Cloudflare Workers, written in Rust
+UHRP file-storage service **0.2.3** on Cloudflare Workers, written in Rust
 and compiled to WASM. It implements the six client routes of
 [`@bsv/uhrp-storage-server`](https://github.com/bsv-blockchain/storage-server)
 with Cloudflare R2 for file bytes and a post-upload Queue consumer for
@@ -23,6 +23,12 @@ a priced request without payment receives a signed **402 Payment Required**
 challenge; the middleware verifies the BRC-29 payment before the handler runs.
 See [request dispatch](./src/lib.rs) and the [route handlers](./src/routes/).
 
+The router also dispatches `/drafts` and `/drafts/:id` (GET, PUT, DELETE,
+BRC-31) for the Composer's score-draft sync. These routes are not part of the
+nanostore surface; they answer only on deployments that bind the
+`COMPOSER_DRAFTS` KV namespace (`wrangler.composer.toml`), and the 404 of any
+unknown path otherwise. See the [drafts module](./src/routes/drafts.rs).
+
 After `/upload`, the client PUTs bytes directly to R2 using the returned URL
 and required headers, including the signed content length. Downloads are
 public GETs at the configured public file URL. R2 object-create events feed
@@ -37,14 +43,14 @@ exceed Worker memory, as recorded in the queue source.
 ## Health and release status
 
 Public GET `/health` and `/` retain the success status and message and add a
-`build` object in 0.2.1: `lib_rev`, `dirty`, `built_at` (UTC), and `crates`
+`build` object since 0.2.1: `lib_rev`, `dirty`, `built_at` (UTC), and `crates`
 with five locked crate versions. This describes the build, rather than
 establishing wallet, overlay or storage readiness. See the
 [health implementation](./src/health.rs) and [0.2.1 release notes](./CHANGELOG.md#021).
 
-The beta from the public tag
-[`v0.2.1`](https://github.com/Calhooon/bsv-storage-cloudflare/releases/tag/v0.2.1)
-exists. A live upload, public GET, hash check, advertisement and renewal round
+Public tags exist up to
+[`v0.2.2`](https://github.com/Calhooon/bsv-storage-cloudflare/releases/tag/v0.2.2);
+0.2.3 is this manifest's version, released by its `v0.2.3` tag. A live upload, public GET, hash check, advertisement and renewal round
 trip on the current line is pending. The historical checks below do not
 establish current deployment readiness.
 
@@ -92,6 +98,17 @@ base, including unstaged and untracked additions, for hostnames and account
 identifiers. Run `python3 tests/scan_source_hosts.py` from a clone containing
 that base. Existing source literals are outside this check. Scanner regressions
 run with `python3 -m unittest discover -s tests -p test_scan_source_hosts.py`.
+
+## Releases
+
+The tag (`vX.Y.Z`) is the release of record; the repository's Releases page
+carries a Release per tag. From 0.2.3 on, a tag push runs
+[the release workflow](./.github/workflows/release.yml), which publishes the
+crate `bsv-storage-cloudflare` to crates.io at the same version through
+trusted publishing. The Worker in production is deployed from the tag by the
+stack's infra, not by this repository's workflows. Earlier crates.io entries
+under this name: 0.1.0 (2026-04-23) and 0.2.0 (2026-07-02); the tags 0.2.1
+and 0.2.2 were not published there.
 
 ## Recorded parity (2026-04-21)
 
