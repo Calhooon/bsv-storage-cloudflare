@@ -1,0 +1,58 @@
+# Publish bsv-storage-cloudflare to crates.io from a v* tag through trusted
+# publishing (no token in the repository). The tag must equal the package
+# version and sit on main. The crate builds natively (ci.yml tests it on the
+# host), so the package is verified with a native `cargo publish --dry-run`;
+# the wasm32 build is gated by ci.yml's wasm32 and clippy jobs. Deploying the
+# Worker from the tag is the stack's infra, not this workflow.
+name: Release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+env:
+  CARGO_TERM_COLOR: always
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+      - name: Check version and main ancestry
+        run: |
+          python3 scripts/check-release-version.py
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+
+  # ci.yml provides workflow_call with the test, fmt, clippy and wasm32 jobs.
+  ci:
+    needs: version
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  storage:
+    needs: [version, ci]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+        with:
+          toolchain: '1.95.0'
+      - name: Verify package
+        run: cargo publish --locked --dry-run -p bsv-storage-cloudflare
+      - uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+        id: auth
+      - name: Publish
+        run: cargo publish --locked -p bsv-storage-cloudflare
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+      - name: Wait for registry index
+        run: bash scripts/wait-crate-index.sh bsv-storage-cloudflare "${GITHUB_REF_NAME#v}"

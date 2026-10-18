@@ -5,6 +5,8 @@
 name: ci
 'on':
   pull_request: null
+  # the release workflow calls these jobs on a v* tag (release.yml)
+  workflow_call: null
   push:
     branches:
     - main

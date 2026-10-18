@@ -1,10 +1,26 @@
 [package]
 name = "bsv-storage-cloudflare"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 description = "UHRP file-storage server on Cloudflare Workers. Protocol-compatible Rust/WASM port of @bsv/uhrp-storage-server (nanostore.babbage.systems)."
 license = "MIT"
-repository = "https://github.com/Calgooon/bsv-storage-cloudflare"
+repository = "https://github.com/Calhooon/bsv-storage-cloudflare"
+readme = "README.md"
+keywords = ["bitcoin", "bsv", "uhrp", "cloudflare", "wasm"]
+categories = ["cryptography::cryptocurrencies"]
+# The sources, the build script and its helper, the lock (build.rs and
+# src/health.rs read it), the wrangler template, the README, the licence and
+# the changelog. Tests and fixtures stay in the repository.
+include = [
+    "src/**/*.rs",
+    "build.rs",
+    "build_versions.rs",
+    "Cargo.lock",
+    "wrangler.toml",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md",
+]
 
 [lib]
 crate-type = ["cdylib", "rlib"]

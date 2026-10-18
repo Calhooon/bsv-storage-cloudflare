@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.2.3 (2026-10-18)
+
+- Publish the crate `bsv-storage-cloudflare` to crates.io from a `v*` tag
+  through `.github/workflows/release.yml`: crates.io trusted publishing, no
+  token in the repository, the tag checked against the manifest and lock
+  version and against `main`, the `ci.yml` jobs called before a native
+  `cargo publish --dry-run`. `ci.yml` gains `workflow_call` for that call.
+- `Cargo.toml` names the README, keywords, category and an `include` list
+  (sources, build script, lock, wrangler template, README, licence and
+  changelog); the repository URL is corrected to `Calhooon`.
+- Refresh the README to this release, with a Releases section.
+- No dependency, route, binding or wrangler change.
+
 ## 0.2.2 (2026-10-13)
 
 - Add public, unsigned GET `/.well-known/x402-info` with fleet discovery

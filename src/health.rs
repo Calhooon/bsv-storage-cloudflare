@@ -47,7 +47,7 @@ mod tests {
         let crates = build["crates"].as_object().expect("locked crate versions");
         assert_eq!(crates.len(), 5);
         for (name, version) in [
-            ("bsv-storage-cloudflare", "0.2.2"),
+            ("bsv-storage-cloudflare", "0.2.3"),
             ("bsv-rs", "0.4.5"),
             ("bsv-middleware-cloudflare", "0.5.1"),
             ("bsv-middleware-core", "0.2.1"),
