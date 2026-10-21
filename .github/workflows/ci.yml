@@ -77,3 +77,9 @@ jobs:
     - run: cargo check --locked --target wasm32-unknown-unknown
     - run: cargo install worker-build@0.8.4 --locked
     - run: worker-build --release
+  scrub:
+    name: scrub
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - run: tools/scrub.sh
