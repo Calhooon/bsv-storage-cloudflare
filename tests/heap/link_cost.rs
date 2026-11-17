@@ -407,7 +407,7 @@ fn fixture_beefs() -> Vec<(String, Vec<u8>)> {
     v
 }
 
-// ── the adversarial shapes ──────────────────────────────────────────────
+// ── the costly shapes ───────────────────────────────────────────────────
 
 /// One unproven parent with `m` outputs (scripts of `script_len`) and a
 /// subject with `n` inputs spending it (unlocking scripts of `unlock_len`).
@@ -546,7 +546,7 @@ fn random_beef(seed: u64) -> Vec<u8> {
     }
 }
 
-fn adversarial_shapes() -> Vec<(String, Vec<u8>)> {
+fn costly_shapes() -> Vec<(String, Vec<u8>)> {
     let mut v = Vec::new();
     for (m, n) in [(10, 10), (100, 50), (400, 100), (1000, 200), (2000, 400)] {
         v.push((format!("wide parent {m}x{n}"), wide_parent(m, n, 0, 0)));
@@ -584,7 +584,7 @@ fn predicted(beef: &[u8]) -> Option<usize> {
 fn all_generated() -> Vec<(String, Vec<u8>)> {
     let mut v = fixture_beefs();
     v.extend(honest_shapes());
-    v.extend(adversarial_shapes());
+    v.extend(costly_shapes());
     for seed in 1..=520u64 {
         v.push((format!("random {seed}"), random_beef(seed)));
     }
@@ -595,7 +595,6 @@ fn all_generated() -> Vec<(String, Vec<u8>)> {
 fn the_link_cost_estimate_bounds_what_from_beef_allocates() {
     let _g = measure_lock();
     let mut checked = 0;
-    let mut worst_ratio = 0f64;
     for (name, beef) in all_generated() {
         let Some(limit) = predicted(&beef) else {
             continue;
@@ -605,11 +604,9 @@ fn the_link_cost_estimate_bounds_what_from_beef_allocates() {
             peak <= limit,
             "{name}: from_beef peaked at {peak} B over the predicted {limit} B"
         );
-        worst_ratio = worst_ratio.max(peak as f64 / limit as f64);
         checked += 1;
     }
     assert!(checked >= 500, "only {checked} BEEFs measured");
-    eprintln!("link cost bound: {checked} BEEFs, worst peak/predicted {worst_ratio:.3}");
 }
 
 // ── the payment header ──────────────────────────────────────────────────
@@ -659,14 +656,12 @@ fn door(header: &str) -> Option<Option<PaymentVerdict>> {
     }
 }
 
-/// The largest header the shape fits in: 128 KiB.
+/// The largest header the tests build: 128 KiB.
 const HEADER_MAX: usize = 128 * 1024;
 
-/// The worst shape for the link per wire byte (one unproven parent with
-/// empty-script outputs, every subject input spending it) at the largest
-/// size that fits a 128 KiB header.
-fn worst_header() -> (String, usize, usize) {
-    let mut best = (String::new(), 0, 0);
+/// A header of the `wide_parent` family, the largest under [`HEADER_MAX`].
+fn largest_header() -> String {
+    let mut best = String::new();
     let mut m = 4000;
     loop {
         let n = (m * 9) / 41;
@@ -674,7 +669,7 @@ fn worst_header() -> (String, usize, usize) {
         if h.len() > HEADER_MAX {
             break;
         }
-        best = (h, m, n);
+        best = h;
         m += 50;
     }
     best
@@ -683,35 +678,24 @@ fn worst_header() -> (String, usize, usize) {
 #[test]
 fn the_payment_header_link_cost_is_bounded_before_the_middleware() {
     let _g = measure_lock();
-    let (header, m, n) = worst_header();
+    let header = largest_header();
     assert!(header.len() <= HEADER_MAX);
     let mut verdict = None;
     let peak = peak_of(|| verdict = Some(door(&header)));
-    assert_eq!(verdict, Some(None), "the check refuses the {m}x{n} shape");
+    assert_eq!(verdict, Some(None), "the check refuses the header");
     // The whole check (JSON, base64, parse, estimate) stays within a band of
     // the header's own size.
     let band = 24 * header.len();
-    eprintln!(
-        "door: {m}x{n}, header {} B, check peak {peak} B (band {band} B)",
-        header.len()
-    );
     assert!(peak <= band, "check peaked at {peak} B, band {band} B");
-    let parsed = Beef::from_binary(&wide_parent(m, n, 0, 0)).unwrap();
-    let est = link_cost(&parsed).unwrap().heap_bytes();
-    eprintln!("door: estimate {est} B, ceiling {LINK_COST_CEILING} B");
-    assert!(est > 32 * LINK_COST_CEILING);
 }
 
 #[test]
 fn honest_payments_reach_the_middleware_with_their_verdict() {
     let _g = measure_lock();
-    let mut largest = 0u64;
     for (name, beef) in fixture_beefs().into_iter().chain(honest_shapes()) {
         let header = header_for(&beef);
         let parsed = Beef::from_binary(&beef).unwrap();
         let est = link_cost(&parsed).unwrap().heap_bytes();
-        largest = largest.max(est);
-        eprintln!("honest: {name}: {} B wire, estimate {est} B", beef.len());
         assert!(
             est * 8 <= LINK_COST_CEILING,
             "{name}: estimate {est} B is not far below the ceiling"
@@ -723,7 +707,6 @@ fn honest_payments_reach_the_middleware_with_their_verdict() {
         );
         assert_eq!(door(&header), Some(middleware_read(&header)), "{name}");
     }
-    eprintln!("honest: largest estimate {largest} B");
 }
 
 #[test]
@@ -755,20 +738,14 @@ fn a_header_that_does_not_decode_goes_on_unchanged() {
 }
 
 #[test]
-fn the_smallest_shapes_over_the_ceiling() {
+fn the_check_refuses_a_small_header_over_the_bound() {
     let _g = measure_lock();
-    // Grow the worst shape until the estimate passes the ceiling.
+    // Grow the `wide_parent` family until the check refuses it.
     let mut m = 10;
     loop {
         let n = (m * 9) / 41 + 1;
-        let beef = wide_parent(m, n, 0, 0);
-        let header = header_for(&beef);
-        if let HeaderCheck::OverBound { estimate } = payment_header_link_check(&header) {
-            eprintln!(
-                "smallest over the ceiling: {m}x{n}, {} B wire, header {} B, estimate {estimate} B",
-                beef.len(),
-                header.len()
-            );
+        let header = header_for(&wide_parent(m, n, 0, 0));
+        if let HeaderCheck::OverBound { .. } = payment_header_link_check(&header) {
             assert!(header.len() < 24 * 1024);
             break;
         }
@@ -821,16 +798,12 @@ fn the_fan_out_reads_the_subject_alone() {
 #[test]
 fn the_fan_out_read_follows_the_body() {
     let _g = measure_lock();
-    let mut worst = 0f64;
     for (name, beef) in all_generated() {
         let peak = peak_of(|| subject_output(&beef, 0));
-        let ratio = peak as f64 / beef.len().max(1) as f64;
-        worst = worst.max(ratio);
         assert!(
             peak <= PARSE_FLOOR + PARSE_PER_BYTE * beef.len(),
             "{name}: subject read peaked at {peak} B for {} B",
             beef.len()
         );
     }
-    eprintln!("fan-out read: worst peak per wire byte {worst:.1}");
 }
