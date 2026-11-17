@@ -1,8 +1,8 @@
 //! Overlay SHIP broadcaster — UHRP advert submission.
 //!
-//! Thin wrapper around the `overlay-engine`/`overlay-cloudflare` crates
-//! (rust-overlay), reusing their `TaggedBEEF` + `Steak` wire types so this
-//! crate no longer carries its own duplicates of either.
+//! Thin wrapper over the overlay's submit wire, reusing the `TaggedBEEF` +
+//! `Steak` wire types of `bsv_rs::overlay::types` (the types the overlay's
+//! engine re-exports) so this crate carries no duplicates of either.
 //!
 //! # Why not just `WorkerBroadcaster::broadcast_to_host` verbatim?
 //!
@@ -28,7 +28,7 @@
 
 #![allow(dead_code)] // Some helpers are consumed only by /advertise or /renew.
 
-use bsv_overlay_engine::types::{Steak, TaggedBEEF};
+use bsv_rs::overlay::types::{Steak, TaggedBEEF};
 use worker::{Fetch, Headers, Method, Request, RequestInit};
 
 use crate::error::ERR_OVERLAY_BROADCAST;
@@ -403,9 +403,21 @@ async fn read_body_bounded(response: &mut worker::Response, cap: usize) -> Resul
     Ok(body)
 }
 
+/// The subject transaction's output `vout`, read without linking its
+/// ancestry: `Transaction::from_beef_subject` resolves the subject as
+/// `Transaction::from_beef` does (the Atomic BEEF's named transaction, else
+/// the last entry) and copies that entry alone.
+pub(crate) fn subject_output(
+    beef_bytes: &[u8],
+    vout: usize,
+) -> Option<bsv_rs::transaction::TransactionOutput> {
+    let mut tx = bsv_rs::transaction::Transaction::from_beef_subject(beef_bytes, None).ok()?;
+    std::mem::take(&mut tx.outputs).into_iter().nth(vout)
+}
+
 /// The SHIP host URLs a lookup answer names. Each output's subject is read
-/// without linking its ancestry ([`crate::link_cost::subject_output`]): the
-/// fan-out needs the one output, nothing linked.
+/// without linking its ancestry ([`subject_output`]): the fan-out needs the
+/// one output, nothing linked.
 pub(crate) fn hosts_from_lookup_answer(body: &[u8]) -> Result<Vec<String>, String> {
     use bsv_rs::script::templates::PushDrop;
 
@@ -431,7 +443,7 @@ pub(crate) fn hosts_from_lookup_answer(body: &[u8]) -> Result<Vec<String>, Strin
     let mut urls = Vec::new();
     for out in answer.outputs {
         let vout = out.output_index as usize;
-        let output = match crate::link_cost::subject_output(&out.beef, vout) {
+        let output = match subject_output(&out.beef, vout) {
             Some(o) => o,
             None => continue,
         };
@@ -546,7 +558,7 @@ mod tests {
     #[test]
     fn steak_parses_outputs_to_admit() {
         // Steak is `HashMap<String, AdmittanceInstructions>` per
-        // `bsv_overlay_engine::types::Steak` (re-exported from `bsv_rs`). Lock
+        // `bsv_rs::overlay::types::Steak`. Lock
         // the wire-format parity we rely on in submit_tagged.
         let body = r#"{"tm_uhrp":{"outputsToAdmit":[0],"coinsToRetain":[]}}"#;
         let parsed: Steak = serde_json::from_str(body).unwrap();
@@ -651,7 +663,7 @@ mod tests {
         let beef = ship_answer_beef();
         // The subject's output is the one `Transaction::from_beef` returns.
         let linked = bsv_rs::transaction::Transaction::from_beef(&beef, None).unwrap();
-        let unlinked = crate::link_cost::subject_output(&beef, 0).unwrap();
+        let unlinked = subject_output(&beef, 0).unwrap();
         assert_eq!(
             unlinked.locking_script.to_binary(),
             linked.outputs[0].locking_script.to_binary()

@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.3.0 (2026-11-17)
+
+- bsv-rs `0.8.11` (a caret requirement) and bsv-middleware-cloudflare
+  `=0.7.4` (core 0.4.3); the lock holds one bsv-rs. The parity harness moves
+  with them. `bsv-overlay-engine` is no longer a dependency: `TaggedBEEF` and
+  `Steak` come from `bsv_rs::overlay::types`, the types the engine
+  re-exports. `/health`'s `build.crates` names four crates.
+- The paid routes' payment check reads the payment's subject transaction
+  alone (output 0's script and amount; nothing linked, no script run), so
+  `/upload` and `/renew` hand the header to the middleware with no check of
+  their own in front of it. `tests/heap` measures that door on every shape
+  up to a 128 KiB header: its peak stays within 1 MiB plus 8 bytes per
+  header byte.
+- A derivation prefix is claimed in the `AUTH_SESSIONS` KV under the same
+  key (`auth:nonce:payment-derivation-prefix:<prefix>`, no expiry), now
+  holding the subject txid it pays for: a prefix consumed earlier stays
+  refused, and another transaction under a claimed prefix is refused with
+  `400 ERR_INVALID_DERIVATION_PREFIX`. A KV fault while claiming answers
+  `503 ERR_PAYMENT_UNAVAILABLE` with `Retry-After`, the quote kept.
+- The middleware's own challenge (after a wallet rejection) carries the
+  same payment headers as the routes' 402; responses expose `Retry-After`
+  to browsers.
+- A payment's BEEF and a tracker answer's BEEF are read by bsv-rs 0.8:
+  bytes after the last transaction and non-canonical varints are refused (an
+  unreadable payment, `400 ERR_INVALID_PAYMENT`; a tracker output skipped).
+  The advert's AtomicBEEF holds its transaction and that transaction's
+  ancestry.
+- `tests/compat` runs v0.2.4's modules (a verbatim copy) against the current
+  ones on the same inputs: sessions and general messages, derivation
+  prefixes, the payment header and its verdict, the advert's fields, script
+  and transaction, the fan-out's hosts, the R2 event and the presigned PUT.
+  CI runs it with fmt and clippy.
+- No binding, wrangler or route change, and no stored-data migration.
+
 ## 0.2.4 (2026-11-17)
 
 - The payment header's transaction is checked before the payment middleware
