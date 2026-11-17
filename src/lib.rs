@@ -8,8 +8,7 @@ use bsv_middleware_cloudflare::{
     middleware::{
         auth::{handle_cors_preflight, AuthSession},
         payment::payment_headers,
-        process_auth, process_payment_with_storage, sign_json_response, AuthMiddlewareOptions,
-        AuthResult, PaymentMiddlewareOptions, PaymentResult,
+        process_auth, sign_json_response, AuthMiddlewareOptions, AuthResult, PaymentResult,
     },
     AuthCloudflareError, KvPrefixStore, KvSessionStorage,
 };
@@ -35,6 +34,7 @@ const SESSION_TTL_SECONDS: u64 = 3600;
 mod error;
 mod health;
 mod overlay;
+pub mod paid;
 mod queue;
 mod routes;
 mod storage;
@@ -92,7 +92,7 @@ async fn build_signed_402(price: u64, session: &AuthSession, server_key: &str) -
 }
 
 /// The KV handle behind the payment-derivation-prefix store
-/// (the-composer #44/#62; [`run_payment_middleware`] wraps it in a
+/// (the-composer #44/#62; [`run_payment_door`] wraps it in a
 /// [`KvPrefixStore`]).
 ///
 /// Same `AUTH_SESSIONS` KV namespace + `"auth"` prefix + TTL that the auth
@@ -110,14 +110,18 @@ fn payment_nonce_store(env: &Env) -> std::result::Result<KvSessionStorage, AuthC
     Ok(KvSessionStorage::new(kv, "auth", SESSION_TTL_SECONDS))
 }
 
-/// BRC-29 payment processing with single-use derivation prefixes —
-/// the middleware's `process_payment_with_storage` over a
+/// BRC-29 payment processing with single-use derivation prefixes — the
+/// storage's door ([`paid::decide`], the middleware's
+/// `process_payment_with_storage` decision step for step) over a
 /// [`KvPrefixStore`] on the [`payment_nonce_store`] handle (the-composer
-/// #44/#62 on the live `/upload` and `/renew` routes).
+/// #44/#62 on the live `/upload` and `/renew` routes), answered as the
+/// middleware answers ([`paid::into_result`]).
 ///
-/// The middleware reads the payment's subject transaction alone (output 0's
+/// The door refuses a header over [`paid::PAYMENT_HEADER_MAX`] before
+/// reading it, reads the payment's subject transaction alone (output 0's
 /// script and amount; no ancestry linked, no script run) and leaves the
-/// payment's validity to the wallet storage server's `internalizeAction`.
+/// payment's validity to the wallet storage server's `internalizeAction`,
+/// whose request it writes once ([`paid::internalize_call`]).
 /// Deliberate money-path deltas vs `@bsv/payment-express-middleware` 1.2.3
 /// (the middleware's own executed tests pin the ordering):
 /// - a replayed `X-BSV-Payment` header is rejected with
@@ -130,34 +134,42 @@ fn payment_nonce_store(env: &Env) -> std::result::Result<KvSessionStorage, AuthC
 /// - a wallet **error** releases the prefix to the same transaction (an
 ///   honest retry works); a wallet **rejection** (`accepted != true`) keeps
 ///   it consumed and 402s with a fresh challenge.
-async fn run_payment_middleware<F: Fn(&Request) -> u64>(
+async fn run_payment_door(
     req: &Request,
     env: &Env,
     auth_context: &bsv_middleware_cloudflare::AuthContext,
-    options: &PaymentMiddlewareOptions<F>,
+    server_key: &str,
+    price: u64,
+    wallet_url: &str,
 ) -> std::result::Result<PaymentResult, AuthCloudflareError> {
     let nonce_store = payment_nonce_store(env)?;
-    let result =
-        process_payment_with_storage(req, auth_context, options, &KvPrefixStore(&nonce_store))
-            .await?;
-    Ok(match result {
-        PaymentResult::Required(r) => PaymentResult::Required(header_transport_only(r)),
-        PaymentResult::Failed(r) => PaymentResult::Failed(header_transport_only(r)),
-        other => other,
-    })
+    let header = req.headers().get(payment_headers::PAYMENT).ok().flatten();
+    let decision = paid::decide(
+        auth_context,
+        price,
+        header,
+        server_key,
+        &KvPrefixStore(&nonce_store),
+        |remittance| {
+            paid::internalize(
+                wallet_url,
+                server_key,
+                &auth_context.identity_key,
+                remittance,
+            )
+        },
+    )
+    .await?;
+    paid::into_result(decision)
 }
 
-/// `payment_headers::TRANSPORTS` of the middleware.
-const PAYMENT_TRANSPORTS: &str = "x-bsv-payment-transports";
-
-/// The payment transports this Worker reads: the `X-BSV-Payment` header
-/// alone. The middleware's own challenges (the fresh challenge after a
-/// wallet rejection) name `x-bsv-payment-transports: header,multipart`;
-/// the paid routes read no multipart body, so the name is taken off and the
-/// challenge carries the header set [`build_signed_402`] sends.
-fn header_transport_only(response: Response) -> Response {
-    let _ = response.headers().delete(PAYMENT_TRANSPORTS);
-    response
+/// The wallet storage server the paid routes internalize payments at: the
+/// one `/advertise` draws funds from (`WALLET_STORAGE_URL`).
+fn wallet_storage_url(env: &Env) -> String {
+    env.var("WALLET_STORAGE_URL")
+        .ok()
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "https://wallet-infra.x402agency.com".to_string())
 }
 
 /// Build an UNSIGNED JSON response with CORS headers. The minimal error
@@ -351,13 +363,18 @@ async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 Some(ref s) => build_signed_402(price, s, &server_key).await,
                 None => {
                     // No session means AuthFetch wouldn't be able to verify
-                    // either way — fall through to middleware's unsigned 402
+                    // either way — fall through to the door's unsigned 402
                     // as a minimal error surface.
-                    let payment_options = PaymentMiddlewareOptions::new(
-                        server_key.clone(),
-                        move |_: &Request| -> u64 { price },
-                    );
-                    match run_payment_middleware(&req, &env, &auth_context, &payment_options).await
+                    let wallet_url = wallet_storage_url(&env);
+                    match run_payment_door(
+                        &req,
+                        &env,
+                        &auth_context,
+                        &server_key,
+                        price,
+                        &wallet_url,
+                    )
+                    .await
                     {
                         Ok(PaymentResult::Required(r) | PaymentResult::Failed(r)) => Ok(r),
                         Ok(_) => {
@@ -369,29 +386,26 @@ async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 }
             };
         }
-        // Annotate closure arg type explicitly so the HRTB on
-        // `process_payment_with_storage::<F, S>`'s `F: Fn(&Request) -> u64`
-        // bound is satisfied.
-        let calc_price = move |_: &Request| -> u64 { price };
         // Payment must internalize against the SAME wallet server /advertise
-        // draws funds from. Middleware default is storage.babbage.systems; override
-        // with our WALLET_STORAGE_URL so /upload payments land where /advertise
-        // can see them.
-        let wallet_url = env
-            .var("WALLET_STORAGE_URL")
-            .ok()
-            .map(|v| v.to_string())
-            .unwrap_or_else(|| "https://wallet-infra.x402agency.com".to_string());
-        let payment_options =
-            PaymentMiddlewareOptions::with_storage_url(server_key.clone(), calc_price, wallet_url);
+        // draws funds from, so /upload payments land where /advertise can see
+        // them.
+        let wallet_url = wallet_storage_url(&env);
         // Malformed/failed payment headers are typed 400s from the
         // middleware; sign them for the authenticated client (#31 — the TS
         // payment middleware's errors flow through auth's response signing).
-        let payment_result =
-            match run_payment_middleware(&req, &env, &auth_context, &payment_options).await {
-                Ok(result) => result,
-                Err(e) => return middleware_error_response(&e, session.as_ref()),
-            };
+        let payment_result = match run_payment_door(
+            &req,
+            &env,
+            &auth_context,
+            &server_key,
+            price,
+            &wallet_url,
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(e) => return middleware_error_response(&e, session.as_ref()),
+        };
         match payment_result {
             PaymentResult::Free | PaymentResult::Verified(_) => {
                 if let PaymentResult::Verified(ref ctx) = payment_result {
@@ -461,13 +475,18 @@ async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 Some(ref s) => build_signed_402(price, s, &server_key).await,
                 None => {
                     // No session means AuthFetch wouldn't be able to verify
-                    // either way — fall through to middleware's unsigned 402
+                    // either way — fall through to the door's unsigned 402
                     // as a minimal error surface.
-                    let payment_options = PaymentMiddlewareOptions::new(
-                        server_key.clone(),
-                        move |_: &Request| -> u64 { price },
-                    );
-                    match run_payment_middleware(&req, &env, &auth_context, &payment_options).await
+                    let wallet_url = wallet_storage_url(&env);
+                    match run_payment_door(
+                        &req,
+                        &env,
+                        &auth_context,
+                        &server_key,
+                        price,
+                        &wallet_url,
+                    )
+                    .await
                     {
                         Ok(PaymentResult::Required(r) | PaymentResult::Failed(r)) => Ok(r),
                         Ok(_) => {
@@ -479,29 +498,26 @@ async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 }
             };
         }
-        // Annotate closure arg type explicitly so the HRTB on
-        // `process_payment_with_storage::<F, S>`'s `F: Fn(&Request) -> u64`
-        // bound is satisfied.
-        let calc_price = move |_: &Request| -> u64 { price };
         // Payment must internalize against the SAME wallet server /advertise
-        // draws funds from. Middleware default is storage.babbage.systems; override
-        // with our WALLET_STORAGE_URL so /renew payments land where /advertise
-        // can see them.
-        let wallet_url = env
-            .var("WALLET_STORAGE_URL")
-            .ok()
-            .map(|v| v.to_string())
-            .unwrap_or_else(|| "https://wallet-infra.x402agency.com".to_string());
-        let payment_options =
-            PaymentMiddlewareOptions::with_storage_url(server_key.clone(), calc_price, wallet_url);
+        // draws funds from, so /renew payments land where /advertise can see
+        // them.
+        let wallet_url = wallet_storage_url(&env);
         // Malformed/failed payment headers are typed 400s from the
         // middleware; sign them for the authenticated client (#31 — the TS
         // payment middleware's errors flow through auth's response signing).
-        let payment_result =
-            match run_payment_middleware(&req, &env, &auth_context, &payment_options).await {
-                Ok(result) => result,
-                Err(e) => return middleware_error_response(&e, session.as_ref()),
-            };
+        let payment_result = match run_payment_door(
+            &req,
+            &env,
+            &auth_context,
+            &server_key,
+            price,
+            &wallet_url,
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(e) => return middleware_error_response(&e, session.as_ref()),
+        };
         match payment_result {
             PaymentResult::Free | PaymentResult::Verified(_) => {
                 if let PaymentResult::Verified(ref ctx) = payment_result {
@@ -689,26 +705,25 @@ mod tests {
 
     #[test]
     fn the_paid_routes_name_the_header_transport_alone() {
-        use bsv_middleware_cloudflare::middleware::payment::payment_headers;
-        // The name taken off the middleware's own challenges.
-        assert_eq!(PAYMENT_TRANSPORTS, payment_headers::TRANSPORTS);
-        // The challenge the routes build carries the version, the price and
-        // the prefix, and no transports.
+        // Both challenges the routes build (the signed 402, and the door's
+        // own after a wallet rejection or without a session) carry the
+        // version, the price and the prefix, and no transports.
         let source = include_str!("lib.rs");
         let build = &source[source.find("async fn build_signed_402(").unwrap()..];
         let build = &build[..build.find("signed_json_or_internal_error(").unwrap()];
-        for name in ["VERSION", "SATOSHIS_REQUIRED", "DERIVATION_PREFIX"] {
-            assert!(
-                build.contains(&format!("payment_headers::{name}")),
-                "{name}"
-            );
+        let door = include_str!("paid.rs");
+        let door = &door[door.find("fn challenge_headers(").unwrap()..];
+        let door = &door[..door.find("\n}\n").unwrap()];
+        for challenge in [build, door] {
+            for name in ["VERSION", "SATOSHIS_REQUIRED", "DERIVATION_PREFIX"] {
+                assert!(
+                    challenge.contains(&format!("payment_headers::{name}")),
+                    "{name}"
+                );
+            }
+            assert!(!challenge.contains("TRANSPORTS"));
         }
-        assert!(!build.contains("TRANSPORTS"));
-        // Every middleware answer on the paid routes passes through
-        // `header_transport_only`.
-        let run = &source[source.find("async fn run_payment_middleware").unwrap()..];
-        let run = &run[..run.find("\n}\n").unwrap()];
-        assert!(run.contains("PaymentResult::Required(header_transport_only(r))"));
-        assert!(run.contains("PaymentResult::Failed(header_transport_only(r))"));
+        // The paid routes run the storage's door, not the middleware's.
+        assert!(!source.contains(&["process_payment", "_with_storage("].concat()));
     }
 }

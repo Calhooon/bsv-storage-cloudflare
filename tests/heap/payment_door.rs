@@ -16,14 +16,19 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
+use bsv_middleware_cloudflare::core::MemoryStore;
 use bsv_middleware_cloudflare::core::{
     expected_locking_script, payment_subject_txid, verify_payment_output, BsvPayment,
     PaymentVerdict, UnverifiableReason,
 };
+use bsv_middleware_cloudflare::AuthContext;
 use bsv_rs::primitives::hash::sha256d;
 use bsv_rs::primitives::{from_base64, to_base64, to_hex};
 use bsv_rs::transaction::{
     Beef, MerklePath, MerklePathLeaf, Transaction, ATOMIC_BEEF, BEEF_V1, BEEF_V2,
+};
+use bsv_storage_cloudflare::paid::{
+    decide, internalize_call, Decision, Remittance, PAYMENT_HEADER_MAX, PAYMENT_TOO_LARGE,
 };
 
 // ── the counting allocator ──────────────────────────────────────────────
@@ -285,7 +290,8 @@ fn funded(seed: u64, outputs: usize, script: &[u8]) -> RawTx {
 
 const SERVER_KEY: &str = "0000000000000000000000000000000000000000000000000000000000000001";
 const PAYER: &str = "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5";
-const PREFIX: &str = "b0YxH8Zl3mJ8kQ2C0fV9yq3w5lWm3T6dYcR8nQwq2pY=";
+/// A derivation prefix the server ([`SERVER_KEY`]) issued: its HMAC verifies.
+const PREFIX: &str = "47CdLOOVbIDIvJT/IN4SfZIM/+kZVxxZsds2vDPOZWea2I7yhth9AL1xKUwhNeqa";
 const SUFFIX: &str = "c3VmZml4LXN1ZmZpeA==";
 const PRICE: u64 = 1000;
 
@@ -855,6 +861,175 @@ fn a_header_that_does_not_decode_is_answered_in_kind() {
             })
         ));
     }
+}
+
+// ── the paid route, from the header to the wallet call ──────────────────
+
+/// The server's identity key (for [`SERVER_KEY`]).
+const SERVER_IDENTITY: &str = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+
+fn block_on<F: std::future::Future>(f: F) -> F::Output {
+    let mut f = std::pin::pin!(f);
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    match f.as_mut().poll(&mut cx) {
+        std::task::Poll::Ready(out) => out,
+        std::task::Poll::Pending => panic!("the door awaited something that is not ready"),
+    }
+}
+
+/// What the paid routes do with a header, measured to the wallet call's
+/// send: the storage's door (`paid::decide`, over an in-memory prefix
+/// store), and for a payment that reaches the wallet, the call written
+/// (`paid::internalize_call`) and held as the route holds it while it is
+/// sent, the payment's bytes let go. Returns the decision and the size of
+/// the call's body.
+fn paid_request(header: String) -> (Decision, usize) {
+    let store = MemoryStore::new();
+    let auth = AuthContext::authenticated(PAYER.to_string());
+    let sent = std::cell::Cell::new(0usize);
+    let decision = block_on(decide(
+        &auth,
+        PRICE,
+        Some(header),
+        SERVER_KEY,
+        &store,
+        |remittance: Remittance| {
+            let call = internalize_call(3, SERVER_IDENTITY, Some(1), &remittance, PAYER).unwrap();
+            drop(remittance);
+            sent.set(call.body().len());
+            drop(call);
+            async { Ok(serde_json::json!({"accepted": true})) }
+        },
+    ))
+    .unwrap();
+    (decision, sent.get())
+}
+
+/// A payment of one input whose unlocking script is `len` bytes,
+/// output 0 paying the server: the most transaction per header byte.
+fn padded_payment(len: usize) -> Vec<u8> {
+    let tx = RawTx::new()
+        .input(&fake_txid(70_000), 0, vec![0x51; len])
+        .output(PRICE, paying_script());
+    let mut b = BeefBuild::default();
+    let id = b.tx(&tx);
+    b.atomic(&id).bytes()
+}
+
+/// Each paying family grown until its header passes the door's ceiling;
+/// the last one at or under it.
+fn largest_paying_headers() -> Vec<(String, String)> {
+    type Family = (&'static str, usize, Box<dyn Fn(usize) -> Vec<u8>>);
+    let families: Vec<Family> = vec![
+        ("one padded input", 1000, Box::new(padded_payment)),
+        ("sweep, unproven parent", 50, Box::new(|n| sweep(n, false))),
+        ("sweep, proven parent", 50, Box::new(|n| sweep(n, true))),
+        (
+            "one block, compound BUMP",
+            20,
+            Box::new(payment_from_one_block),
+        ),
+        (
+            "distinct proven parents",
+            10,
+            Box::new(|n| payment_from_distinct_parents(n, true)),
+        ),
+        ("unconfirmed chain", 100, Box::new(unconfirmed_chain)),
+    ];
+    let mut out = Vec::new();
+    for (name, start, build) in families {
+        let mut k = start;
+        let mut best = None;
+        loop {
+            let header = header_for(&build(k));
+            if header.len() > PAYMENT_HEADER_MAX {
+                break;
+            }
+            best = Some((format!("{name} at {k}"), header));
+            k += (k / 16).max(1);
+        }
+        out.push(best.unwrap_or_else(|| panic!("{name}: the first size passes the ceiling")));
+    }
+    out
+}
+
+#[test]
+fn the_paid_route_holds_the_door_bound_to_the_wallet_call() {
+    let _g = measure_lock();
+    let mut headers: Vec<(String, String)> = all_generated()
+        .into_iter()
+        .map(|(name, beef)| (name, header_for(&beef)))
+        .collect();
+    headers.extend(largest_headers());
+    let paying = largest_paying_headers();
+    headers.extend(paying.iter().cloned());
+    let (mut largest, mut slope, mut called) = (0usize, 0f64, 0usize);
+    for (name, header) in &headers {
+        let len = header.len();
+        let owned = header.clone();
+        let mut answer = None;
+        let peak = peak_of(|| answer = Some(paid_request(owned)));
+        let (decision, body) = answer.unwrap();
+        assert!(
+            peak <= door_bound(header),
+            "{name}: the paid route peaked at {peak} B for a {len} B header ({decision:?})"
+        );
+        if body > 0 {
+            called += 1;
+            assert_eq!(
+                decision,
+                Decision::Verified {
+                    satoshis_paid: PRICE
+                },
+                "{name}"
+            );
+        }
+        largest = largest.max(peak);
+        slope = slope.max(peak.saturating_sub(DOOR_FLOOR) as f64 / len as f64);
+    }
+    // Every paying shape at the ceiling reached the wallet call.
+    for (name, header) in &paying {
+        let (decision, body) = paid_request(header.clone());
+        assert!(body > header.len(), "{name}: {decision:?}, body {body} B");
+    }
+    assert!(
+        called >= 15,
+        "only {called} payments reached the wallet call"
+    );
+    eprintln!(
+        "paid route to the wallet call: {} headers, {called} wallet calls, largest peak {largest} B, at most {slope:.2} B per header byte over the floor",
+        headers.len()
+    );
+}
+
+#[test]
+fn a_header_over_the_ceiling_is_refused_before_it_is_decoded() {
+    let _g = measure_lock();
+    // What any header costs before it is read: the server's wallet.
+    let floor = peak_of(|| paid_request("{".to_string()));
+    let mut refused = 0;
+    for (name, header) in largest_headers() {
+        if header.len() <= PAYMENT_HEADER_MAX {
+            continue;
+        }
+        refused += 1;
+        let owned = header.clone();
+        let mut answer = None;
+        let peak = peak_of(|| answer = Some(paid_request(owned)));
+        assert_eq!(
+            answer.unwrap(),
+            (
+                Decision::InvalidPayment {
+                    description: PAYMENT_TOO_LARGE.to_string()
+                },
+                0
+            ),
+            "{name}"
+        );
+        // Nothing the header's size drives: no JSON, no base64, no parse.
+        assert!(peak <= floor + 4096, "{name}: {peak} B against {floor} B");
+    }
+    assert!(refused >= 5, "only {refused} headers over the ceiling");
 }
 
 // ── the fan-out ─────────────────────────────────────────────────────────

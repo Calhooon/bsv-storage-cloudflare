@@ -1,6 +1,6 @@
-# Heap measurements of the paid routes' door on the payment header (the
-# payment middleware's read) and of the fan-out's subject read, with a
-# counting allocator. A package of its own, outside the workspace: the
+# Heap measurements of the paid routes on the payment header (the door's
+# read, and the storage's own path from the header to the wallet call's
+# send) and of the fan-out's subject read, with a counting allocator. A package of its own, outside the workspace: the
 # allocator is the one `unsafe` in the tree, and the Worker's crates forbid
 # `unsafe_code`. Its lock is the root lock's resolution (the same bsv-rs,
 # middleware and serde versions).
@@ -17,6 +17,7 @@ name = "payment_door"
 path = "payment_door.rs"
 
 [dev-dependencies]
+bsv-storage-cloudflare = { path = "../.." }
 bsv-middleware-cloudflare = "=0.7.4"
 bsv-rs = { version = "0.8.11", features = ["auth", "wallet", "transaction", "script"] }
 serde = { version = "1", features = ["derive"] }

@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.3.1 (2026-11-17)
+
+- The paid routes run the storage's own payment door (`src/paid.rs`): the
+  payment middleware's decision, step for step and answer for answer, over
+  the middleware's public parts (the prefix's HMAC, the output check, the
+  subject's txid, the transaction-bound prefix claim).
+- A payment header longer than 96 KiB is answered before it is read:
+  `400 ERR_INVALID_PAYMENT`, "Payment not verified: payment transaction
+  unreadable: the payment transaction is too large to read". The derivation
+  prefix is not claimed, so the payer retries under it. Every real wallet
+  payment the estate's rows rebuild as a header the platform carries is at
+  most 35,546 bytes.
+- The `internalizeAction` call is written once: the JSON-RPC body is
+  serialized from the payment's bytes straight into the BRC-104 payload it
+  is signed over, and the body sent is that payload's tail. The request is
+  the middleware's, byte for byte, with `tx` the array of byte values every
+  wallet storage server reads. `tests/heap` measures each paid request from
+  the header to the call's send, on every shape up to the ceiling: its peak
+  stays within 1 MiB plus 8 bytes per header byte.
+- The fan-out posts an advert only to hosts named by tracker outputs that
+  are SHIP advertisements for the topic, signed by the identity key they
+  name under BRC-88's derivation and locked by that identity's linked key
+  (as `@bsv/sdk`'s `SHIPBroadcaster` reads them), for a public `https`
+  origin: a DNS name (no IP literal, no `localhost`, `.localhost`, `.local`,
+  `.internal` or `.home.arpa` name, no `xn--` label), the default port, and
+  no credentials, path, query or fragment. Each host once, the primary left
+  out, at most 32. A tracker's outputs that name no host are skipped and
+  counted in one log line per tracker; the upload's answer is unchanged.
+- No binding, wrangler or route change, and no stored-data migration.
+
 ## 0.3.0 (2026-11-17)
 
 - bsv-rs `0.8.11` (a caret requirement) and bsv-middleware-cloudflare
