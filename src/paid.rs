@@ -689,6 +689,12 @@ async fn post(url: &str, headers: &[(String, String)], call: &WalletCall) -> Res
     Ok((status, text))
 }
 
+/// The JSON-RPC endpoint of the wallet storage server at `storage_url` (the
+/// storage client's: its root, one slash).
+fn rpc_url(storage_url: &str) -> String {
+    format!("{}/", storage_url.trim_end_matches('/'))
+}
+
 /// The storage server's auth layer refused the request before its handler
 /// ran (the middleware's storage client's test).
 fn auth_layer_rejection(status: u16, body: &str) -> bool {
@@ -767,7 +773,7 @@ pub async fn internalize(
         |e| AuthCloudflareError::ConfigError(format!("Invalid server private key: {}", e)),
     )?));
     let server_identity_key = wallet.identity_key().to_hex();
-    let url = format!("{}/", storage_url);
+    let url = rpc_url(storage_url);
 
     let (mut session, user_id) = open_session(&wallet, storage_url, &server_identity_key).await?;
     let mut call = internalize_call(
@@ -1209,6 +1215,8 @@ mod tests {
         )
         .is_err());
         assert!(rpc_result(502, "bad gateway", 3).is_err());
+        assert_eq!(rpc_url("https://w.example.com/"), "https://w.example.com/");
+        assert_eq!(rpc_url("https://w.example.com"), "https://w.example.com/");
         assert!(auth_layer_rejection(401, ""));
         assert!(auth_layer_rejection(500, "Session not found"));
         assert!(!auth_layer_rejection(500, "boom"));
