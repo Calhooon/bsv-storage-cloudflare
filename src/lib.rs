@@ -729,8 +729,17 @@ mod tests {
         ));
         assert_eq!(status, 400);
         assert_eq!(body["code"], over_bound_body()["code"]);
-        assert!(link_cost::OVER_BOUND_DESCRIPTION
-            .starts_with("Payment not verified: payment transaction unreadable: "));
+        // The middleware's own words for an unreadable payment transaction.
+        let unreadable = bsv_middleware_cloudflare::core::PaymentVerdict::Unverifiable {
+            reason: bsv_middleware_cloudflare::core::UnverifiableReason::MalformedTransaction(
+                "the payment transaction is too large to read".into(),
+            ),
+        };
+        assert_eq!(link_cost::OVER_BOUND_DESCRIPTION, unreadable.to_string());
+        assert_eq!(
+            link_cost::OVER_BOUND_DESCRIPTION,
+            "Payment not verified: payment transaction unreadable: the payment transaction is too large to read"
+        );
     }
 
     #[test]

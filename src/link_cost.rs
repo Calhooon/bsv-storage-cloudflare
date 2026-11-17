@@ -38,8 +38,7 @@ pub const PER_LEAF: u64 = 128;
 
 /// The bound on the link the payment middleware performs on the payment
 /// header's transaction, in the heap bytes [`LinkCost::heap_bytes`]
-/// estimates. Honest payments (a hundred inputs, a 200-transaction
-/// unconfirmed chain, a 50-output sweep) estimate at most about 2 MB.
+/// estimates.
 pub const LINK_COST_CEILING: u64 = 16 * 1024 * 1024;
 
 /// What linking a BEEF from its subject would copy, counted per copy: every
@@ -219,7 +218,7 @@ pub fn payment_header_link_check(header: &str) -> HeaderCheck {
 /// The description of the refusal, in the words the payment middleware uses
 /// for a payment transaction it cannot read.
 pub const OVER_BOUND_DESCRIPTION: &str =
-    "Payment not verified: payment transaction unreadable: the BEEF's link cost is over the bound";
+    "Payment not verified: payment transaction unreadable: the payment transaction is too large to read";
 
 /// The subject transaction's output `vout`, read without linking: the
 /// subject's entry (the same transaction `Transaction::from_beef(bytes,
