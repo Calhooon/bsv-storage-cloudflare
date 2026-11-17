@@ -311,9 +311,6 @@ async fn fan_out_to_mainnet_peers(primary_host: &str, tagged: &TaggedBEEF) {
 /// - field[3] = topic name (UTF-8)
 /// - field[4] = signature
 async fn discover_peers_from_tracker(tracker: &str, topic: &str) -> Result<Vec<String>, String> {
-    use bsv_rs::script::templates::PushDrop;
-    use bsv_rs::transaction::Transaction;
-
     let url = format!("{}/lookup", tracker.trim_end_matches('/'));
     let body = serde_json::json!({
         "service": "ls_ship",
@@ -341,7 +338,76 @@ async fn discover_peers_from_tracker(tracker: &str, topic: &str) -> Result<Vec<S
     if !(200..300).contains(&status) {
         return Err(format!("HTTP {}", status));
     }
-    let text = response.text().await.map_err(|e| e.to_string())?;
+    let body = read_body_bounded(&mut response, LOOKUP_ANSWER_MAX_BYTES).await?;
+    hosts_from_lookup_answer(&body)
+}
+
+/// The most a tracker's lookup answer may carry. Real `ls_ship` answers
+/// for `tm_uhrp` from the four trackers measure 67 to 417 KB, and up to
+/// 592 KB for any topic (2026-11); a larger answer is skipped as an
+/// unreadable one is.
+pub(crate) const LOOKUP_ANSWER_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+/// Append `chunk` to `body` unless the body would pass `cap`.
+pub(crate) fn push_bounded(body: &mut Vec<u8>, chunk: &[u8], cap: usize) -> Result<(), String> {
+    if body.len().saturating_add(chunk.len()) > cap {
+        return Err(format!("answer over {} bytes", cap));
+    }
+    body.extend_from_slice(chunk);
+    Ok(())
+}
+
+/// Read a response body, refusing it once it passes `cap` bytes (a declared
+/// `Content-Length` over the cap is refused before reading).
+async fn read_body_bounded(response: &mut worker::Response, cap: usize) -> Result<Vec<u8>, String> {
+    use wasm_bindgen::JsCast;
+    use worker::ResponseBody;
+
+    if let Ok(Some(declared)) = response.headers().get("Content-Length") {
+        if declared.trim().parse::<u64>().is_ok_and(|n| n > cap as u64) {
+            return Err(format!("answer over {} bytes", cap));
+        }
+    }
+    let stream = match response.body() {
+        ResponseBody::Empty => return Ok(Vec::new()),
+        ResponseBody::Body(bytes) => {
+            let mut body = Vec::new();
+            push_bounded(&mut body, bytes, cap)?;
+            return Ok(body);
+        }
+        ResponseBody::Stream(stream) => stream.clone(),
+    };
+    let reader: worker::web_sys::ReadableStreamDefaultReader = stream
+        .get_reader()
+        .dyn_into()
+        .map_err(|_| "body reader unavailable".to_string())?;
+    let mut body = Vec::new();
+    loop {
+        let next = wasm_bindgen_futures::JsFuture::from(reader.read())
+            .await
+            .map_err(|e| format!("{:?}", e))?;
+        let done = js_sys::Reflect::get(&next, &"done".into())
+            .ok()
+            .and_then(|d| d.as_bool())
+            .unwrap_or(true);
+        if done {
+            break;
+        }
+        let value = js_sys::Reflect::get(&next, &"value".into()).map_err(|e| format!("{:?}", e))?;
+        let chunk = js_sys::Uint8Array::new(&value).to_vec();
+        if let Err(e) = push_bounded(&mut body, &chunk, cap) {
+            let _ = reader.cancel();
+            return Err(e);
+        }
+    }
+    Ok(body)
+}
+
+/// The SHIP host URLs a lookup answer names. Each output's subject is read
+/// without linking its ancestry ([`crate::link_cost::subject_output`]): the
+/// fan-out needs the one output, nothing linked.
+pub(crate) fn hosts_from_lookup_answer(body: &[u8]) -> Result<Vec<String>, String> {
+    use bsv_rs::script::templates::PushDrop;
 
     #[derive(serde::Deserialize)]
     struct LookupOutput {
@@ -357,25 +423,19 @@ async fn discover_peers_from_tracker(tracker: &str, topic: &str) -> Result<Vec<S
         outputs: Vec<LookupOutput>,
     }
 
-    let answer: LookupAnswer = serde_json::from_str(&text).map_err(|e| format!("parse: {}", e))?;
+    let answer: LookupAnswer = serde_json::from_slice(body).map_err(|e| format!("parse: {}", e))?;
     if answer.answer_type != "output-list" {
         return Ok(Vec::new());
     }
 
     let mut urls = Vec::new();
     for out in answer.outputs {
-        // `Transaction::from_beef` expects an optional txid hint; pass None
-        // and let the parser walk to the subject tx.
-        let tx = match Transaction::from_beef(&out.beef, None) {
-            Ok(t) => t,
-            Err(_) => continue,
-        };
         let vout = out.output_index as usize;
-        let locking_script = match tx.outputs.get(vout) {
-            Some(o) => &o.locking_script,
+        let output = match crate::link_cost::subject_output(&out.beef, vout) {
+            Some(o) => o,
             None => continue,
         };
-        let decoded = match PushDrop::decode(locking_script) {
+        let decoded = match PushDrop::decode(&output.locking_script) {
             Ok(d) => d,
             Err(_) => continue,
         };
@@ -529,5 +589,101 @@ mod tests {
         assert_eq!(tagged.topics, vec!["tm_uhrp".to_string()]);
         assert_eq!(tagged.beef, vec![0xde, 0xad, 0xbe, 0xef]);
         assert!(tagged.off_chain_values.is_none());
+    }
+
+    // ── the fan-out reads the subject alone, from a bounded answer ──────
+
+    fn raw_tx(inputs: &[(&str, u32)], outputs: &[Vec<u8>]) -> Vec<u8> {
+        let mut out = 1u32.to_le_bytes().to_vec();
+        out.push(inputs.len() as u8);
+        for (txid, vout) in inputs {
+            let mut id = hex::decode(txid).unwrap();
+            id.reverse();
+            out.extend_from_slice(&id);
+            out.extend_from_slice(&vout.to_le_bytes());
+            out.push(0);
+            out.extend_from_slice(&0xffff_ffffu32.to_le_bytes());
+        }
+        out.push(outputs.len() as u8);
+        for script in outputs {
+            out.extend_from_slice(&1000u64.to_le_bytes());
+            if script.len() < 0xfd {
+                out.push(script.len() as u8);
+            } else {
+                out.push(0xfd);
+                out.extend_from_slice(&(script.len() as u16).to_le_bytes());
+            }
+            out.extend_from_slice(script);
+        }
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out
+    }
+
+    /// A SHIP advert (the parity fixture's script) as output 0 of a subject
+    /// that spends an unproven parent's outputs many times over.
+    fn ship_answer_beef() -> Vec<u8> {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/parity/fixtures/parity/ship_tm_uhrp.json"
+        ))
+        .unwrap();
+        let ship =
+            hex::decode(fixture["expected"]["locking_script_hex"].as_str().unwrap()).unwrap();
+        let outside = "11".repeat(32);
+        let parent = raw_tx(&[(&outside, 0)], &vec![Vec::new(); 200]);
+        let mut beef = bsv_rs::transaction::Beef::new();
+        let parent_id = beef.merge_raw_tx(parent, None).txid();
+        let spends: Vec<(&str, u32)> = (0..200).map(|i| (parent_id.as_str(), i)).collect();
+        let subject = raw_tx(&spends, &[ship]);
+        let subject_id = beef.merge_raw_tx(subject, None).txid();
+        beef.to_binary_atomic(&subject_id).unwrap()
+    }
+
+    fn answer(beefs: &[(Vec<u8>, u32)]) -> Vec<u8> {
+        let outputs: Vec<_> = beefs
+            .iter()
+            .map(|(b, i)| serde_json::json!({"beef": b, "outputIndex": i}))
+            .collect();
+        serde_json::to_vec(&serde_json::json!({"type": "output-list", "outputs": outputs})).unwrap()
+    }
+
+    #[test]
+    fn the_fan_out_reads_the_subject_alone() {
+        let beef = ship_answer_beef();
+        // The subject's output is the one `Transaction::from_beef` returns.
+        let linked = bsv_rs::transaction::Transaction::from_beef(&beef, None).unwrap();
+        let unlinked = crate::link_cost::subject_output(&beef, 0).unwrap();
+        assert_eq!(
+            unlinked.locking_script.to_binary(),
+            linked.outputs[0].locking_script.to_binary()
+        );
+        let hosts = hosts_from_lookup_answer(&answer(&[(beef.clone(), 0)])).unwrap();
+        assert_eq!(hosts, vec!["https://overlay.example.com".to_string()]);
+        // An output that is not there, or a BEEF that does not parse, is skipped.
+        let hosts = hosts_from_lookup_answer(&answer(&[(beef, 3), (vec![1, 2, 3], 0)])).unwrap();
+        assert!(hosts.is_empty());
+    }
+
+    #[test]
+    fn an_unreadable_lookup_answer_is_an_error_and_another_type_is_empty() {
+        assert!(hosts_from_lookup_answer(b"not json").is_err());
+        assert!(hosts_from_lookup_answer(&[0xff, 0xfe]).is_err());
+        let other = br#"{"type":"freeform","result":{}}"#;
+        assert_eq!(
+            hosts_from_lookup_answer(other).unwrap(),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn the_lookup_answer_is_bounded_in_size() {
+        let cap = 10;
+        let mut body = Vec::new();
+        push_bounded(&mut body, b"12345", cap).unwrap();
+        push_bounded(&mut body, b"67890", cap).unwrap();
+        assert_eq!(body, b"1234567890");
+        assert!(push_bounded(&mut body, b"1", cap).is_err());
+        assert_eq!(body.len(), cap, "a refused chunk is not kept");
+        // Real tracker answers are under a seventh of the bound.
+        assert_eq!(LOOKUP_ANSWER_MAX_BYTES, 4 * 1024 * 1024);
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "bsv-storage-cloudflare"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 description = "UHRP file-storage server on Cloudflare Workers. Protocol-compatible Rust/WASM port of @bsv/uhrp-storage-server (nanostore.babbage.systems)."
 license = "MIT"
@@ -88,3 +88,4 @@ panic = "warn"
 # unless `--workspace` is passed explicitly, so the wasm gate remains green.
 [workspace]
 members = ["tests/parity"]
+exclude = ["tests/heap"]
