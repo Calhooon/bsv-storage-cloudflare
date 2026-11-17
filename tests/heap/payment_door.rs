@@ -1,31 +1,29 @@
-//! The payment header's link cost is bounded before the payment middleware,
-//! and the fan-out reads a tracker answer's subject alone.
+//! The paid routes' door on the payment header, measured: what the payment
+//! middleware allocates reading an `X-BSV-Payment` header follows the
+//! header's size, with no check of the storage's own in front of it.
 //!
-//! Native measurements with a counting allocator around the real bsv-rs
-//! 0.4.5 calls: `Transaction::from_beef` (the link the payment middleware
-//! performs through `verify_payment_output`) and the storage's own reading
-//! in `src/link_cost.rs` (included here by path). Every test takes the
-//! allocator's lock, so one measurement runs at a time.
+//! The middleware (bsv-middleware-cloudflare 0.7.4, core 0.4.3) parses the
+//! header's JSON, decodes its base64 `transaction`, reads the BEEF's subject
+//! alone (`verify_payment_output`: output 0's script and amount; nothing
+//! linked, no script run) and takes the subject's txid
+//! (`payment_subject_txid`) before it claims the derivation prefix. Native
+//! measurements with a counting allocator around those calls; every test
+//! takes the allocator's lock, so one measurement runs at a time.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-
-#[allow(dead_code)]
-#[path = "../../src/link_cost.rs"]
-mod link_cost;
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
-use bsv_middleware_cloudflare::core::verify_payment_output;
-use bsv_middleware_cloudflare::core::{PaymentVerdict, UnverifiableReason};
+use bsv_middleware_cloudflare::core::{
+    expected_locking_script, payment_subject_txid, verify_payment_output, BsvPayment,
+    PaymentVerdict, UnverifiableReason,
+};
 use bsv_rs::primitives::hash::sha256d;
-use bsv_rs::primitives::{to_base64, to_hex};
+use bsv_rs::primitives::{from_base64, to_base64, to_hex};
 use bsv_rs::transaction::{
     Beef, MerklePath, MerklePathLeaf, Transaction, ATOMIC_BEEF, BEEF_V1, BEEF_V2,
-};
-use link_cost::{
-    link_cost, payment_header_link_check, subject_output, HeaderCheck, LINK_COST_CEILING,
 };
 
 // ── the counting allocator ──────────────────────────────────────────────
@@ -173,10 +171,21 @@ impl BeefBuild {
     /// A transaction proven by a BUMP whose leaf level is full: at least
     /// `extra + 2` leaves, rounded up to a power of two.
     fn proven(&mut self, tx: &RawTx, height: u32, extra: usize) -> String {
-        let txid = tx.txid();
-        let count = (extra + 2).next_power_of_two();
-        let mut level = vec![MerklePathLeaf::new_txid(0, txid.clone())];
-        for i in 1..count {
+        self.proven_together(std::slice::from_ref(tx), height, extra)
+            .pop()
+            .unwrap()
+    }
+    /// Transactions mined in one block, proven by one compound BUMP whose
+    /// leaf level holds each of them and `extra` other leaves (rounded up to
+    /// a power of two).
+    fn proven_together(&mut self, txs: &[RawTx], height: u32, extra: usize) -> Vec<String> {
+        let ids: Vec<String> = txs.iter().map(RawTx::txid).collect();
+        let count = (ids.len() + extra).max(2).next_power_of_two();
+        let mut level = Vec::with_capacity(count);
+        for (i, id) in ids.iter().enumerate() {
+            level.push(MerklePathLeaf::new_txid(i as u64, id.clone()));
+        }
+        for i in ids.len()..count {
             level.push(MerklePathLeaf::new(
                 i as u64,
                 fake_txid(height as u64 * 7919 + i as u64),
@@ -188,12 +197,18 @@ impl BeefBuild {
         }
         let bump = MerklePath::new_unchecked(height, path).unwrap();
         self.bumps.push(bump);
-        self.txs.push((tx.bytes(), Some(self.bumps.len() - 1)));
-        txid
+        for tx in txs {
+            self.txs.push((tx.bytes(), Some(self.bumps.len() - 1)));
+        }
+        ids
     }
     fn atomic(mut self, txid: &str) -> Self {
         self.atomic = Some(txid.to_string());
         self
+    }
+    fn bytes_with_atomic(mut self, id: &str) -> Vec<u8> {
+        self.atomic = Some(id.to_string());
+        self.bytes()
     }
     fn bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
@@ -266,10 +281,70 @@ fn funded(seed: u64, outputs: usize, script: &[u8]) -> RawTx {
     tx
 }
 
+// ── the payment header ──────────────────────────────────────────────────
+
+const SERVER_KEY: &str = "0000000000000000000000000000000000000000000000000000000000000001";
+const PAYER: &str = "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5";
+const PREFIX: &str = "b0YxH8Zl3mJ8kQ2C0fV9yq3w5lWm3T6dYcR8nQwq2pY=";
+const SUFFIX: &str = "c3VmZml4LXN1ZmZpeA==";
+const PRICE: u64 = 1000;
+
+/// The script output 0 must carry to pay the server under [`PREFIX`] and
+/// [`SUFFIX`] (BRC-29, derived from the server's side).
+fn paying_script() -> Vec<u8> {
+    hex::decode(expected_locking_script(SERVER_KEY, PAYER, PREFIX, SUFFIX).unwrap()).unwrap()
+}
+
+fn header_for(beef: &[u8]) -> String {
+    serde_json::json!({
+        "derivationPrefix": PREFIX,
+        "derivationSuffix": SUFFIX,
+        "transaction": to_base64(beef),
+    })
+    .to_string()
+}
+
+/// What the middleware reads of a header before it claims the prefix, in
+/// its order: the JSON (`BsvPayment`), the base64, `verify_payment_output`
+/// (the subject alone), then the subject's txid for the claim.
+#[derive(Debug, PartialEq, Eq)]
+enum Door {
+    Malformed,
+    BadBase64,
+    Verdict(PaymentVerdict),
+    Claims { satoshis: u64, txid: String },
+}
+
+fn door(header: &str) -> Door {
+    let Ok(payment) = serde_json::from_str::<BsvPayment>(header) else {
+        return Door::Malformed;
+    };
+    let Ok(bytes) = from_base64(&payment.transaction) else {
+        return Door::BadBase64;
+    };
+    let verdict = verify_payment_output(
+        SERVER_KEY,
+        PAYER,
+        &payment.derivation_prefix,
+        &payment.derivation_suffix,
+        &bytes,
+        0,
+        PRICE,
+    )
+    .unwrap();
+    match verdict {
+        PaymentVerdict::Verified { satoshis } => Door::Claims {
+            satoshis,
+            txid: payment_subject_txid(&bytes).unwrap(),
+        },
+        other => Door::Verdict(other),
+    }
+}
+
 // ── the honest shapes ───────────────────────────────────────────────────
 
-/// A P2PKH payment with `n` inputs, each from a distinct parent; the
-/// parents proven, or unproven over a proven grandparent.
+/// A payment with `n` inputs, each from a distinct parent; the parents
+/// proven, or unproven over a proven grandparent. Output 0 pays the server.
 fn payment_from_distinct_parents(n: usize, parents_proven: bool) -> Vec<u8> {
     let mut b = BeefBuild::default();
     let mut child = RawTx::new();
@@ -290,28 +365,51 @@ fn payment_from_distinct_parents(n: usize, parents_proven: bool) -> Vec<u8> {
         };
         child = child.input(&parent.txid(), 0, p2pkh_unlock(6));
     }
-    let child = child.output(500, p2pkh(7)).output(300, p2pkh(8));
+    let child = child.output(PRICE, paying_script()).output(300, p2pkh(8));
+    let id = b.tx(&child);
+    b.atomic(&id).bytes()
+}
+
+/// `n` inputs from `n` parents mined in one block, proven by one compound
+/// BUMP. Output 0 pays the server.
+fn payment_from_one_block(n: usize) -> Vec<u8> {
+    let mut b = BeefBuild::default();
+    let parents: Vec<RawTx> = (0..n)
+        .map(|i| funded(15_000 + i as u64, 2, &p2pkh(1)))
+        .collect();
+    let ids = b.proven_together(&parents, 805_000, 4 * n);
+    let mut child = RawTx::new();
+    for id in &ids {
+        child = child.input(id, 0, p2pkh_unlock(6));
+    }
+    let child = child.output(PRICE, paying_script()).output(300, p2pkh(8));
     let id = b.tx(&child);
     b.atomic(&id).bytes()
 }
 
 /// An unconfirmed chain of `hops` transactions over one proven root, each
-/// spending the change of the one before it.
+/// spending the change of the one before it; the last pays the server.
 fn unconfirmed_chain(hops: usize) -> Vec<u8> {
     let mut b = BeefBuild::default();
     let root = funded(30_000, 2, &p2pkh(1));
     let mut prev = b.proven(&root, 810_000, 18);
     for i in 0..hops {
+        let first = if i + 1 == hops {
+            paying_script()
+        } else {
+            p2pkh(2)
+        };
         let tx = RawTx::new()
             .input(&prev, 1, p2pkh_unlock(i as u8))
-            .output(100, p2pkh(2))
+            .output(PRICE, first)
             .output(10_000_000 - i as u64, p2pkh(3));
         prev = b.tx(&tx);
     }
     b.atomic(&prev).bytes()
 }
 
-/// A sweep of `n` outputs of one parent (proven, or over a proven grandparent).
+/// A sweep of `n` outputs of one parent (proven, or over a proven
+/// grandparent) into one output that pays the server.
 fn sweep(n: usize, parent_proven: bool) -> Vec<u8> {
     let mut b = BeefBuild::default();
     let parent = if parent_proven {
@@ -333,7 +431,7 @@ fn sweep(n: usize, parent_proven: bool) -> Vec<u8> {
     for i in 0..n {
         child = child.input(&pid, i as u32, p2pkh_unlock(5));
     }
-    let child = child.output(40_000, p2pkh(6));
+    let child = child.output(PRICE, paying_script());
     let id = b.tx(&child);
     b.atomic(&id).bytes()
 }
@@ -350,12 +448,28 @@ fn honest_shapes() -> Vec<(String, Vec<u8>)> {
             payment_from_distinct_parents(n, false),
         ));
     }
-    v.push(("unconfirmed chain, 200 hops".into(), unconfirmed_chain(200)));
-    v.push(("sweep of 50 outputs, proven parent".into(), sweep(50, true)));
-    v.push((
-        "sweep of 50 outputs, unproven parent".into(),
-        sweep(50, false),
-    ));
+    for n in [20, 50, 100] {
+        v.push((
+            format!("payment, {n} inputs from one block, one compound BUMP"),
+            payment_from_one_block(n),
+        ));
+    }
+    for hops in [200, 500] {
+        v.push((
+            format!("unconfirmed chain, {hops} hops"),
+            unconfirmed_chain(hops),
+        ));
+    }
+    for n in [50, 300] {
+        v.push((
+            format!("sweep of {n} outputs, proven parent"),
+            sweep(n, true),
+        ));
+        v.push((
+            format!("sweep of {n} outputs, unproven parent"),
+            sweep(n, false),
+        ));
+    }
     v
 }
 
@@ -436,13 +550,6 @@ fn wide_bump(leaves: usize, n: usize) -> Vec<u8> {
     let child = child.output(1, Vec::new());
     let id = b.tx(&child);
     b.bytes_with_atomic(&id)
-}
-
-impl BeefBuild {
-    fn bytes_with_atomic(mut self, id: &str) -> Vec<u8> {
-        self.atomic = Some(id.to_string());
-        self.bytes()
-    }
 }
 
 /// `levels` unproven levels, each spending every output of the level below
@@ -570,15 +677,25 @@ fn costly_shapes() -> Vec<(String, Vec<u8>)> {
     v
 }
 
-/// What `from_beef` may allocate at most: the parse (bounded per wire byte)
-/// and the link (the estimate).
-const PARSE_PER_BYTE: usize = 64;
+// ── the door, measured ──────────────────────────────────────────────────
+
+/// The largest header the tests build: the platform refuses a request whose
+/// headers pass 128 KiB in all.
+const HEADER_MAX: usize = 128 * 1024;
+
+/// The door's peak heap allowed per header byte, over a fixed floor: the
+/// BRC-29 key derivation costs about half a MiB on every header, whatever
+/// its size; the rest follows the header (JSON, base64, the BEEF's parse,
+/// the subject's copy).
+const DOOR_PER_HEADER_BYTE: usize = 8;
+const DOOR_FLOOR: usize = 1024 * 1024;
+
+/// What a BEEF's subject read may allocate: the parse, per wire byte.
+const PARSE_PER_BYTE: usize = 24;
 const PARSE_FLOOR: usize = 16 * 1024;
 
-fn predicted(beef: &[u8]) -> Option<usize> {
-    let parsed = Beef::from_binary(beef).ok()?;
-    let cost = link_cost(&parsed)?;
-    Some(PARSE_FLOOR + PARSE_PER_BYTE * beef.len() + cost.heap_bytes() as usize)
+fn door_bound(header: &str) -> usize {
+    DOOR_FLOOR + DOOR_PER_HEADER_BYTE * header.len()
 }
 
 fn all_generated() -> Vec<(String, Vec<u8>)> {
@@ -591,173 +708,161 @@ fn all_generated() -> Vec<(String, Vec<u8>)> {
     v
 }
 
-#[test]
-fn the_link_cost_estimate_bounds_what_from_beef_allocates() {
-    let _g = measure_lock();
-    let mut checked = 0;
-    for (name, beef) in all_generated() {
-        let Some(limit) = predicted(&beef) else {
-            continue;
-        };
-        let peak = peak_of(|| Transaction::from_beef(&beef, None));
-        assert!(
-            peak <= limit,
-            "{name}: from_beef peaked at {peak} B over the predicted {limit} B"
-        );
-        checked += 1;
-    }
-    assert!(checked >= 500, "only {checked} BEEFs measured");
-}
-
-// ── the payment header ──────────────────────────────────────────────────
-
-const SERVER_KEY: &str = "0000000000000000000000000000000000000000000000000000000000000001";
-const PAYER: &str = "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5";
-
-fn header_for(beef: &[u8]) -> String {
-    serde_json::json!({
-        "derivationPrefix": "b0YxH8Zl3mJ8kQ2C0fV9yq3w5lWm3T6dYcR8nQwq2pY=",
-        "derivationSuffix": "c3VmZml4LXN1ZmZpeA==",
-        "transaction": to_base64(beef),
-    })
-    .to_string()
-}
-
-/// The payment middleware's read of a header (its JSON, its base64, then
-/// `verify_payment_output`, which calls `Transaction::from_beef`).
-fn middleware_read(header: &str) -> Option<PaymentVerdict> {
-    #[derive(serde::Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct H {
-        derivation_prefix: String,
-        derivation_suffix: String,
-        transaction: String,
-    }
-    let h: H = serde_json::from_str(header).ok()?;
-    let bytes = bsv_rs::primitives::from_base64(&h.transaction).ok()?;
-    verify_payment_output(
-        SERVER_KEY,
-        PAYER,
-        &h.derivation_prefix,
-        &h.derivation_suffix,
-        &bytes,
-        0,
-        1,
-    )
-    .ok()
-}
-
-/// The order `src/lib.rs` runs: the storage's check, then the middleware's
-/// read when the check passes. `None` is the refusal.
-fn door(header: &str) -> Option<Option<PaymentVerdict>> {
-    match payment_header_link_check(header) {
-        HeaderCheck::OverBound { .. } => None,
-        HeaderCheck::Pass => Some(middleware_read(header)),
-    }
-}
-
-/// The largest header the tests build: 128 KiB.
-const HEADER_MAX: usize = 128 * 1024;
-
-/// A header of the `wide_parent` family, the largest under [`HEADER_MAX`].
-fn largest_header() -> String {
-    let mut best = String::new();
-    let mut m = 4000;
-    loop {
-        let n = (m * 9) / 41;
-        let h = header_for(&wide_parent(m, n, 0, 0));
-        if h.len() > HEADER_MAX {
-            break;
+/// Each family grown until its header passes [`HEADER_MAX`]; the last one
+/// under it.
+fn largest_headers() -> Vec<(String, String)> {
+    type Family = (&'static str, usize, Box<dyn Fn(usize) -> Vec<u8>>);
+    let families: Vec<Family> = vec![
+        (
+            "wide parent",
+            400,
+            Box::new(|m| wide_parent(m, (m * 9) / 41, 0, 0)),
+        ),
+        (
+            "wide parent, scripts",
+            100,
+            Box::new(|m| wide_parent(m, m / 4, 30, 20)),
+        ),
+        ("wide bump", 64, Box::new(|n| wide_bump(n * 8, n))),
+        ("diamond", 10, Box::new(|levels| diamond(levels, 3))),
+        ("fan of fans", 20, Box::new(|m| fan_of_fans(m, m / 4, 8))),
+        ("sweep, unproven parent", 50, Box::new(|n| sweep(n, false))),
+        ("sweep, proven parent", 50, Box::new(|n| sweep(n, true))),
+        (
+            "one block, compound BUMP",
+            20,
+            Box::new(payment_from_one_block),
+        ),
+        (
+            "distinct proven parents",
+            10,
+            Box::new(|n| payment_from_distinct_parents(n, true)),
+        ),
+        ("unconfirmed chain", 100, Box::new(unconfirmed_chain)),
+    ];
+    let mut out = Vec::new();
+    for (name, start, build) in families {
+        let mut k = start;
+        let mut best = None;
+        loop {
+            let header = header_for(&build(k));
+            if header.len() > HEADER_MAX {
+                break;
+            }
+            best = Some((format!("{name} at {k}"), header));
+            k += (k / 8).max(1);
         }
-        best = h;
-        m += 50;
+        out.push(best.unwrap_or_else(|| panic!("{name}: the first size passes the header bound")));
     }
-    best
+    out
 }
 
 #[test]
-fn the_payment_header_link_cost_is_bounded_before_the_middleware() {
+fn the_payment_door_follows_the_header() {
     let _g = measure_lock();
-    let header = largest_header();
-    assert!(header.len() <= HEADER_MAX);
-    let mut verdict = None;
-    let peak = peak_of(|| verdict = Some(door(&header)));
-    assert_eq!(verdict, Some(None), "the check refuses the header");
-    // The whole check (JSON, base64, parse, estimate) stays within a band of
-    // the header's own size.
-    let band = 24 * header.len();
-    assert!(peak <= band, "check peaked at {peak} B, band {band} B");
-}
-
-#[test]
-fn honest_payments_reach_the_middleware_with_their_verdict() {
-    let _g = measure_lock();
-    for (name, beef) in fixture_beefs().into_iter().chain(honest_shapes()) {
-        let header = header_for(&beef);
-        let parsed = Beef::from_binary(&beef).unwrap();
-        let est = link_cost(&parsed).unwrap().heap_bytes();
+    let mut headers: Vec<(String, String)> = all_generated()
+        .into_iter()
+        .map(|(name, beef)| (name, header_for(&beef)))
+        .collect();
+    headers.extend(largest_headers());
+    let (mut largest, mut slope) = (0usize, 0f64);
+    for (name, header) in &headers {
+        let peak = peak_of(|| door(header));
         assert!(
-            est * 8 <= LINK_COST_CEILING,
-            "{name}: estimate {est} B is not far below the ceiling"
+            peak <= door_bound(header),
+            "{name}: the door peaked at {peak} B for a {} B header",
+            header.len()
         );
+        largest = largest.max(peak);
+        slope = slope.max(peak.saturating_sub(DOOR_FLOOR) as f64 / header.len() as f64);
+    }
+    assert!(
+        headers.len() >= 560,
+        "only {} headers measured",
+        headers.len()
+    );
+    eprintln!(
+        "payment door: {} headers, largest peak {largest} B, at most {slope:.2} B per header byte over the floor",
+        headers.len()
+    );
+}
+
+#[test]
+fn the_largest_headers_reach_the_middleware_verdict() {
+    let _g = measure_lock();
+    for (name, header) in largest_headers() {
+        let answer = door(&header);
+        assert!(
+            matches!(answer, Door::Claims { .. } | Door::Verdict(_)),
+            "{name}: {answer:?}"
+        );
+        if let Door::Verdict(PaymentVerdict::Unverifiable { reason }) = &answer {
+            panic!("{name}: unreadable: {reason:?}");
+        }
+    }
+}
+
+#[test]
+fn honest_payments_are_verified_and_claim_their_subject() {
+    let _g = measure_lock();
+    for (name, beef) in honest_shapes() {
+        let subject = Transaction::from_beef_subject(&beef, None).unwrap().id();
         assert_eq!(
-            payment_header_link_check(&header),
-            HeaderCheck::Pass,
+            door(&header_for(&beef)),
+            Door::Claims {
+                satoshis: PRICE,
+                txid: subject,
+            },
             "{name}"
         );
-        assert_eq!(door(&header), Some(middleware_read(&header)), "{name}");
+    }
+    // The fixtures pay other keys: read, and refused for their script.
+    for (name, beef) in fixture_beefs() {
+        assert!(
+            matches!(
+                door(&header_for(&beef)),
+                Door::Verdict(PaymentVerdict::WrongScript { .. })
+            ),
+            "{name}"
+        );
     }
 }
 
 #[test]
-fn a_header_that_does_not_decode_goes_on_unchanged() {
+fn a_header_that_does_not_decode_is_answered_in_kind() {
     let _g = measure_lock();
     for header in [
         "",
         "not json",
         r#"{"derivationPrefix":"a","derivationSuffix":"b"}"#,
-        r#"{"derivationPrefix":"a","derivationSuffix":"b","transaction":"%%%"}"#,
-        r#"{"derivationPrefix":"a","derivationSuffix":"b","transaction":"AAAA"}"#,
         r#"{"derivationPrefix":1,"derivationSuffix":"b","transaction":"AAAA"}"#,
     ] {
-        assert_eq!(payment_header_link_check(header), HeaderCheck::Pass);
-        assert_eq!(door(header), Some(middleware_read(header)));
+        assert_eq!(door(header), Door::Malformed, "{header}");
     }
-    // A BEEF naming a subject it does not carry links nothing either.
+    let bad = format!(
+        r#"{{"derivationPrefix":"{PREFIX}","derivationSuffix":"{SUFFIX}","transaction":"%%%"}}"#
+    );
+    assert_eq!(door(&bad), Door::BadBase64);
+    // Bytes that are not a BEEF, and a BEEF naming a subject it does not
+    // carry, are the payer's unreadable transaction.
     let mut b = BeefBuild::default();
     b.tx(&funded(60_000, 1, &[]));
-    let bytes = b.bytes_with_atomic(&fake_txid(1));
-    let header = header_for(&bytes);
-    assert_eq!(payment_header_link_check(&header), HeaderCheck::Pass);
-    assert!(matches!(
-        middleware_read(&header),
-        Some(PaymentVerdict::Unverifiable {
-            reason: UnverifiableReason::MalformedTransaction(_)
-        })
-    ));
-}
-
-#[test]
-fn the_check_refuses_a_small_header_over_the_bound() {
-    let _g = measure_lock();
-    // Grow the `wide_parent` family until the check refuses it.
-    let mut m = 10;
-    loop {
-        let n = (m * 9) / 41 + 1;
-        let header = header_for(&wide_parent(m, n, 0, 0));
-        if let HeaderCheck::OverBound { .. } = payment_header_link_check(&header) {
-            assert!(header.len() < 24 * 1024);
-            break;
-        }
-        m += 10;
+    for beef in [vec![0, 0, 0, 0], b.bytes_with_atomic(&fake_txid(1))] {
+        assert!(matches!(
+            door(&header_for(&beef)),
+            Door::Verdict(PaymentVerdict::Unverifiable {
+                reason: UnverifiableReason::MalformedTransaction(_)
+            })
+        ));
     }
 }
 
 // ── the fan-out ─────────────────────────────────────────────────────────
 
-/// The output the fan-out read before: `from_beef`, then `outputs[vout]`.
-fn linked_output(beef: &[u8], vout: usize) -> Option<(String, u64, Vec<u8>)> {
-    let tx = Transaction::from_beef(beef, None).ok()?;
+/// What `src/overlay/mod.rs` reads of a tracker answer's BEEF: the subject
+/// alone, then `outputs[vout]`.
+fn subject_output(beef: &[u8], vout: usize) -> Option<(String, u64, Vec<u8>)> {
+    let tx = Transaction::from_beef_subject(beef, None).ok()?;
     let o = tx.outputs.get(vout)?;
     Some((
         tx.id(),
@@ -766,31 +871,28 @@ fn linked_output(beef: &[u8], vout: usize) -> Option<(String, u64, Vec<u8>)> {
     ))
 }
 
-fn unlinked_output(beef: &[u8], vout: usize) -> Option<(String, u64, Vec<u8>)> {
-    let o = subject_output(beef, vout)?;
-    let parsed = Beef::from_binary(beef).ok()?;
-    let id = link_cost::subject_txid(&parsed)?;
-    Some((id, o.satoshis.unwrap_or(0), o.locking_script.to_binary()))
-}
-
 #[test]
-fn the_fan_out_reads_the_subject_alone() {
+fn the_fan_out_reads_the_subject_from_beef_links() {
     let _g = measure_lock();
     let mut compared = 0;
     for (name, beef) in all_generated() {
+        let Ok(linked) = Transaction::from_beef(&beef, None) else {
+            continue;
+        };
         for vout in [0usize, 1, 2, 7, 1000] {
-            assert_eq!(
-                unlinked_output(&beef, vout),
-                linked_output(&beef, vout),
-                "{name} vout {vout}"
-            );
+            let theirs = linked.outputs.get(vout).map(|o| {
+                (
+                    linked.id(),
+                    o.satoshis.unwrap_or(0),
+                    o.locking_script.to_binary(),
+                )
+            });
+            assert_eq!(subject_output(&beef, vout), theirs, "{name} vout {vout}");
         }
         compared += 1;
     }
-    // Unreadable answers are unreadable to both.
     for bad in [&b""[..], &[1, 2, 3], &[0xef, 0xbe, 0x00, 0x02][..]] {
-        assert_eq!(unlinked_output(bad, 0), None);
-        assert_eq!(linked_output(bad, 0), None);
+        assert_eq!(subject_output(bad, 0), None);
     }
     assert!(compared >= 500, "only {compared} answers compared");
 }

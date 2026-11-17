@@ -1,0 +1,28 @@
+# The storage at v0.2.4 against the storage now, on the same inputs. A
+# package of its own, outside the Worker's workspace: `old` mounts a
+# verbatim copy of v0.2.4's `src/` (v0_2_4/src, without lib.rs and
+# health.rs) on that release's dependencies (bsv-rs 0.4.5,
+# bsv-middleware-cloudflare 0.5.1); `new` mounts the tree's `src/` on the
+# Worker's. Neither is built into the Worker or published.
+#   cargo test --locked --manifest-path tests/compat/Cargo.toml
+[package]
+name = "compat"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[[test]]
+name = "old_against_new"
+path = "old_against_new.rs"
+
+[dev-dependencies]
+old = { path = "old" }
+new = { path = "new" }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+hex = "0.4"
+tokio = { version = "1", features = ["rt", "macros"] }
+
+[workspace]
+members = ["old", "new"]

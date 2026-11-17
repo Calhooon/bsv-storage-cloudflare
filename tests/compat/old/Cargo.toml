@@ -1,0 +1,31 @@
+# bsv-storage-cloudflare v0.2.4's modules (../v0_2_4/src, verbatim) on its
+# dependencies, for the comparison in ../old_against_new.rs.
+[package]
+name = "old"
+version = "0.2.4"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[lib]
+test = false
+doctest = false
+
+[dependencies]
+worker = { version = "0.8", features = ["queue"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+serde-wasm-bindgen = "0.6"
+chrono = { version = "0.4", features = ["serde", "wasmbind"] }
+getrandom = { version = "0.2", features = ["js"] }
+console_error_panic_hook = "0.1"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+hex = "0.4"
+base64 = "0.22"
+sha2 = "0.10"
+hmac = "0.12"
+bsv-middleware-cloudflare = "=0.5.1"
+bsv-rs = { version = "=0.4.5", features = ["auth", "wallet", "transaction", "script", "wasm"] }
+bsv-overlay-engine = "=0.1.0"

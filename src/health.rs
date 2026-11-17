@@ -11,7 +11,6 @@ pub(crate) fn body() -> Value {
             "bsv-rs": shared["crates"]["bsv-rs"],
             "bsv-middleware-cloudflare": shared["crates"]["bsv-middleware-cloudflare"],
             "bsv-middleware-core": shared["crates"]["bsv-middleware-core"],
-            "bsv-overlay-engine": option_env!("STORAGE_OVERLAY_ENGINE_VERSION"),
         },
     });
     json!({
@@ -45,13 +44,12 @@ mod tests {
         assert!(built_at.ends_with('Z'));
         assert!(chrono::DateTime::parse_from_rfc3339(built_at).is_ok());
         let crates = build["crates"].as_object().expect("locked crate versions");
-        assert_eq!(crates.len(), 5);
+        assert_eq!(crates.len(), 4);
         for (name, version) in [
-            ("bsv-storage-cloudflare", "0.2.4"),
-            ("bsv-rs", "0.4.5"),
-            ("bsv-middleware-cloudflare", "0.5.1"),
-            ("bsv-middleware-core", "0.2.1"),
-            ("bsv-overlay-engine", "0.1.0"),
+            ("bsv-storage-cloudflare", "0.3.0"),
+            ("bsv-rs", "0.8.11"),
+            ("bsv-middleware-cloudflare", "0.7.4"),
+            ("bsv-middleware-core", "0.4.3"),
         ] {
             assert_eq!(crates[name], version, "{name}");
             let locked = super::build_versions::lock_version(include_str!("../Cargo.lock"), name)

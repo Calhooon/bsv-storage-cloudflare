@@ -11,7 +11,7 @@ use bsv_middleware_cloudflare::{
         process_auth, process_payment_with_storage, sign_json_response, AuthMiddlewareOptions,
         AuthResult, PaymentMiddlewareOptions, PaymentResult,
     },
-    AuthCloudflareError, KvSessionStorage,
+    AuthCloudflareError, KvPrefixStore, KvSessionStorage,
 };
 use bsv_rs::primitives::PrivateKey;
 use bsv_rs::wallet::ProtoWallet;
@@ -27,14 +27,13 @@ const PAYMENT_ORIGINATOR: &str = "bsv-auth-cloudflare";
 /// the `KvSessionStorage` handle [`payment_nonce_store`] builds, so the two
 /// stay in lockstep with the storage `process_auth` constructs internally
 /// (same KV binding, same `"auth"` prefix, same TTL). The TTL only governs
-/// session records — consumed payment derivation prefixes are written with
-/// **no expiry** (the challenge HMAC never expires, so its consumption
-/// record must not either).
+/// session records — claimed payment derivation prefixes are written with
+/// **no expiry** (the challenge HMAC never expires, so its claim record must
+/// not either).
 const SESSION_TTL_SECONDS: u64 = 3600;
 
 mod error;
 mod health;
-mod link_cost;
 mod overlay;
 mod queue;
 mod routes;
@@ -92,13 +91,16 @@ async fn build_signed_402(price: u64, session: &AuthSession, server_key: &str) -
     signed_json_or_internal_error(&body, 402, &payment_hdrs, session)
 }
 
-/// The single-use payment-derivation-prefix store (the-composer #44/#62).
+/// The KV handle behind the payment-derivation-prefix store
+/// (the-composer #44/#62; [`run_payment_middleware`] wraps it in a
+/// [`KvPrefixStore`]).
 ///
 /// Same `AUTH_SESSIONS` KV namespace + `"auth"` prefix + TTL that the auth
-/// middleware's `process_auth` builds internally, so consumed payment
-/// prefixes live alongside the BRC-103/104 sessions they protect (keys:
-/// `auth:nonce:payment-derivation-prefix:<prefix>`, written with no
-/// expiry). `process_auth` has already used this binding by the time any
+/// middleware's `process_auth` builds internally, so claimed payment
+/// prefixes live alongside the BRC-103/104 sessions they protect (key:
+/// `auth:nonce:payment-derivation-prefix:<prefix>`, value: the subject txid
+/// the prefix is bound to, written with no expiry; a key holding `"1"`, a
+/// prefix consumed before the binding, stays refused). `process_auth` has already used this binding by the time any
 /// paid route runs, so a missing binding fails at auth — the `ConfigError`
 /// here is a config-drift backstop, not a reachable client path.
 fn payment_nonce_store(env: &Env) -> std::result::Result<KvSessionStorage, AuthCloudflareError> {
@@ -109,24 +111,25 @@ fn payment_nonce_store(env: &Env) -> std::result::Result<KvSessionStorage, AuthC
 }
 
 /// BRC-29 payment processing with single-use derivation prefixes —
-/// middleware 0.3.0 `process_payment_with_storage` threaded through the
-/// [`payment_nonce_store`] seam. Replaces the `#[allow(deprecated)]`
-/// stateless `process_payment` shim (the-composer #62, closing #44 on the
-/// live `/upload` and `/renew` routes).
+/// the middleware's `process_payment_with_storage` over a
+/// [`KvPrefixStore`] on the [`payment_nonce_store`] handle (the-composer
+/// #44/#62 on the live `/upload` and `/renew` routes).
 ///
-/// Deliberate money-path deltas vs the stateless shim (both are documented
-/// hardening divergences from `@bsv/payment-express-middleware` 1.2.3; the
-/// middleware's own executed tests pin the ordering):
+/// The middleware reads the payment's subject transaction alone (output 0's
+/// script and amount; no ancestry linked, no script run) and leaves the
+/// payment's validity to the wallet storage server's `internalizeAction`.
+/// Deliberate money-path deltas vs `@bsv/payment-express-middleware` 1.2.3
+/// (the middleware's own executed tests pin the ordering):
 /// - a replayed `X-BSV-Payment` header is rejected with
-///   `400 ERR_INVALID_DERIVATION_PREFIX` **before** touching the wallet
-///   (previously: deferred to the upstream wallet's duplicate handling);
-/// - a KV fault while consuming the prefix fails **closed**
-///   (`Err(KvError)` → signed 500 `ERR_STORAGE` via
-///   [`middleware_error_response`]), never silently disabling replay
-///   protection;
-/// - a wallet **error** releases the prefix (honest retry works); a wallet
-///   **rejection** (`accepted != true`) keeps it consumed and 402s with a
-///   fresh challenge.
+///   `400 ERR_INVALID_DERIVATION_PREFIX` **before** touching the wallet,
+///   and a prefix binds the first subject txid that claims it: another
+///   transaction under the same prefix is refused the same way;
+/// - a KV fault while claiming the prefix fails **closed** (503
+///   `ERR_PAYMENT_UNAVAILABLE` with `Retry-After`, the quote kept), never
+///   silently disabling replay protection;
+/// - a wallet **error** releases the prefix to the same transaction (an
+///   honest retry works); a wallet **rejection** (`accepted != true`) keeps
+///   it consumed and 402s with a fresh challenge.
 async fn run_payment_middleware<F: Fn(&Request) -> u64>(
     req: &Request,
     env: &Env,
@@ -134,39 +137,27 @@ async fn run_payment_middleware<F: Fn(&Request) -> u64>(
     options: &PaymentMiddlewareOptions<F>,
 ) -> std::result::Result<PaymentResult, AuthCloudflareError> {
     let nonce_store = payment_nonce_store(env)?;
-    process_payment_with_storage(req, auth_context, options, &nonce_store).await
-}
-
-/// The payment header's link cost, bounded before the payment middleware
-/// reads it. The middleware parses the header's `transaction` and links its
-/// BEEF from the subject down; [`link_cost::payment_header_link_check`]
-/// decodes it the same way, parses it without linking and estimates what the
-/// link would copy. Over [`link_cost::LINK_COST_CEILING`], the payer gets the
-/// middleware's own answer for an unreadable payment transaction (400
-/// `ERR_INVALID_PAYMENT`, unsigned JSON with CORS, as its `Failed` responses
-/// are returned) and the middleware is not called. A header that does not
-/// decode or parse goes on to the middleware unchanged, so every other
-/// refusal keeps its answer.
-fn payment_header_over_bound(req: &Request) -> Result<Option<Response>> {
-    let Some(header) = req.headers().get(payment_headers::PAYMENT).ok().flatten() else {
-        return Ok(None);
-    };
-    match link_cost::payment_header_link_check(&header) {
-        link_cost::HeaderCheck::Pass => Ok(None),
-        link_cost::HeaderCheck::OverBound { estimate } => {
-            console_error!("payment header: link cost {estimate} B over the bound; refused");
-            unsigned_json_response(&over_bound_body(), 400).map(Some)
-        }
-    }
-}
-
-/// The refusal's body: the middleware's `ErrorResponse` shape and field order.
-fn over_bound_body() -> serde_json::Value {
-    json!({
-        "status": "error",
-        "code": "ERR_INVALID_PAYMENT",
-        "description": link_cost::OVER_BOUND_DESCRIPTION,
+    let result =
+        process_payment_with_storage(req, auth_context, options, &KvPrefixStore(&nonce_store))
+            .await?;
+    Ok(match result {
+        PaymentResult::Required(r) => PaymentResult::Required(header_transport_only(r)),
+        PaymentResult::Failed(r) => PaymentResult::Failed(header_transport_only(r)),
+        other => other,
     })
+}
+
+/// `payment_headers::TRANSPORTS` of the middleware.
+const PAYMENT_TRANSPORTS: &str = "x-bsv-payment-transports";
+
+/// The payment transports this Worker reads: the `X-BSV-Payment` header
+/// alone. The middleware's own challenges (the fresh challenge after a
+/// wallet rejection) name `x-bsv-payment-transports: header,multipart`;
+/// the paid routes read no multipart body, so the name is taken off and the
+/// challenge carries the header set [`build_signed_402`] sends.
+fn header_transport_only(response: Response) -> Response {
+    let _ = response.headers().delete(PAYMENT_TRANSPORTS);
+    response
 }
 
 /// Build an UNSIGNED JSON response with CORS headers. The minimal error
@@ -378,13 +369,6 @@ async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 }
             };
         }
-        // The payment header's link cost is bounded before the middleware
-        // reads it (a free request is never read by the middleware).
-        if price > 0 {
-            if let Some(refusal) = payment_header_over_bound(&req)? {
-                return Ok(refusal);
-            }
-        }
         // Annotate closure arg type explicitly so the HRTB on
         // `process_payment_with_storage::<F, S>`'s `F: Fn(&Request) -> u64`
         // bound is satisfied.
@@ -494,13 +478,6 @@ async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
                     }
                 }
             };
-        }
-        // The payment header's link cost is bounded before the middleware
-        // reads it (a free request is never read by the middleware).
-        if price > 0 {
-            if let Some(refusal) = payment_header_over_bound(&req)? {
-                return Ok(refusal);
-            }
         }
         // Annotate closure arg type explicitly so the HRTB on
         // `process_payment_with_storage::<F, S>`'s `F: Fn(&Request) -> u64`
@@ -710,52 +687,28 @@ mod tests {
         );
     }
 
-    // ── the payment header's link cost is bounded before the middleware ──
-
     #[test]
-    fn a_payment_over_the_bound_is_answered_as_an_unreadable_payment() {
-        // The middleware's answer for a payment transaction it cannot read:
-        // `failed_json_response(400, "ERR_INVALID_PAYMENT", ..)`, its
-        // `ErrorResponse` serialized in field order.
-        let ours = serde_json::to_string(&over_bound_body()).unwrap();
-        let theirs = serde_json::to_string(&bsv_middleware_cloudflare::types::ErrorResponse::new(
-            "ERR_INVALID_PAYMENT",
-            link_cost::OVER_BOUND_DESCRIPTION,
-        ))
-        .unwrap();
-        assert_eq!(ours, theirs);
-        let (body, status) = middleware_error_body(&AuthCloudflareError::InvalidPayment(
-            link_cost::OVER_BOUND_DESCRIPTION.into(),
-        ));
-        assert_eq!(status, 400);
-        assert_eq!(body["code"], over_bound_body()["code"]);
-        // The middleware's own words for an unreadable payment transaction.
-        let unreadable = bsv_middleware_cloudflare::core::PaymentVerdict::Unverifiable {
-            reason: bsv_middleware_cloudflare::core::UnverifiableReason::MalformedTransaction(
-                "the payment transaction is too large to read".into(),
-            ),
-        };
-        assert_eq!(link_cost::OVER_BOUND_DESCRIPTION, unreadable.to_string());
-        assert_eq!(
-            link_cost::OVER_BOUND_DESCRIPTION,
-            "Payment not verified: payment transaction unreadable: the payment transaction is too large to read"
-        );
-    }
-
-    #[test]
-    fn the_payment_header_is_checked_before_the_middleware_on_both_paid_routes() {
+    fn the_paid_routes_name_the_header_transport_alone() {
+        use bsv_middleware_cloudflare::middleware::payment::payment_headers;
+        // The name taken off the middleware's own challenges.
+        assert_eq!(PAYMENT_TRANSPORTS, payment_headers::TRANSPORTS);
+        // The challenge the routes build carries the version, the price and
+        // the prefix, and no transports.
         let source = include_str!("lib.rs");
-        let main = &source[source.find("async fn main(").unwrap()..];
-        for route in ["path == \"/upload\"", "path == \"/renew\""] {
-            let start = main.find(route).unwrap();
-            let branch = &main[start..];
-            let branch = &branch[..branch.find("PaymentResult::Free").unwrap()];
-            let check = branch.find("payment_header_over_bound(&req)?").unwrap();
-            let paid = branch
-                .rfind("run_payment_middleware(&req, &env, &auth_context, &payment_options)")
-                .unwrap();
-            assert!(check < paid, "{route}: the check runs first");
-            assert!(branch[..check].contains("if price > 0 {"));
+        let build = &source[source.find("async fn build_signed_402(").unwrap()..];
+        let build = &build[..build.find("signed_json_or_internal_error(").unwrap()];
+        for name in ["VERSION", "SATOSHIS_REQUIRED", "DERIVATION_PREFIX"] {
+            assert!(
+                build.contains(&format!("payment_headers::{name}")),
+                "{name}"
+            );
         }
+        assert!(!build.contains("TRANSPORTS"));
+        // Every middleware answer on the paid routes passes through
+        // `header_transport_only`.
+        let run = &source[source.find("async fn run_payment_middleware").unwrap()..];
+        let run = &run[..run.find("\n}\n").unwrap()];
+        assert!(run.contains("PaymentResult::Required(header_transport_only(r))"));
+        assert!(run.contains("PaymentResult::Failed(header_transport_only(r))"));
     }
 }
