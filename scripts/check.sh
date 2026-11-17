@@ -13,9 +13,11 @@ echo "==> cargo fmt --check"
 # Scope fmt to the workspace members we own (root crate + parity harness).
 # Registry dependencies have their own formatting contracts.
 cargo fmt -p bsv-storage-cloudflare -p parity -- --check
+cargo fmt --manifest-path tests/heap/Cargo.toml -- --check
 
 echo "==> cargo clippy (workspace, -D warnings)"
 cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo clippy --locked --manifest-path tests/heap/Cargo.toml --all-targets -- -D warnings
 
 echo "==> cargo clippy (wasm32-unknown-unknown, -D warnings)"
 cargo clippy --locked --target wasm32-unknown-unknown --all-targets -- -D warnings
@@ -25,6 +27,7 @@ cargo check --locked --target wasm32-unknown-unknown
 
 echo "==> cargo test (workspace)"
 cargo test --locked --workspace --no-fail-fast
+cargo test --locked --manifest-path tests/heap/Cargo.toml --release
 
 if [[ "${1:-}" == --cargo-only ]]; then
   echo "all five cargo gates green; Worker build remains with the release keeper"

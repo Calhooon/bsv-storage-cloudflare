@@ -34,6 +34,7 @@ const SESSION_TTL_SECONDS: u64 = 3600;
 
 mod error;
 mod health;
+mod link_cost;
 mod overlay;
 mod queue;
 mod routes;
@@ -134,6 +135,38 @@ async fn run_payment_middleware<F: Fn(&Request) -> u64>(
 ) -> std::result::Result<PaymentResult, AuthCloudflareError> {
     let nonce_store = payment_nonce_store(env)?;
     process_payment_with_storage(req, auth_context, options, &nonce_store).await
+}
+
+/// The payment header's link cost, bounded before the payment middleware
+/// reads it. The middleware parses the header's `transaction` and links its
+/// BEEF from the subject down; [`link_cost::payment_header_link_check`]
+/// decodes it the same way, parses it without linking and estimates what the
+/// link would copy. Over [`link_cost::LINK_COST_CEILING`], the payer gets the
+/// middleware's own answer for an unreadable payment transaction (400
+/// `ERR_INVALID_PAYMENT`, unsigned JSON with CORS, as its `Failed` responses
+/// are returned) and the middleware is not called. A header that does not
+/// decode or parse goes on to the middleware unchanged, so every other
+/// refusal keeps its answer.
+fn payment_header_over_bound(req: &Request) -> Result<Option<Response>> {
+    let Some(header) = req.headers().get(payment_headers::PAYMENT).ok().flatten() else {
+        return Ok(None);
+    };
+    match link_cost::payment_header_link_check(&header) {
+        link_cost::HeaderCheck::Pass => Ok(None),
+        link_cost::HeaderCheck::OverBound { estimate } => {
+            console_error!("payment header: link cost {estimate} B over the bound; refused");
+            unsigned_json_response(&over_bound_body(), 400).map(Some)
+        }
+    }
+}
+
+/// The refusal's body: the middleware's `ErrorResponse` shape and field order.
+fn over_bound_body() -> serde_json::Value {
+    json!({
+        "status": "error",
+        "code": "ERR_INVALID_PAYMENT",
+        "description": link_cost::OVER_BOUND_DESCRIPTION,
+    })
 }
 
 /// Build an UNSIGNED JSON response with CORS headers. The minimal error
@@ -345,6 +378,13 @@ async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 }
             };
         }
+        // The payment header's link cost is bounded before the middleware
+        // reads it (a free request is never read by the middleware).
+        if price > 0 {
+            if let Some(refusal) = payment_header_over_bound(&req)? {
+                return Ok(refusal);
+            }
+        }
         // Annotate closure arg type explicitly so the HRTB on
         // `process_payment_with_storage::<F, S>`'s `F: Fn(&Request) -> u64`
         // bound is satisfied.
@@ -454,6 +494,13 @@ async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
                     }
                 }
             };
+        }
+        // The payment header's link cost is bounded before the middleware
+        // reads it (a free request is never read by the middleware).
+        if price > 0 {
+            if let Some(refusal) = payment_header_over_bound(&req)? {
+                return Ok(refusal);
+            }
         }
         // Annotate closure arg type explicitly so the HRTB on
         // `process_payment_with_storage::<F, S>`'s `F: Fn(&Request) -> u64`
@@ -661,5 +708,45 @@ mod tests {
             text.starts_with(r#"{"status":"error","code":"ERR_INVALID_AUTH""#),
             "unexpected serialization: {text}"
         );
+    }
+
+    // ── the payment header's link cost is bounded before the middleware ──
+
+    #[test]
+    fn a_payment_over_the_bound_is_answered_as_an_unreadable_payment() {
+        // The middleware's answer for a payment transaction it cannot read:
+        // `failed_json_response(400, "ERR_INVALID_PAYMENT", ..)`, its
+        // `ErrorResponse` serialized in field order.
+        let ours = serde_json::to_string(&over_bound_body()).unwrap();
+        let theirs = serde_json::to_string(&bsv_middleware_cloudflare::types::ErrorResponse::new(
+            "ERR_INVALID_PAYMENT",
+            link_cost::OVER_BOUND_DESCRIPTION,
+        ))
+        .unwrap();
+        assert_eq!(ours, theirs);
+        let (body, status) = middleware_error_body(&AuthCloudflareError::InvalidPayment(
+            link_cost::OVER_BOUND_DESCRIPTION.into(),
+        ));
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], over_bound_body()["code"]);
+        assert!(link_cost::OVER_BOUND_DESCRIPTION
+            .starts_with("Payment not verified: payment transaction unreadable: "));
+    }
+
+    #[test]
+    fn the_payment_header_is_checked_before_the_middleware_on_both_paid_routes() {
+        let source = include_str!("lib.rs");
+        let main = &source[source.find("async fn main(").unwrap()..];
+        for route in ["path == \"/upload\"", "path == \"/renew\""] {
+            let start = main.find(route).unwrap();
+            let branch = &main[start..];
+            let branch = &branch[..branch.find("PaymentResult::Free").unwrap()];
+            let check = branch.find("payment_header_over_bound(&req)?").unwrap();
+            let paid = branch
+                .rfind("run_payment_middleware(&req, &env, &auth_context, &payment_options)")
+                .unwrap();
+            assert!(check < paid, "{route}: the check runs first");
+            assert!(branch[..check].contains("if price > 0 {"));
+        }
     }
 }

@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.2.4 (2026-11-17)
+
+- The payment header's transaction is checked for its link cost before the
+  payment middleware reads it on `/upload` and `/renew`: the storage decodes
+  it as the middleware does, parses the BEEF without linking it and estimates
+  what linking it from the subject would copy. A payment over the bound is
+  answered as an unreadable payment (`400 ERR_INVALID_PAYMENT`, the
+  middleware's own shape); a header that does not decode or parse goes on to
+  the middleware unchanged.
+- The mainnet fan-out reads a tracker answer's subject without linking (the
+  Atomic BEEF's named transaction, else the last entry, as `from_beef`
+  chooses it) and bounds the answer's size (4 MiB) before decoding it; an
+  answer over the bound is skipped as an unreadable one is.
+- `tests/heap`: the native heap measurements of both readings with a
+  counting allocator, a package of its own outside the workspace; `ci.yml`
+  and `scripts/check.sh` run its test, fmt and clippy.
+- No dependency moves: bsv-rs `=0.4.5`, bsv-middleware-cloudflare `=0.5.1`
+  (core 0.2.1), the same lock.
+
 ## 0.2.3 (2026-10-18)
 
 - Publish the crate `bsv-storage-cloudflare` to crates.io from a `v*` tag

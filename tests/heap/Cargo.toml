@@ -1,0 +1,25 @@
+# Heap measurements of the storage's BEEF reading (src/link_cost.rs) against
+# the real bsv-rs 0.4.5 link, with a counting allocator. A package of its own,
+# outside the workspace: the allocator is the one `unsafe` in the tree, and
+# the Worker's crates forbid `unsafe_code`. Its lock is the root lock's
+# resolution (the same bsv-rs, middleware and serde versions).
+#   cargo test --locked --manifest-path tests/heap/Cargo.toml --release
+[package]
+name = "heap"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[[test]]
+name = "link_cost"
+path = "link_cost.rs"
+
+[dev-dependencies]
+bsv-middleware-cloudflare = "=0.5.1"
+bsv-rs = { version = "=0.4.5", features = ["auth", "wallet", "transaction", "script"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+hex = "0.4"
+
+[workspace]

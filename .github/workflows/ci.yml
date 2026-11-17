@@ -32,6 +32,7 @@ jobs:
       with:
         workspaces: . -> target
     - run: cargo test --locked --workspace --no-fail-fast
+    - run: cargo test --locked --manifest-path tests/heap/Cargo.toml --release
   fmt:
     name: fmt
     runs-on: ubuntu-latest
@@ -46,6 +47,7 @@ jobs:
       with:
         workspaces: . -> target
     - run: cargo fmt -p bsv-storage-cloudflare -p parity -- --check
+    - run: cargo fmt --manifest-path tests/heap/Cargo.toml -- --check
   clippy:
     name: clippy
     runs-on: ubuntu-latest
@@ -60,6 +62,7 @@ jobs:
       with:
         workspaces: . -> target
     - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+    - run: cargo clippy --locked --manifest-path tests/heap/Cargo.toml --all-targets -- -D warnings
     - run: cargo clippy --locked --target wasm32-unknown-unknown --all-targets -- -D warnings
   wasm32:
     name: wasm32
