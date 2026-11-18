@@ -1,9 +1,12 @@
 # The storage at v0.2.4 against the storage now, on the same inputs. A
 # package of its own, outside the Worker's workspace: `old` mounts a
-# verbatim copy of v0.2.4's `src/` (v0_2_4/src, without lib.rs and
-# health.rs) on that release's dependencies (bsv-rs 0.4.5,
-# bsv-middleware-cloudflare 0.5.1); `new` mounts the tree's `src/` on the
-# Worker's. Neither is built into the Worker or published.
+# copy of v0.2.4's `src/` (v0_2_4/src, without lib.rs and health.rs), kept
+# as released but for one made-up fixture value: the "account" of the R2
+# event in queue/mod.rs's unit test `parses_real_r2_put_event`, a test
+# module `old` does not build and a field no assertion reads. It runs on
+# that release's dependencies (bsv-rs 0.4.5, bsv-middleware-cloudflare
+# 0.5.1); `new` mounts the tree's `src/` on the Worker's. Neither is built
+# into the Worker or published.
 #   cargo test --locked --manifest-path tests/compat/Cargo.toml
 [package]
 name = "compat"
