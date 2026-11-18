@@ -1,0 +1,28 @@
+# The stand-in for everything the storage Worker fetches in ../run.mjs: a
+# wallet storage server (BRC-103/104 through the middleware's process_auth;
+# makeAvailable, findOrInsertUser, internalizeAction, and listOutputs,
+# createAction, processAction for /renew), the overlay's /submit and
+# /lookup, and the exchange rate.
+# A package of its own, outside the workspace; never published.
+#   worker-build --release   (worker-build 0.8.4, in this directory)
+[package]
+name = "wallet-stand-in"
+version = "0.0.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+bsv-middleware-cloudflare = "=0.7.5"
+worker = "0.8"
+serde_json = { version = "1", features = ["preserve_order"] }
+getrandom = { version = "0.2", features = ["js"] }
+
+[profile.release]
+opt-level = "s"
+
+[workspace]

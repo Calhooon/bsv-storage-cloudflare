@@ -67,7 +67,7 @@ else
   create_out="$($WRANGLER kv namespace create "$KV_NAMESPACE_TITLE" 2>&1 || true)"
   echo "$create_out"
   # Extract id from the TOML-ish output wrangler prints. Example line:
-  #   id = "c22bbbbcade14868a970638672258594"
+  #   id = "<your-kv-namespace-id>"
   KV_ID="$(printf '%s\n' "$create_out" \
     | grep -oE 'id = "[0-9a-f]{32}"' \
     | head -n1 \

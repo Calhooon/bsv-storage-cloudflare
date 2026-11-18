@@ -524,7 +524,7 @@ fn lookup_answer(outputs: &[(Vec<u8>, u32)]) -> Vec<u8> {
 }
 
 #[test]
-fn the_fan_out_takes_the_same_hosts_from_the_same_answers() {
+fn the_fan_out_takes_the_signed_hosts_once_from_the_same_answers() {
     let ship = ship_script();
     let plain = {
         let mut beef = new::bsv_rs::transaction::Beef::new();
@@ -540,15 +540,43 @@ fn the_fan_out_takes_the_same_hosts_from_the_same_answers() {
         br#"{"type":"freeform","result":{}}"#.to_vec(),
         b"not json".to_vec(),
     ];
+    // The new build takes each host once, from the same signed adverts.
     for answer in &answers {
-        assert_eq!(
-            old::hosts_from_lookup_answer(answer),
-            new::hosts_from_lookup_answer(answer)
-        );
+        let once = old::hosts_from_lookup_answer(answer).map(|mut hosts| {
+            hosts.dedup();
+            hosts
+        });
+        assert_eq!(once, new::hosts_from_lookup_answer(answer));
     }
     assert_eq!(
-        new::hosts_from_lookup_answer(&answers[1]).unwrap(),
+        old::hosts_from_lookup_answer(&answers[1]).unwrap(),
         vec!["https://overlay.example.com".to_string(); 2]
+    );
+    assert_eq!(
+        new::hosts_from_lookup_answer(&answers[1]).unwrap(),
+        vec!["https://overlay.example.com".to_string()]
+    );
+    // An advert its identity did not sign names a host to the old build
+    // only: the same fields, the signature dropped.
+    let unsigned = {
+        let token = new::bsv_rs::script::templates::PushDrop::decode(
+            &new::bsv_rs::script::LockingScript::from_binary(&ship).unwrap(),
+        )
+        .unwrap();
+        let mut fields = token.fields.clone();
+        fields.pop();
+        new::bsv_rs::script::templates::PushDrop::new(token.locking_public_key, fields)
+            .lock()
+            .to_binary()
+    };
+    let answer = lookup_answer(&[(atomic_beef(raw_tx(&[(1, unsigned)])), 0)]);
+    assert_eq!(
+        old::hosts_from_lookup_answer(&answer).unwrap(),
+        vec!["https://overlay.example.com".to_string()]
+    );
+    assert_eq!(
+        new::hosts_from_lookup_answer(&answer).unwrap(),
+        Vec::<String>::new()
     );
     // The bound on a tracker's answer.
     assert_eq!(new::LOOKUP_ANSWER_MAX_BYTES, old::LOOKUP_ANSWER_MAX_BYTES);

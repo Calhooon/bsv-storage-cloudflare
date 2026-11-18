@@ -1,6 +1,6 @@
 [package]
 name = "bsv-storage-cloudflare"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 description = "UHRP file-storage server on Cloudflare Workers. Protocol-compatible Rust/WASM port of @bsv/uhrp-storage-server (nanostore.babbage.systems)."
 license = "MIT"
@@ -29,7 +29,7 @@ crate-type = ["cdylib", "rlib"]
 # 0.8 to match bsv-middleware-cloudflare. Two simultaneous `worker` versions
 # cannot coexist: middleware and Worker `Response`/`Env` types must match.
 # Keep both on the same worker major version.
-worker = { version = "0.8", features = ["queue"] }
+worker = { version = "0.8", features = ["queue", "d1"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 serde-wasm-bindgen = "0.6"
@@ -43,8 +43,10 @@ hex = "0.4"
 base64 = "0.22"
 sha2 = "0.10"
 
-bsv-middleware-cloudflare = "=0.7.4"
-bsv-rs = { version = "0.8.11", features = ["auth", "wallet", "transaction", "script", "overlay", "wasm"] }
+# `d1-claims`: the payment prefix is claimed in the `CLAIMS` D1 database
+# (`D1PrefixStore`, `payment_prefix_gate`).
+bsv-middleware-cloudflare = { version = "=0.7.5", features = ["d1-claims"] }
+bsv-rs = { version = "0.8.13", features = ["auth", "wallet", "transaction", "script", "overlay", "wasm"] }
 # SigV4 for R2 S3-compatible presigned URLs (task #4).
 hmac = "0.12"
 
@@ -68,6 +70,13 @@ bsv-worker-build-info = { version = "=0.1.0", features = ["build"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }
+# The single-use stores' conformance kit, run against the paid routes' store
+# (tests/claims_store.rs). Tests only: the Worker carries none of it.
+bsv-middleware-core = { version = "0.4.4", features = ["conformance"] }
+
+# The kit on SQLite runs natively only.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+rusqlite = { version = "0.43", default-features = false, features = ["bundled"] }
 
 [lints.rust]
 unsafe_code = "forbid"

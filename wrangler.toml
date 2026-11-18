@@ -14,7 +14,7 @@ WALLET_STORAGE_URL = "https://wallet-infra.x402agency.com"
 # Overlay submit HOST (no `/submit` suffix). Our `WorkerBroadcaster`-style
 # submit appends `/submit` itself; setting `...foo/submit` here would
 # silently produce `...foo/submit/submit` and 404 every advert.
-# rust-overlay at dev-a3e.workers.dev now registers tm_uhrp + ls_uhrp
+# rust-overlay at your-worker.your-account.workers.dev now registers tm_uhrp + ls_uhrp
 # (see rust-overlay commit feat(uhrp): tm_uhrp + ls_uhrp topic manager
 # and lookup service). Adverts go there instead of bsvb.tech so the
 # round-trip is entirely Calgooon-owned. overlay-us-1.bsvb.tech remains
@@ -25,10 +25,10 @@ OVERLAY_SUBMIT_URL = "https://your-worker.your-account.workers.dev"
 # production. For the initial deploy we use Cloudflare's auto-generated
 # r2.dev public URL for bucket `uhrp-prod` (enabled via
 # `wrangler r2 bucket dev-url enable uhrp-prod`).
-PUBLIC_URL_BASE = "https://pub-0c965344954142909622d4c2aed91f87.r2.dev"
+PUBLIC_URL_BASE = "https://pub-<your-r2-dev-id>.r2.dev"
 # R2 S3-compat API endpoint host used by the /upload SigV4 presigner
 # (task #4). Format: `<ACCOUNT_ID>.r2.cloudflarestorage.com`.
-R2_S3_ENDPOINT_HOST = "ea3e6d176ed3893258fe34281f710c7f.r2.cloudflarestorage.com"
+R2_S3_ENDPOINT_HOST = "<your-account-id>.r2.cloudflarestorage.com"
 # R2 bucket name (mirrors the `UHRP_FILES` r2_buckets binding below).
 # Set here as a var because SigV4 needs the name in the presigned URL path.
 R2_BUCKET = "uhrp-prod"
@@ -47,8 +47,8 @@ command = "worker-build --release"
 # fetches (the "fetch to a workers.dev URL from a Worker is restricted" path).
 # A service binding uses CF's internal RPC rail instead of the public HTTPS
 # edge, so it's the canonical solution. Pinned to the `rust-overlay` Worker
-# on the same account — both run under dev@calhounjohn.com / account
-# ea3e6d176ed3893258fe34281f710c7f.
+# on the same account — both run under <your-cloudflare-login> / account
+# <your-account-id>.
 [[services]]
 binding = "OVERLAY"
 service = "rust-overlay"
@@ -56,6 +56,16 @@ service = "rust-overlay"
 [[kv_namespaces]]
 binding = "AUTH_SESSIONS"
 id = "<your-account-id>"
+
+# The payment-prefix claims ledger (0.3.1): the paid routes (/upload, /renew)
+# claim each payment's derivation prefix here, in one statement, and record
+# what each won claim was granted. The schema is migrations/, applied before
+# the deploy: `wrangler d1 migrations apply CLAIMS --remote`.
+[[d1_databases]]
+binding = "CLAIMS"
+database_name = "uhrp-payment-claims"
+database_id = "<your-database-id>"
+migrations_dir = "migrations"
 
 [[r2_buckets]]
 binding = "UHRP_FILES"

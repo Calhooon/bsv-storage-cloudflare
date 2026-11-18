@@ -54,15 +54,26 @@ pub(crate) const CUSTOM_TIME_BUFFER_SECONDS: u64 = 300;
 /// calculation) and passed in so the handler returns the exact satoshi figure
 /// the client paid. Recomputing here would risk a drift vs. the middleware if
 /// the WhatsOnChain rate shifts between calls.
-pub async fn handle(body: &[u8], identity_key: &str, amount: u64, env: &Env) -> (Value, u16) {
+///
+/// With the answer, what it grants when it is a success: the object
+/// identifier, the size and the minutes signed into the presigned PUT, and
+/// the expiry the advert carries (the PUT's expiry and the custom-time
+/// buffer).
+pub async fn handle_granting(
+    body: &[u8],
+    identity_key: &str,
+    amount: u64,
+    env: &Env,
+) -> ((Value, u16), Option<crate::claims::Granted>) {
+    let answer = |a: (Value, u16)| (a, None);
     // TS: `if (!req.auth.identityKey)` — middleware guarantees identity_key is
     // set for authenticated routes; defensive check preserved for parity.
     if identity_key.is_empty() {
-        return error(
+        return answer(error(
             ERR_MISSING_IDENTITY_KEY,
             "Missing authfetch identityKey.",
             400,
-        );
+        ));
     }
 
     let req: UploadRequest = serde_json::from_slice(body).unwrap_or(UploadRequest {
@@ -79,11 +90,11 @@ pub async fn handle(body: &[u8], identity_key: &str, amount: u64, env: &Env) -> 
     let file_size = match req.file_size {
         Some(v) if v.is_finite() && v > 0.0 && v.fract() == 0.0 => v,
         _ => {
-            return error(
+            return answer(error(
                 ERR_INVALID_SIZE,
                 "The file size must be a positive integer.",
                 400,
-            );
+            ));
         }
     };
 
@@ -91,11 +102,11 @@ pub async fn handle(body: &[u8], identity_key: &str, amount: u64, env: &Env) -> 
     let retention_period = match req.retention_period {
         Some(v) if v.is_finite() && v != 0.0 => v,
         _ => {
-            return error(
+            return answer(error(
                 ERR_NO_RETENTION_PERIOD,
                 "You must specify the number of minutes to host the file.",
                 400,
-            );
+            ));
         }
     };
 
@@ -112,20 +123,20 @@ pub async fn handle(body: &[u8], identity_key: &str, amount: u64, env: &Env) -> 
         .unwrap_or(0.0);
 
     if retention_period < min_hosting_minutes {
-        return error(
+        return answer(error(
             ERR_INVALID_RETENTION_PERIOD,
             format!("The retention period must be >= {min_hosting_minutes} minutes"),
             400,
-        );
+        ));
     }
 
     // TS: explicit 11 GB ceiling unique to `/upload` (§2 validation).
     if file_size > MAX_UPLOAD_BYTES {
-        return error(
+        return answer(error(
             ERR_INVALID_SIZE,
             "Max supported file size is 11000000000 bytes.",
             400,
-        );
+        ));
     }
 
     // ── Generate object identifier + expiry ──────────────────────────────────
@@ -133,7 +144,7 @@ pub async fn handle(body: &[u8], identity_key: &str, amount: u64, env: &Env) -> 
     // TS: `Utils.toBase58(Array.from(crypto.randomBytes(16)))`.
     let mut obj_bytes = [0u8; 16];
     if getrandom(&mut obj_bytes).is_err() {
-        return internal_error();
+        return answer(internal_error());
     }
     let object_identifier = to_base58(&obj_bytes);
 
@@ -156,21 +167,33 @@ pub async fn handle(body: &[u8], identity_key: &str, amount: u64, env: &Env) -> 
         file_size as u64,
     ) {
         Ok(pair) => pair,
-        Err(_) => return internal_error(),
+        Err(_) => return answer(internal_error()),
     };
 
     // ── Success response (field order: status, uploadURL, requiredHeaders,
     // amount, description — matches TS upload.ts:83–89 exactly) ─────────────
 
+    let granted = crate::claims::Granted {
+        object_identifier: Some(object_identifier),
+        file_size: Some(file_size as u64),
+        minutes: Some(retention_period),
+        // The expiry the advert carries: the queue advertises the object's
+        // custom-time, the PUT's expiry and its buffer.
+        expiry_time: Some(expiry_time + CUSTOM_TIME_BUFFER_SECONDS),
+        ..Default::default()
+    };
     (
-        json!(UploadResponse {
-            status: "success",
-            upload_url,
-            required_headers,
-            amount,
-            description: "File can now be uploaded.",
-        }),
-        200,
+        (
+            json!(UploadResponse {
+                status: "success",
+                upload_url,
+                required_headers,
+                amount,
+                description: "File can now be uploaded.",
+            }),
+            200,
+        ),
+        Some(granted),
     )
 }
 

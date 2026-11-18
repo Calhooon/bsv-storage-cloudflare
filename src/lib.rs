@@ -4,14 +4,17 @@
 //! See `PROTOCOL.md` for the wire spec the Rust port must match byte-for-byte.
 
 use bsv_middleware_cloudflare::{
-    add_cors_headers, init_panic_hook,
+    add_cors_headers,
+    core::{PaymentVerdict, UnverifiableReason},
+    init_panic_hook,
     middleware::{
         auth::{handle_cors_preflight, AuthSession},
         payment::payment_headers,
         process_auth, process_payment_with_storage, sign_json_response, AuthMiddlewareOptions,
         AuthResult, PaymentMiddlewareOptions, PaymentResult,
     },
-    AuthCloudflareError, KvPrefixStore, KvSessionStorage,
+    types::ErrorResponse,
+    AuthCloudflareError,
 };
 use bsv_rs::primitives::PrivateKey;
 use bsv_rs::wallet::ProtoWallet;
@@ -23,15 +26,18 @@ use worker::*;
 /// later rejects.
 const PAYMENT_ORIGINATOR: &str = "bsv-auth-cloudflare";
 
-/// BRC-103/104 session TTL. Used both for `AuthMiddlewareOptions` and for
-/// the `KvSessionStorage` handle [`payment_nonce_store`] builds, so the two
-/// stay in lockstep with the storage `process_auth` constructs internally
-/// (same KV binding, same `"auth"` prefix, same TTL). The TTL only governs
-/// session records — claimed payment derivation prefixes are written with
-/// **no expiry** (the challenge HMAC never expires, so its claim record must
-/// not either).
+/// BRC-103/104 session TTL (`AuthMiddlewareOptions`). The TTL only governs
+/// session records — a payment prefix's claim and its key-value record
+/// ([`claims::paid_store`]) are written with **no expiry** (the challenge
+/// HMAC never expires, so its claim must not either).
 const SESSION_TTL_SECONDS: u64 = 3600;
 
+/// The largest `X-BSV-Payment` header the paid routes read: 96 KiB. A larger
+/// header is refused before it is parsed or decoded, with the middleware's
+/// answer to a payment transaction it cannot read ([`payment_too_large`]).
+pub const PAYMENT_HEADER_MAX: usize = 96 * 1024;
+
+pub mod claims;
 mod error;
 mod health;
 mod overlay;
@@ -91,60 +97,62 @@ async fn build_signed_402(price: u64, session: &AuthSession, server_key: &str) -
     signed_json_or_internal_error(&body, 402, &payment_hdrs, session)
 }
 
-/// The KV handle behind the payment-derivation-prefix store
-/// (the-composer #44/#62; [`run_payment_middleware`] wraps it in a
-/// [`KvPrefixStore`]).
-///
-/// Same `AUTH_SESSIONS` KV namespace + `"auth"` prefix + TTL that the auth
-/// middleware's `process_auth` builds internally, so claimed payment
-/// prefixes live alongside the BRC-103/104 sessions they protect (key:
-/// `auth:nonce:payment-derivation-prefix:<prefix>`, value: the subject txid
-/// the prefix is bound to, written with no expiry; a key holding `"1"`, a
-/// prefix consumed before the binding, stays refused). `process_auth` has already used this binding by the time any
-/// paid route runs, so a missing binding fails at auth — the `ConfigError`
-/// here is a config-drift backstop, not a reachable client path.
-fn payment_nonce_store(env: &Env) -> std::result::Result<KvSessionStorage, AuthCloudflareError> {
-    let kv = env.kv("AUTH_SESSIONS").map_err(|e| {
-        AuthCloudflareError::ConfigError(format!("AUTH_SESSIONS KV not bound: {}", e))
-    })?;
-    Ok(KvSessionStorage::new(kv, "auth", SESSION_TTL_SECONDS))
-}
-
-/// BRC-29 payment processing with single-use derivation prefixes —
-/// the middleware's `process_payment_with_storage` over a
-/// [`KvPrefixStore`] on the [`payment_nonce_store`] handle (the-composer
-/// #44/#62 on the live `/upload` and `/renew` routes).
+/// BRC-29 payment processing with single-use derivation prefixes: the
+/// middleware's `process_payment_with_storage` (the 0.7.5 door, whose
+/// `internalizeAction` request is written once, through
+/// `WorkerStorageClient::internalize_action_with_tx`) over the paid routes'
+/// store ([`claims::PaidPrefixStore`]: the prefix claimed in the `CLAIMS` D1
+/// database in one statement, the key-value record beside it).
 ///
 /// The middleware reads the payment's subject transaction alone (output 0's
 /// script and amount; no ancestry linked, no script run) and leaves the
 /// payment's validity to the wallet storage server's `internalizeAction`.
-/// Deliberate money-path deltas vs `@bsv/payment-express-middleware` 1.2.3
-/// (the middleware's own executed tests pin the ordering):
-/// - a replayed `X-BSV-Payment` header is rejected with
-///   `400 ERR_INVALID_DERIVATION_PREFIX` **before** touching the wallet,
-///   and a prefix binds the first subject txid that claims it: another
-///   transaction under the same prefix is refused the same way;
-/// - a KV fault while claiming the prefix fails **closed** (503
-///   `ERR_PAYMENT_UNAVAILABLE` with `Retry-After`, the quote kept), never
-///   silently disabling replay protection;
+/// The prefix is claimed before the wallet is called:
+/// - a won claim goes on to the wallet and, accepted, to the route;
+/// - the same transaction again is refused with the middleware's signed
+///   `409 ERR_PAYMENT_REPLAYED`, another transaction under a bound prefix
+///   with its signed `400 ERR_PAYMENT_INVALID` ([`claims::Refusal`], signed
+///   by [`paid_route`]), neither touching the wallet;
+/// - a store fault fails **closed** (503 `ERR_PAYMENT_UNAVAILABLE` with
+///   `Retry-After`, the quote kept), never a service: signed when the gate
+///   could not make the claim (its answer, signed by [`paid_route`]), and
+///   the door's unsigned answer for a fault the store meets before or after
+///   the gate;
 /// - a wallet **error** releases the prefix to the same transaction (an
 ///   honest retry works); a wallet **rejection** (`accepted != true`) keeps
-///   it consumed and 402s with a fresh challenge.
+///   it claimed and 402s with a fresh challenge.
 async fn run_payment_middleware<F: Fn(&Request) -> u64>(
     req: &Request,
-    env: &Env,
     auth_context: &bsv_middleware_cloudflare::AuthContext,
     options: &PaymentMiddlewareOptions<F>,
+    store: &claims::PaidStore<'_>,
 ) -> std::result::Result<PaymentResult, AuthCloudflareError> {
-    let nonce_store = payment_nonce_store(env)?;
-    let result =
-        process_payment_with_storage(req, auth_context, options, &KvPrefixStore(&nonce_store))
-            .await?;
+    let result = process_payment_with_storage(req, auth_context, options, store).await?;
     Ok(match result {
         PaymentResult::Required(r) => PaymentResult::Required(header_transport_only(r)),
         PaymentResult::Failed(r) => PaymentResult::Failed(header_transport_only(r)),
         other => other,
     })
+}
+
+/// The middleware's answer to a payment transaction it cannot read (400
+/// `ERR_INVALID_PAYMENT`, the quote kept: nothing claimed, no fresh
+/// challenge), for a header over [`PAYMENT_HEADER_MAX`].
+fn payment_too_large() -> Result<Response> {
+    let verdict = PaymentVerdict::Unverifiable {
+        reason: UnverifiableReason::MalformedTransaction(
+            "the payment transaction is too large to read".to_string(),
+        ),
+    };
+    let body = ErrorResponse::new("ERR_INVALID_PAYMENT", verdict.to_string());
+    Ok(add_cors_headers(
+        Response::from_json(&body)?.with_status(400),
+    ))
+}
+
+/// Whether an `X-BSV-Payment` header is over [`PAYMENT_HEADER_MAX`].
+pub fn over_the_ceiling(header: &str) -> bool {
+    header.len() > PAYMENT_HEADER_MAX
 }
 
 /// `payment_headers::TRANSPORTS` of the middleware.
@@ -247,6 +255,202 @@ fn signed_json_or_internal_error(
     }
 }
 
+/// A paid request, authenticated and priced.
+struct Paid<'a> {
+    req: &'a Request,
+    env: &'a Env,
+    auth_context: &'a bsv_middleware_cloudflare::AuthContext,
+    session: Option<&'a AuthSession>,
+    server_key: &'a str,
+    price: u64,
+}
+
+/// The paid routes.
+enum PaidRoute {
+    Upload,
+    Renew(routes::renew::PreparedRenew),
+}
+
+impl PaidRoute {
+    fn path(&self) -> &'static str {
+        match self {
+            PaidRoute::Upload => "/upload",
+            PaidRoute::Renew(_) => "/renew",
+        }
+    }
+}
+
+/// The wallet storage server the paid routes internalize payments at: the
+/// one `/advertise` draws funds from (`WALLET_STORAGE_URL`), so payments land
+/// where `/advertise` can see them. The middleware's default is
+/// storage.babbage.systems.
+fn wallet_storage_url(env: &Env) -> String {
+    env.var("WALLET_STORAGE_URL")
+        .ok()
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "https://wallet-infra.x402agency.com".to_string())
+}
+
+/// `/upload` and `/renew` from the price on: the challenge, the header's
+/// ceiling, the payment door over the paid routes' store, the route, and the
+/// record of what a won claim was granted.
+async fn paid_route(paid: Paid<'_>, route: PaidRoute, request_body: &[u8]) -> Result<Response> {
+    let Paid {
+        req,
+        env,
+        auth_context,
+        session,
+        server_key,
+        price,
+    } = paid;
+    let header = req.headers().get(payment_headers::PAYMENT).ok().flatten();
+    let store = match claims::paid_store(env) {
+        Ok(store) => store,
+        // `process_auth` has already used `AUTH_SESSIONS`, so this is a
+        // config-drift backstop, not a reachable client path.
+        Err(e) => {
+            return middleware_error_response(
+                &AuthCloudflareError::ConfigError(format!("AUTH_SESSIONS KV not bound: {e}")),
+                session,
+            )
+        }
+    };
+    // Short-circuit: if the client didn't provide `x-bsv-payment`, build
+    // and sign the 402 inline (poc-server pattern). Skipping the payment
+    // middleware here is intentional — wrapping its pre-built Response
+    // forces a serde_json round-trip that produces body bytes ≠ what we
+    // sign, which @bsv/sdk rejects via MetaNet Client's verifySignature
+    // RPC. (Challenge prefixes are claimed at redemption, not issuance, so
+    // bypassing the middleware for the 402 does not skip the single-use
+    // claim.)
+    if price > 0 && header.is_none() {
+        return match session {
+            Some(s) => build_signed_402(price, s, server_key).await,
+            None => {
+                // No session means AuthFetch wouldn't be able to verify
+                // either way — fall through to middleware's unsigned 402
+                // as a minimal error surface.
+                let payment_options = PaymentMiddlewareOptions::new(
+                    server_key.to_string(),
+                    move |_: &Request| -> u64 { price },
+                );
+                match run_payment_middleware(req, auth_context, &payment_options, &store).await {
+                    Ok(PaymentResult::Required(r) | PaymentResult::Failed(r)) => Ok(r),
+                    Ok(_) => Ok(Response::from_json(&json!({"status": "error"}))?.with_status(500)),
+                    // Typed 4xx/5xx JSON, not a plaintext 500 (#31).
+                    Err(e) => middleware_error_response(&e, None),
+                }
+            }
+        };
+    }
+    // The ceiling: a header the door would read (a priced request) that is
+    // longer than 96 KiB is refused before it is parsed or decoded.
+    if price > 0 && header.as_deref().is_some_and(over_the_ceiling) {
+        return payment_too_large();
+    }
+    drop(header);
+    // Annotate closure arg type explicitly so the HRTB on
+    // `process_payment_with_storage::<F, S>`'s `F: Fn(&Request) -> u64`
+    // bound is satisfied.
+    let calc_price = move |_: &Request| -> u64 { price };
+    let payment_options = PaymentMiddlewareOptions::with_storage_url(
+        server_key.to_string(),
+        calc_price,
+        wallet_storage_url(env),
+    );
+    // Malformed/failed payment headers are typed 400s from the
+    // middleware; sign them for the authenticated client (#31 — the TS
+    // payment middleware's errors flow through auth's response signing).
+    let payment_result =
+        match run_payment_middleware(req, auth_context, &payment_options, &store).await {
+            Ok(result) => result,
+            Err(e) => return middleware_error_response(&e, session),
+        };
+    let path = route.path();
+    let satoshis = match payment_result {
+        PaymentResult::Free => None,
+        PaymentResult::Verified(ref ctx) => {
+            console_error!(
+                "{path}: payment verified, accepted={} sats_paid={}",
+                ctx.accepted,
+                ctx.satoshis_paid
+            );
+            Some(ctx.satoshis_paid)
+        }
+        PaymentResult::Required(response) | PaymentResult::Failed(response) => {
+            // A refused claim: the middleware's answer (409 for the same
+            // transaction, 400 for another, the gate's 503 for a claim it
+            // could not make), signed for the payer.
+            if let Some(refusal) = store.take_refusal() {
+                return match session {
+                    Some(s) => signed_json_or_internal_error(
+                        &refusal.body,
+                        refusal.status,
+                        &refusal.headers,
+                        s,
+                    ),
+                    None => {
+                        let resp = unsigned_json_response(&refusal.body, refusal.status)?;
+                        for (name, value) in &refusal.headers {
+                            resp.headers().set(name, value)?;
+                        }
+                        Ok(resp)
+                    }
+                };
+            }
+            // Required branch is handled above via build_signed_402 when the
+            // client didn't send x-bsv-payment. Reaching here with Required
+            // means the client DID send a payment header but the middleware
+            // still returned Required — shouldn't happen in practice. Failed
+            // covers the bad-payment paths: 400 for malformed payments or
+            // failed verification, 503 for a fault outside the gate, 402
+            // with a fresh challenge when the wallet rejected
+            // (`accepted != true`).
+            // Terminal from the client's perspective either way. Return
+            // the unsigned Response rather than re-signing (which
+            // mangles bytes).
+            return Ok(response);
+        }
+    };
+    // A won claim, its payment accepted: the first grant write. A failed
+    // write is logged and changes nothing in the answer.
+    let won = satoshis.and(store.won());
+    let grants_db = store.ledger().db();
+    if let (Some(won), Some(db), Some(satoshis)) = (&won, grants_db, satoshis) {
+        if let Err(e) =
+            claims::grants::paid(db, won, path, &auth_context.identity_key, satoshis).await
+        {
+            console_error!("{path}: the grant's first write failed: {e}");
+        }
+    }
+    let identity_key = &auth_context.identity_key;
+    let ((body, status), granted) = match route {
+        PaidRoute::Upload => {
+            routes::upload::handle_granting(request_body, identity_key, price, env).await
+        }
+        PaidRoute::Renew(prepared) => {
+            let granted = prepared.granted();
+            let (body, status) =
+                routes::renew::handle(request_body, identity_key, price, prepared, env).await;
+            let granted = granted.map(|mut g| {
+                g.expiry_time = body["newExpiryTime"].as_u64();
+                g
+            });
+            ((body, status), granted)
+        }
+    };
+    if let (Some(won), Some(db)) = (&won, grants_db) {
+        let granted = granted.unwrap_or_default();
+        if let Err(e) = claims::grants::answered(db, won, status, &granted).await {
+            console_error!("{path}: the grant's second write failed: {e}");
+        }
+    }
+    match session {
+        Some(s) => signed_json_or_internal_error(&body, status, &[], s),
+        None => unsigned_json_response(&body, status),
+    }
+}
+
 #[event(fetch)]
 async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
     init_panic_hook();
@@ -331,98 +535,15 @@ async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
             Some((fs, rp)) => routes::quote::compute_price_from_env(fs, rp, &env).await,
             None => 0,
         };
-        // Short-circuit: if the client didn't provide `x-bsv-payment`, build
-        // and sign the 402 inline (poc-server pattern). Skipping the payment
-        // middleware here is intentional — wrapping its pre-built Response
-        // forces a serde_json round-trip that produces body bytes ≠ what we
-        // sign, which @bsv/sdk rejects via MetaNet Client's verifySignature
-        // RPC. (Challenge prefixes are consumed at redemption, not issuance,
-        // so bypassing the middleware for the 402 does not skip #44's
-        // single-use enforcement.)
-        if price > 0
-            && req
-                .headers()
-                .get(payment_headers::PAYMENT)
-                .ok()
-                .flatten()
-                .is_none()
-        {
-            return match session {
-                Some(ref s) => build_signed_402(price, s, &server_key).await,
-                None => {
-                    // No session means AuthFetch wouldn't be able to verify
-                    // either way — fall through to middleware's unsigned 402
-                    // as a minimal error surface.
-                    let payment_options = PaymentMiddlewareOptions::new(
-                        server_key.clone(),
-                        move |_: &Request| -> u64 { price },
-                    );
-                    match run_payment_middleware(&req, &env, &auth_context, &payment_options).await
-                    {
-                        Ok(PaymentResult::Required(r) | PaymentResult::Failed(r)) => Ok(r),
-                        Ok(_) => {
-                            Ok(Response::from_json(&json!({"status": "error"}))?.with_status(500))
-                        }
-                        // Typed 4xx/5xx JSON, not a plaintext 500 (#31).
-                        Err(e) => middleware_error_response(&e, None),
-                    }
-                }
-            };
-        }
-        // Annotate closure arg type explicitly so the HRTB on
-        // `process_payment_with_storage::<F, S>`'s `F: Fn(&Request) -> u64`
-        // bound is satisfied.
-        let calc_price = move |_: &Request| -> u64 { price };
-        // Payment must internalize against the SAME wallet server /advertise
-        // draws funds from. Middleware default is storage.babbage.systems; override
-        // with our WALLET_STORAGE_URL so /upload payments land where /advertise
-        // can see them.
-        let wallet_url = env
-            .var("WALLET_STORAGE_URL")
-            .ok()
-            .map(|v| v.to_string())
-            .unwrap_or_else(|| "https://wallet-infra.x402agency.com".to_string());
-        let payment_options =
-            PaymentMiddlewareOptions::with_storage_url(server_key.clone(), calc_price, wallet_url);
-        // Malformed/failed payment headers are typed 400s from the
-        // middleware; sign them for the authenticated client (#31 — the TS
-        // payment middleware's errors flow through auth's response signing).
-        let payment_result =
-            match run_payment_middleware(&req, &env, &auth_context, &payment_options).await {
-                Ok(result) => result,
-                Err(e) => return middleware_error_response(&e, session.as_ref()),
-            };
-        match payment_result {
-            PaymentResult::Free | PaymentResult::Verified(_) => {
-                if let PaymentResult::Verified(ref ctx) = payment_result {
-                    console_error!(
-                        "upload: payment verified, accepted={} sats_paid={}",
-                        ctx.accepted,
-                        ctx.satoshis_paid
-                    );
-                }
-                let (body, status) =
-                    routes::upload::handle(&request_body, identity_key, price, &env).await;
-                return match session {
-                    Some(ref s) => signed_json_or_internal_error(&body, status, &[], s),
-                    None => unsigned_json_response(&body, status),
-                };
-            }
-            PaymentResult::Required(response) | PaymentResult::Failed(response) => {
-                // Required branch is handled above via build_signed_402 when the
-                // client didn't send x-bsv-payment. Reaching here with Required
-                // means the client DID send a payment header but the middleware
-                // still returned Required — shouldn't happen in practice. Failed
-                // covers the bad-payment paths: 400 for malformed payments,
-                // failed verification, or a REPLAYED derivation prefix
-                // (single-use enforcement, #44/#62); 402 with a fresh
-                // challenge when the wallet rejected (`accepted != true`).
-                // Terminal from the client's perspective either way. Return
-                // the unsigned Response rather than re-signing (which
-                // mangles bytes).
-                return Ok(response);
-            }
-        }
+        let paid = Paid {
+            req: &req,
+            env: &env,
+            auth_context: &auth_context,
+            session: session.as_ref(),
+            server_key: &server_key,
+            price,
+        };
+        return paid_route(paid, PaidRoute::Upload, &request_body).await;
     }
 
     // `/renew` is the second paid route (PROTOCOL.md §5). `fileSize` is NOT
@@ -431,7 +552,7 @@ async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
     // client claims; the-composer #45) in a single pre-payment listOutputs
     // round-trip. The prepared context is threaded into the handler so the
     // lookup never runs twice. Price uses the exact `/quote` formula, and
-    // the 402/payment plumbing below mirrors `/upload`'s line for line.
+    // the 402/payment plumbing is `/upload`'s ([`paid_route`]).
     if method == Method::Post && path == "/renew" {
         let prepared = routes::renew::prepare(&request_body, &env).await;
         // `None` = free pass (malformed body / advert not found / lookup
@@ -441,98 +562,15 @@ async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
             Some((fs, minutes)) => routes::quote::compute_price_from_env(fs, minutes, &env).await,
             None => 0,
         };
-        // Short-circuit: if the client didn't provide `x-bsv-payment`, build
-        // and sign the 402 inline (poc-server pattern). Skipping the payment
-        // middleware here is intentional — wrapping its pre-built Response
-        // forces a serde_json round-trip that produces body bytes ≠ what we
-        // sign, which @bsv/sdk rejects via MetaNet Client's verifySignature
-        // RPC. (Challenge prefixes are consumed at redemption, not issuance,
-        // so bypassing the middleware for the 402 does not skip #44's
-        // single-use enforcement.)
-        if price > 0
-            && req
-                .headers()
-                .get(payment_headers::PAYMENT)
-                .ok()
-                .flatten()
-                .is_none()
-        {
-            return match session {
-                Some(ref s) => build_signed_402(price, s, &server_key).await,
-                None => {
-                    // No session means AuthFetch wouldn't be able to verify
-                    // either way — fall through to middleware's unsigned 402
-                    // as a minimal error surface.
-                    let payment_options = PaymentMiddlewareOptions::new(
-                        server_key.clone(),
-                        move |_: &Request| -> u64 { price },
-                    );
-                    match run_payment_middleware(&req, &env, &auth_context, &payment_options).await
-                    {
-                        Ok(PaymentResult::Required(r) | PaymentResult::Failed(r)) => Ok(r),
-                        Ok(_) => {
-                            Ok(Response::from_json(&json!({"status": "error"}))?.with_status(500))
-                        }
-                        // Typed 4xx/5xx JSON, not a plaintext 500 (#31).
-                        Err(e) => middleware_error_response(&e, None),
-                    }
-                }
-            };
-        }
-        // Annotate closure arg type explicitly so the HRTB on
-        // `process_payment_with_storage::<F, S>`'s `F: Fn(&Request) -> u64`
-        // bound is satisfied.
-        let calc_price = move |_: &Request| -> u64 { price };
-        // Payment must internalize against the SAME wallet server /advertise
-        // draws funds from. Middleware default is storage.babbage.systems; override
-        // with our WALLET_STORAGE_URL so /renew payments land where /advertise
-        // can see them.
-        let wallet_url = env
-            .var("WALLET_STORAGE_URL")
-            .ok()
-            .map(|v| v.to_string())
-            .unwrap_or_else(|| "https://wallet-infra.x402agency.com".to_string());
-        let payment_options =
-            PaymentMiddlewareOptions::with_storage_url(server_key.clone(), calc_price, wallet_url);
-        // Malformed/failed payment headers are typed 400s from the
-        // middleware; sign them for the authenticated client (#31 — the TS
-        // payment middleware's errors flow through auth's response signing).
-        let payment_result =
-            match run_payment_middleware(&req, &env, &auth_context, &payment_options).await {
-                Ok(result) => result,
-                Err(e) => return middleware_error_response(&e, session.as_ref()),
-            };
-        match payment_result {
-            PaymentResult::Free | PaymentResult::Verified(_) => {
-                if let PaymentResult::Verified(ref ctx) = payment_result {
-                    console_error!(
-                        "renew: payment verified, accepted={} sats_paid={}",
-                        ctx.accepted,
-                        ctx.satoshis_paid
-                    );
-                }
-                let (body, status) =
-                    routes::renew::handle(&request_body, identity_key, price, prepared, &env).await;
-                return match session {
-                    Some(ref s) => signed_json_or_internal_error(&body, status, &[], s),
-                    None => unsigned_json_response(&body, status),
-                };
-            }
-            PaymentResult::Required(response) | PaymentResult::Failed(response) => {
-                // Required branch is handled above via build_signed_402 when the
-                // client didn't send x-bsv-payment. Reaching here with Required
-                // means the client DID send a payment header but the middleware
-                // still returned Required — shouldn't happen in practice. Failed
-                // covers the bad-payment paths: 400 for malformed payments,
-                // failed verification, or a REPLAYED derivation prefix
-                // (single-use enforcement, #44/#62); 402 with a fresh
-                // challenge when the wallet rejected (`accepted != true`).
-                // Terminal from the client's perspective either way. Return
-                // the unsigned Response rather than re-signing (which
-                // mangles bytes).
-                return Ok(response);
-            }
-        }
+        let paid = Paid {
+            req: &req,
+            env: &env,
+            auth_context: &auth_context,
+            session: session.as_ref(),
+            server_key: &server_key,
+            price,
+        };
+        return paid_route(paid, PaidRoute::Renew(prepared), &request_body).await;
     }
 
     // /drafts — composer-storage score-draft sync (NOT nanostore parity; see

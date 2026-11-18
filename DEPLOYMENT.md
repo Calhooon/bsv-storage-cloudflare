@@ -9,7 +9,7 @@ Operator guide for a first deploy, DNS cutover from `nanostore.babbage.systems`,
 ## Prerequisites
 
 - **Cloudflare account** with R2 enabled (paid tier — R2 storage is not on the Workers free plan).
-- **CF API token** with these scopes: `Workers Scripts:Edit`, `Workers KV Storage:Edit`, `Workers R2 Storage:Edit`, `Queues:Edit`. Store in `secrets.md` (gitignored). The token value lives there; this doc only references `CLOUDFLARE_API_TOKEN` by name.
+- **CF API token** with these scopes: `Workers Scripts:Edit`, `Workers KV Storage:Edit`, `Workers R2 Storage:Edit`, `Queues:Edit`, `D1:Edit`. Store in `secrets.md` (gitignored). The token value lives there; this doc only references `CLOUDFLARE_API_TOKEN` by name.
 - **Tools**:
   - Rust stable + the `wasm32-unknown-unknown` target: `rustup target add wasm32-unknown-unknown`
   - `worker-build` 0.1.x: `cargo install worker-build`
@@ -46,7 +46,114 @@ wrangler kv namespace create AUTH_SESSIONS
 
 wrangler queues create uhrp-post-upload
 # Expected: "Creating queue uhrp-post-upload. Created queue uhrp-post-upload."
+
+wrangler d1 create uhrp-payment-claims
+# Copy its database_id into wrangler.toml's [[d1_databases]] (binding CLAIMS).
 ```
+
+### The payment claims ledger (`CLAIMS`, 0.3.1)
+
+The paid routes claim each payment's derivation prefix in the `CLAIMS` D1
+database and record what each won claim was granted there. Its schema is
+`migrations/` (the middleware's `payment_claims` table and
+`payment_grants`), applied **before** the Worker that reads it is deployed:
+
+```bash
+wrangler d1 migrations apply CLAIMS --remote
+```
+
+**Success**: `wrangler d1 execute CLAIMS --remote --command "SELECT name FROM sqlite_master WHERE type='table'"`
+lists `payment_claims` and `payment_grants`.
+
+**The order, for every instance (`wrangler.toml`, and
+`wrangler.composer.toml` with its own database and `-c
+wrangler.composer.toml` on each command):**
+
+1. `wrangler d1 create <the instance's database>`; its `database_id` goes
+   into the config's `[[d1_databases]]` entry, `binding = "CLAIMS"`,
+   `migrations_dir = "migrations"` (the tracked configs carry
+   `<your-database-id>`).
+2. `wrangler d1 migrations apply CLAIMS --remote`, from the checkout of the
+   commit being deployed.
+3. The success check above: both tables listed.
+4. Only then `wrangler deploy` (Step 6).
+
+**What the Worker answers without them.** If the `CLAIMS` binding is
+missing from the deployed config, or the binding is there and the
+migration has not been applied, every payment sent to a paid route
+(`/upload`, `/renew`) is answered `503 ERR_PAYMENT_UNAVAILABLE`
+(`retryable: true`, `Retry-After: 5`): the wallet is not called, nothing
+is uploaded or renewed, and the payer may retry the same payment once the
+ledger is in place. Without the binding the 503 is signed for an
+authenticated payer. With the binding and no tables it is signed for a
+payment whose prefix has no `AUTH_SESSIONS` record and for the
+transaction a `released:<txid>` record names, and unsigned (the payment
+door's own answer) for any other payment whose prefix has a record; a
+payer whose client retries only signed answers retries that one by hand. The 402
+challenge is still issued, and the routes that take no payment are
+unaffected. `tests/workerd` (`node run.mjs worker`) runs the Worker both ways
+in Miniflare: without the binding, and with the binding and no tables.
+
+**The cutover from a release before 0.3.1 is two deploys.**
+
+1. Deploy this release with the `CLAIMS` binding absent from the config
+   (the paid routes answer the retryable 503 and serve nothing; the routes
+   that take no payment are unaffected).
+2. Wait three minutes after that deploy has reached every request (with
+   a gradual deployment, from when the new version takes 100%).
+3. Deploy this release with `CLAIMS` bound and migrated (the order above).
+
+A rollback across it takes the same two steps: first this release with
+the `CLAIMS` binding absent, a wait of three minutes, then the earlier
+release.
+
+Three minutes is a margin the operator chooses, not a platform bound:
+Cloudflare documents that a key-value write may take up to 60 seconds or
+more to be visible at other locations, and states no fixed time for a
+deploy to reach every location, so the wait is that documented minute
+with room for requests still running on the version before.
+
+### Reading the claims ledger
+
+Each paid request's claim is a `payment_claims` row (`nonce` is the
+payment's derivation prefix, `txid` its transaction, `released` 0 while
+the claim is held). Each claim the wallet accepted has a `payment_grants`
+row under the same prefix. The claims held for more than ten minutes with
+no grant row:
+
+```bash
+wrangler d1 execute CLAIMS --remote --command "SELECT c.nonce, c.txid, c.created_at FROM payment_claims c LEFT JOIN payment_grants g ON g.prefix = c.nonce WHERE g.prefix IS NULL AND c.released = 0 AND c.created_at < unixepoch() - 600"
+```
+
+A grant row's `state`:
+
+| state | meaning |
+|---|---|
+| `paid` | the wallet accepted the payment; the route's answer is not recorded yet. A row still `paid` after ten minutes (`answered_at` null) is a claim whose second grant write failed: it was served at most once |
+| `granted` | the route answered 2xx: the upload or renewal was served |
+| `refused` | the route answered otherwise (its `status`): the payment was accepted and the route did not serve it |
+
+A held claim with no grant row is one of: a prefix served before 0.3.1,
+held from its key-value record (its `txid` is the record's, or none for
+a prefix consumed before records named a transaction); a payment the
+wallet rejected (the payer is answered 402 and the claim is kept); a won
+claim whose first grant write failed; or a claim held with nothing served.
+The Worker has no route that releases a claim. The store's release is two
+writes, the key-value record and then D1; an operator who has checked
+that nothing was served for the claim (the wallet storage server holds no
+accepted action for its `txid`, and the logs show no 2xx for its prefix)
+makes the same two writes:
+
+```bash
+# 1. The record, when it is still the txid itself (skip it when it reads released:<txid>).
+wrangler kv key get --binding AUTH_SESSIONS --remote "auth:nonce:payment-derivation-prefix:<prefix>"
+wrangler kv key put --binding AUTH_SESSIONS --remote "auth:nonce:payment-derivation-prefix:<prefix>" "released:<txid>"
+# 2. D1: the middleware's release statement.
+wrangler d1 execute CLAIMS --remote --command "UPDATE payment_claims SET released = 1 WHERE nonce = '<prefix>' AND txid = '<txid>'"
+```
+
+The released transaction is then served once on its retry, and no other
+transaction can take the prefix.
 
 ---
 
@@ -93,7 +200,7 @@ Edit `wrangler.toml`:
 | Line (approx) | Var | Value |
 |---|---|---|
 | 20 | `PUBLIC_URL_BASE` | Your R2 custom-domain origin — e.g. `"https://storage.example.com"`. Until you cut DNS in Step 9, you can leave this as the R2-default `https://pub-<hash>.r2.dev/uhrp-prod` which R2 gives you when you enable the public bucket — **but only for non-prod testing**. Production must be a custom domain you control. |
-| 23 | `R2_S3_ENDPOINT_HOST` | `"<account_id>.r2.cloudflarestorage.com"` — e.g. `"ea3e6d176ed3893258fe34281f710c7f.r2.cloudflarestorage.com"`. The account ID is also in `secrets.md`. |
+| 23 | `R2_S3_ENDPOINT_HOST` | `"<account_id>.r2.cloudflarestorage.com"`, your Cloudflare account ID. The account ID is also in `secrets.md`. |
 | 37 | `kv_namespaces[].id` | From Step 1's output. |
 
 ---
@@ -116,6 +223,12 @@ Why `object-create` specifically: our queue consumer (`src/queue/mod.rs`) only a
 ---
 
 ## Step 6 — First deploy
+
+**Before it**: the `CLAIMS` database exists, is bound in the config being
+deployed, and has `migrations/` applied (Step 1, "The payment claims
+ledger"). Without it the paid routes answer 503 and serve nothing. Moving
+an instance from a release before 0.3.1 is the two deploys of "The cutover
+from a release before 0.3.1" (Step 1).
 
 **Success**: `npm run deploy` prints `Uploaded bsv-storage-cloudflare` and a URL of the form `https://bsv-storage-cloudflare.<account>.workers.dev`. Save that URL.
 

@@ -46,10 +46,10 @@ mod tests {
         let crates = build["crates"].as_object().expect("locked crate versions");
         assert_eq!(crates.len(), 4);
         for (name, version) in [
-            ("bsv-storage-cloudflare", "0.3.0"),
-            ("bsv-rs", "0.8.11"),
-            ("bsv-middleware-cloudflare", "0.7.4"),
-            ("bsv-middleware-core", "0.4.3"),
+            ("bsv-storage-cloudflare", "0.3.1"),
+            ("bsv-rs", "0.8.13"),
+            ("bsv-middleware-cloudflare", "0.7.5"),
+            ("bsv-middleware-core", "0.4.4"),
         ] {
             assert_eq!(crates[name], version, "{name}");
             let locked = super::build_versions::lock_version(include_str!("../Cargo.lock"), name)
