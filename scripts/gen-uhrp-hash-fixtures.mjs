@@ -7,7 +7,7 @@
 // the build.
 //
 // Run:
-//     cd /Users/johncalhoun/bsv/bsv-storage-cloudflare
+//     cd <this repository>
 //     node scripts/gen-uhrp-hash-fixtures.mjs
 //
 // Requires @bsv/sdk. We resolve it from a sibling project that already has it

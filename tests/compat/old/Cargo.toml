@@ -1,5 +1,6 @@
-# bsv-storage-cloudflare v0.2.4's modules (../v0_2_4/src, verbatim) on its
-# dependencies, for the comparison in ../old_against_new.rs.
+# bsv-storage-cloudflare v0.2.4's modules (../v0_2_4/src, as released but
+# for one unit-test fixture value; see ../Cargo.toml) on its dependencies,
+# for the comparison in ../old_against_new.rs.
 [package]
 name = "old"
 version = "0.2.4"

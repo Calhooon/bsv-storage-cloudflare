@@ -119,7 +119,8 @@ Each paid request's claim is a `payment_claims` row (`nonce` is the
 payment's derivation prefix, `txid` its transaction, `released` 0 while
 the claim is held). Each claim the wallet accepted has a `payment_grants`
 row under the same prefix. The claims held for more than ten minutes with
-no grant row:
+no grant row (the ten minutes count from the claim's first write,
+`created_at`):
 
 ```bash
 wrangler d1 execute CLAIMS --remote --command "SELECT c.nonce, c.txid, c.created_at FROM payment_claims c LEFT JOIN payment_grants g ON g.prefix = c.nonce WHERE g.prefix IS NULL AND c.released = 0 AND c.created_at < unixepoch() - 600"
@@ -138,8 +139,11 @@ held from its key-value record (its `txid` is the record's, or none for
 a prefix consumed before records named a transaction); a payment the
 wallet rejected (the payer is answered 402 and the claim is kept); a won
 claim whose first grant write failed; or a claim held with nothing served.
-The Worker has no route that releases a claim. The store's release is two
-writes, the key-value record and then D1; an operator who has checked
+The Worker has no route that releases a claim. An operator repairs only a
+claim that two runs of the query above, at least ten minutes apart, both
+list; a claim one run lists and the other does not is left as it is. The
+store's release is two writes, the key-value record and then D1; an
+operator who has checked
 that nothing was served for the claim (the wallet storage server holds no
 accepted action for its `txid`, and the logs show no 2xx for its prefix)
 makes the same two writes:

@@ -13,7 +13,7 @@
 // runs — an essential property for a golden fixture.
 //
 // Run:
-//     cd /Users/johncalhoun/bsv/bsv-storage-cloudflare
+//     cd <this repository>
 //     node scripts/gen-pushdrop-fixtures.mjs
 
 import { writeFileSync, mkdirSync } from 'node:fs'

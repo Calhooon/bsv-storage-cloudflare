@@ -1313,5 +1313,5 @@ Response:
 ---
 
 **Document generated**: 2025-04-20  
-**Source codebase**: `/Users/johncalhoun/bsv/storage-server/` (TS v0.2.1)  
+**Source codebase**: `~/bsv/storage-server/` (TS v0.2.1)  
 **Target port**: Cloudflare Workers (Rust)

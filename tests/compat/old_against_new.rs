@@ -1,4 +1,5 @@
-//! The storage at v0.2.4 (`old`: its modules verbatim, on bsv-rs 0.4.5 and
+//! The storage at v0.2.4 (`old`: its modules as released but for one
+//! unit-test fixture value that no comparison reads, on bsv-rs 0.4.5 and
 //! bsv-middleware-cloudflare 0.5.1) against the storage now (`new`: the
 //! tree's modules on the Worker's crates), on the same inputs: what a client,
 //! a payer, the overlay and the platform see must not change.
