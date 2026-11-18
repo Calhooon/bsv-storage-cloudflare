@@ -88,4 +88,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
-    - run: tools/scrub.sh
+      with:
+        fetch-depth: 0
+    - name: Scrub the tree and every commit's added lines since the base (since the previous release tag on a tag)
+      env:
+        BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        REF_TYPE: ${{ github.ref_type }}
+      run: |
+        base="${BASE_SHA:-}"
+        if [ "${REF_TYPE:-}" = tag ]; then
+          base=--tag
+        elif [ -z "$base" ] || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+          base=--all
+        fi
+        tools/scrub.sh "$base"
