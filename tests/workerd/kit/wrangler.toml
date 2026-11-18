@@ -1,0 +1,8 @@
+# Read by nothing at run time (../run.mjs configures Miniflare itself); the
+# build line for `worker-build`.
+name = "claims-kit-worker"
+main = "build/worker/shim.mjs"
+compatibility_date = "2024-01-01"
+
+[build]
+command = "worker-build --release"

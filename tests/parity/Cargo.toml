@@ -26,6 +26,13 @@ path = "src/bin/keygen.rs"
 name = "uhrp_url"
 path = "src/bin/uhrp_url.rs"
 
+# Simultaneous paid requests against local builds of the Worker, for
+# tests/workerd/run.mjs (Miniflare). Usage:
+#   race <storage-url> <old-storage-url> <stand-in-url>
+[[bin]]
+name = "race"
+path = "src/bin/race.rs"
+
 # Native-only dependencies. This crate is NEVER compiled to wasm — the
 # root crate's `cargo check --target wasm32-unknown-unknown` does not pull
 # workspace members in unless `--workspace` is added.
@@ -42,7 +49,7 @@ hex = "0.4"
 # - test identity keypair (PrivateKey::random + PublicKey hex export, default features)
 # - BRC-31 mutual auth client (auth + http features — SimplifiedFetchTransport
 #   does the wire-level work against nanostore.babbage.systems and our worker)
-bsv-rs = { version = "0.8.11", features = ["auth", "http", "overlay"] }
+bsv-rs = { version = "0.8.13", features = ["auth", "http", "overlay"] }
 
 # Request correlation IDs for the BRC-31 client (`src/auth.rs`) — 32 random
 # bytes per in-flight General message so the transport callback can route

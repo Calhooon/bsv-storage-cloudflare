@@ -1,5 +1,114 @@
 # Changelog
 
+## 0.3.1 (2026-11-17)
+
+- The paid routes (`/upload`, `/renew`) claim each payment's derivation
+  prefix in the `CLAIMS` D1 database, in one statement: the middleware's
+  own (`payment_prefix_gate`, the upsert of `D1PrefixStore` and its
+  classifying read in one D1 batch), before the wallet is called. Its
+  answers are the middleware's: a won claim is served; the same
+  transaction again is the signed `409 ERR_PAYMENT_REPLAYED`; another
+  transaction under a bound prefix is the signed `400 ERR_PAYMENT_INVALID`;
+  a store fault is `503 ERR_PAYMENT_UNAVAILABLE` (retryable, `Retry-After`,
+  the quote kept), and nothing is served on a fault. The 503 is signed for
+  an authenticated payer when the gate could not make the claim (no
+  `CLAIMS` binding, no tables, a D1 fault in the claim); a fault the store
+  meets outside the gate (the `AUTH_SESSIONS` record's read or write, the
+  read of D1 in front of the claim, the record's carry into D1) is the
+  door's own 503, unsigned. The door is the
+  middleware's `process_payment_with_storage` (0.7.5), which writes the
+  `internalizeAction` request once (`internalize_action_with_tx`). A
+  wallet error releases the claim to the same transaction, which is served
+  on its retry; no other transaction can take the prefix
+  (`src/claims.rs`).
+- The `AUTH_SESSIONS` record of a prefix (key
+  `auth:nonce:payment-derivation-prefix:<prefix>`, no expiry) is read
+  before each claim and carried into D1 with the middleware's statements
+  as what it says: a prefix it names bound stays refused; a prefix released
+  there to its transaction is carried released, so another transaction is
+  refused and the released transaction is served once. A carry releases
+  only the claim the carry itself made in D1. After each won claim the
+  record is written as the key-value store's own claim writes it (the
+  txid, no expiry), with `{"ledger":"d1"}` in its metadata, whatever the
+  claim's read of the record found; the D1
+  claim alone decides who wins. A bound record without that metadata is
+  held in D1 for its transaction. If the record cannot be written after a
+  win, the claim is released, the wallet is not called, and the request is
+  answered 503: the same payment is served on its retry.
+- A release (a wallet error) writes the record as the key-value store's own
+  release writes it (`released:<txid>`, same key, no expiry), then releases
+  the attempt in D1: the released transaction is served once on its retry,
+  and no other transaction is.
+- What each won claim was granted is recorded in `CLAIMS`
+  (`payment_grants`): the route, the prefix and txid, the payer's identity
+  key, the satoshis paid, the object identifier (and the `uhrp://` URL on
+  a renewal), the size, the minutes as the route computed them (a fraction
+  kept), the expiry the advert carries (on `/upload`, the presigned PUT's
+  expiry with the object's custom-time buffer), the route's status and the
+  times. The row is written `paid` when the wallet accepts and
+  `granted` (or `refused`) when the route answers; a row left `paid`, with
+  `answered_at` null, is a won claim whose grant write failed. The record
+  never changes the answer, and carries nothing of the payment's bytes.
+- `migrations/0001_payment_claims.sql` creates both tables
+  (`PAYMENT_CLAIMS_SCHEMA` as the middleware states it, and
+  `payment_grants`). `wrangler.toml` and `wrangler.composer.toml` bind
+  `CLAIMS` (placeholder ids).
+- **Deploy order.** Before this release is deployed, each instance's
+  `CLAIMS` D1 database is created, bound in the config being deployed,
+  and migrated (`wrangler d1 migrations apply CLAIMS --remote`); then the
+  Worker is deployed (`DEPLOYMENT.md`, Step 1 and Step 6). Without the
+  binding, or with the binding and no tables, every payment to `/upload`
+  or `/renew` is answered `503 ERR_PAYMENT_UNAVAILABLE` (`Retry-After`):
+  the wallet is not called and nothing is served. The gate's 503 (no
+  binding; no tables, for a prefix with no `AUTH_SESSIONS` record or for
+  the transaction a `released:<txid>` record names) is signed for an
+  authenticated payer; with no tables, any other payment whose prefix has
+  a record is the door's 503, unsigned. The 402 challenge is still issued,
+  and the routes that take no payment are unaffected. The cutover from a
+  release before 0.3.1 is two deploys (`DEPLOYMENT.md`, "The cutover").
+- A payment header longer than 96 KiB is refused before it is parsed or
+  decoded, with the middleware's answer to a payment transaction it cannot
+  read: `400 ERR_INVALID_PAYMENT`, "Payment not verified: payment
+  transaction unreadable: the payment transaction is too large to read".
+  Nothing is claimed, so the quote stands.
+- The fan-out posts an advert only to hosts named by tracker outputs that
+  are SHIP advertisements for the topic, signed by the identity key they
+  name under BRC-88's derivation and locked by that identity's linked key,
+  for a public `https` origin: a DNS name (no IP literal, no `localhost`,
+  `.localhost`, `.local`, `.internal` or `.home.arpa` name, no `xn--`
+  label), the default port, and no credentials, path, query or fragment.
+  Each host once, the primary left out, at most 32.
+- bsv-rs `0.8.13` (the patched version of GHSA-j4w5-4g84-q3f4; `0.8.12`
+  is the patched version of GHSA-33fm-jcm5-4m3m), in every lock the
+  repository tracks; bsv-middleware-cloudflare `=0.7.5` (feature
+  `d1-claims`), bsv-middleware-core 0.4.4. `/health`'s `build.crates`
+  names them. The Worker does not enable bsv-rs's `kvstore` feature, so
+  the `GlobalKVStore` code 0.8.13 changes is not in its build.
+- Tests: the middleware's conformance kit runs against the store as the
+  routes wire it, on SQLite with the middleware's statements
+  (`tests/claims_store.rs`) and on workerd's D1 and KV in Miniflare
+  (`tests/workerd`), at the kit's defaults and at raised bounds (sizes 2 to
+  64, a hold of 128 passes); with the release path's mixes the kit runs no
+  law for. `tests/workerd` also runs the Worker: one payment in 2, 4 and 16
+  simultaneous requests to `/upload` is served once; two transactions under
+  one prefix at once are served once. `/renew` is driven the same way: a
+  paid renewal is served once and its grant row recorded; the same payment
+  again is the signed 409 with no second renewal; another transaction
+  under the prefix is the signed 400; one payment in 2, 4 and 16
+  simultaneous requests is one renewal. A wallet error's release is served
+  once on its retry, against the previous release's Worker in both orders
+  on one key-value namespace; a prefix the previous release released,
+  paid at once by its transaction and by others, is served to that
+  transaction at most once and to no other (on SQLite over the kit's
+  schedules, on workerd's store, and through both Workers). The Worker
+  without its `CLAIMS` binding, and
+  with the binding and no tables, answers the 503 on both paid routes and
+  serves nothing. The race client reads each answer's signature: the 200,
+  the 402 challenge, the 409, the 400 `ERR_PAYMENT_INVALID` and the gate's
+  503 are signed; the door's own 400s, its 402 after a wallet rejection and
+  its 503 are not. `tests/heap` holds the paid path to
+  the middleware's stated bound (1.25 MiB plus 4 bytes per header byte).
+
 ## 0.3.0 (2026-11-17)
 
 - bsv-rs `0.8.11` (a caret requirement) and bsv-middleware-cloudflare

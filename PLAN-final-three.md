@@ -158,7 +158,7 @@ The consumer code is already written and committed. All that remains is the CF-s
 ```bash
 # From ~/bsv/bsv-storage-cloudflare/, CF token in env:
 export CLOUDFLARE_API_TOKEN=<from secrets.md>
-export CLOUDFLARE_ACCOUNT_ID=ea3e6d176ed3893258fe34281f710c7f
+export CLOUDFLARE_ACCOUNT_ID=<your-account-id>
 
 # Create the event-notification rule
 npx wrangler r2 bucket notification create uhrp-prod \

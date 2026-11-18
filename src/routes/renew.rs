@@ -168,6 +168,21 @@ impl PreparedRenew {
     /// 4 of the old advert's PushDrop — never from the client. `None` =
     /// price 0 (free pass; the handler then produces the right error).
     #[must_use]
+    /// What a renewal of this advert grants, but its new expiry (the
+    /// handler's answer carries it).
+    pub fn granted(&self) -> Option<crate::claims::Granted> {
+        match self {
+            Self::Ready(ctx) => Some(crate::claims::Granted {
+                object_identifier: Some(ctx.object_identifier.clone()),
+                uhrp_url: Some(ctx.uhrp_url.clone()),
+                file_size: Some(ctx.content_length),
+                minutes: Some(ctx.additional_minutes as f64),
+                expiry_time: None,
+            }),
+            _ => None,
+        }
+    }
+
     pub fn price_inputs(&self) -> Option<(f64, f64)> {
         match self {
             Self::Ready(ctx) => Some((ctx.content_length as f64, ctx.additional_minutes as f64)),

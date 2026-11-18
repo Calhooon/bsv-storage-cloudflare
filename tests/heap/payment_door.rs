@@ -1,14 +1,22 @@
-//! The paid routes' door on the payment header, measured: what the payment
-//! middleware allocates reading an `X-BSV-Payment` header follows the
-//! header's size, with no check of the storage's own in front of it.
+//! The paid routes' door on the payment header, measured: what the paid
+//! path allocates for an `X-BSV-Payment` header follows the header's size,
+//! within the bound the payment middleware's own heap test states for its
+//! door (1.25 MiB plus 4 bytes per header byte, from the header's arrival to
+//! the wallet call's send), and a header over the storage's ceiling
+//! (`PAYMENT_HEADER_MAX`, 96 KiB) is refused before anything is read.
 //!
-//! The middleware (bsv-middleware-cloudflare 0.7.4, core 0.4.3) parses the
-//! header's JSON, decodes its base64 `transaction`, reads the BEEF's subject
-//! alone (`verify_payment_output`: output 0's script and amount; nothing
-//! linked, no script run) and takes the subject's txid
-//! (`payment_subject_txid`) before it claims the derivation prefix. Native
-//! measurements with a counting allocator around those calls; every test
-//! takes the allocator's lock, so one measurement runs at a time.
+//! The paid routes run the middleware's door (bsv-middleware-cloudflare
+//! 0.7.5, core 0.4.4: `process_payment_with_storage`). It parses the
+//! header's JSON, verifies the derivation prefix's HMAC, decodes the base64
+//! `transaction`, reads the BEEF's subject alone (`verify_payment_output`:
+//! output 0's script and amount; nothing linked, no script run), takes the
+//! subject's txid (`payment_subject_txid`), claims the prefix, and writes the
+//! wallet call once (`WorkerStorageClient::internalize_action_with_tx`). The
+//! door takes a Workers request and the call is sent through the Workers
+//! runtime, so natively these tests run the door's steps through the
+//! middleware's public parts in its order, up to the claim; the wallet
+//! call's write is held to the same bound by the middleware's own test.
+//! Every test takes the allocator's lock, so one measurement runs at a time.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -17,14 +25,18 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use bsv_middleware_cloudflare::core::{
-    expected_locking_script, payment_subject_txid, verify_payment_output, BsvPayment,
-    PaymentVerdict, UnverifiableReason,
+    expected_locking_script, payment_subject_txid, verify_payment_output, BsvPayment, MemoryStore,
+    PaymentPrefixStore, PaymentVerdict, PrefixClaim, UnverifiableReason,
 };
+use bsv_rs::auth::utils::verify_nonce;
 use bsv_rs::primitives::hash::sha256d;
+use bsv_rs::primitives::PrivateKey;
 use bsv_rs::primitives::{from_base64, to_base64, to_hex};
 use bsv_rs::transaction::{
     Beef, MerklePath, MerklePathLeaf, Transaction, ATOMIC_BEEF, BEEF_V1, BEEF_V2,
 };
+use bsv_rs::wallet::ProtoWallet;
+use bsv_storage_cloudflare::{over_the_ceiling, PAYMENT_HEADER_MAX};
 
 // ── the counting allocator ──────────────────────────────────────────────
 
@@ -285,7 +297,8 @@ fn funded(seed: u64, outputs: usize, script: &[u8]) -> RawTx {
 
 const SERVER_KEY: &str = "0000000000000000000000000000000000000000000000000000000000000001";
 const PAYER: &str = "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5";
-const PREFIX: &str = "b0YxH8Zl3mJ8kQ2C0fV9yq3w5lWm3T6dYcR8nQwq2pY=";
+/// A derivation prefix the server ([`SERVER_KEY`]) issued: its HMAC verifies.
+const PREFIX: &str = "47CdLOOVbIDIvJT/IN4SfZIM/+kZVxxZsds2vDPOZWea2I7yhth9AL1xKUwhNeqa";
 const SUFFIX: &str = "c3VmZml4LXN1ZmZpeA==";
 const PRICE: u64 = 1000;
 
@@ -683,12 +696,14 @@ fn costly_shapes() -> Vec<(String, Vec<u8>)> {
 /// headers pass 128 KiB in all.
 const HEADER_MAX: usize = 128 * 1024;
 
-/// The door's peak heap allowed per header byte, over a fixed floor: the
-/// BRC-29 key derivation costs about half a MiB on every header, whatever
-/// its size; the rest follows the header (JSON, base64, the BEEF's parse,
-/// the subject's copy).
-const DOOR_PER_HEADER_BYTE: usize = 8;
-const DOOR_FLOOR: usize = 1024 * 1024;
+/// The paid path's peak heap allowed for a header: the bound the payment
+/// middleware's own heap test holds its door to, from the header's arrival
+/// to the wallet call's send (bsv-middleware-cloudflare 0.7.5:
+/// `middleware/payment_heap_tests.rs`): 1.25 MiB plus 4 bytes per header
+/// byte. The floor is mostly the BRC-29 key derivation, paid on every
+/// header whatever its size.
+const DOOR_PER_HEADER_BYTE: usize = 4;
+const DOOR_FLOOR: usize = 1024 * 1024 + 256 * 1024;
 
 /// What a BEEF's subject read may allocate: the parse, per wire byte.
 const PARSE_PER_BYTE: usize = 24;
@@ -855,6 +870,191 @@ fn a_header_that_does_not_decode_is_answered_in_kind() {
             })
         ));
     }
+}
+
+// ── the paid route, from the header to the claim ────────────────────────
+
+fn block_on<F: std::future::Future>(f: F) -> F::Output {
+    let mut f = std::pin::pin!(f);
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    match f.as_mut().poll(&mut cx) {
+        std::task::Poll::Ready(out) => out,
+        std::task::Poll::Pending => panic!("the door awaited something that is not ready"),
+    }
+}
+
+/// What the paid route answers before the wallet call.
+#[derive(Debug, PartialEq, Eq)]
+enum Paid {
+    /// Over the storage's ceiling: refused, nothing read.
+    TooLarge,
+    /// The prefix's HMAC does not verify.
+    InvalidPrefix,
+    /// What the door reads of the header (see [`door`]).
+    Door(Door),
+    /// The claim, won or refused; a won claim goes on to the wallet call.
+    Claimed(PrefixClaim),
+}
+
+/// The paid route on a header, in the middleware's door's order: the
+/// storage's ceiling, the JSON, the prefix's HMAC, the base64, the output
+/// check, the subject's txid, and the claim (on an in-memory store).
+fn paid_request(header: String) -> Paid {
+    if over_the_ceiling(&header) {
+        return Paid::TooLarge;
+    }
+    let Ok(payment) = serde_json::from_str::<BsvPayment>(&header) else {
+        return Paid::Door(Door::Malformed);
+    };
+    drop(header);
+    let wallet = ProtoWallet::new(Some(PrivateKey::from_hex(SERVER_KEY).unwrap()));
+    let valid = block_on(verify_nonce(
+        &payment.derivation_prefix,
+        &wallet,
+        None,
+        "bsv-auth-cloudflare",
+    ))
+    .unwrap_or_default();
+    if !valid {
+        return Paid::InvalidPrefix;
+    }
+    let Ok(bytes) = from_base64(&payment.transaction) else {
+        return Paid::Door(Door::BadBase64);
+    };
+    let verdict = verify_payment_output(
+        SERVER_KEY,
+        PAYER,
+        &payment.derivation_prefix,
+        &payment.derivation_suffix,
+        &bytes,
+        0,
+        PRICE,
+    )
+    .unwrap();
+    if !matches!(verdict, PaymentVerdict::Verified { .. }) {
+        return Paid::Door(Door::Verdict(verdict));
+    }
+    let txid = payment_subject_txid(&bytes).unwrap();
+    let store = MemoryStore::new();
+    Paid::Claimed(
+        block_on(store.claim_prefix(&payment.derivation_prefix, &txid, "bsv-auth-cloudflare"))
+            .unwrap(),
+    )
+}
+
+/// A payment of one input whose unlocking script is `len` bytes,
+/// output 0 paying the server: the most transaction per header byte.
+fn padded_payment(len: usize) -> Vec<u8> {
+    let tx = RawTx::new()
+        .input(&fake_txid(70_000), 0, vec![0x51; len])
+        .output(PRICE, paying_script());
+    let mut b = BeefBuild::default();
+    let id = b.tx(&tx);
+    b.atomic(&id).bytes()
+}
+
+/// Each paying family grown until its header passes the door's ceiling;
+/// the last one at or under it.
+fn largest_paying_headers() -> Vec<(String, String)> {
+    type Family = (&'static str, usize, Box<dyn Fn(usize) -> Vec<u8>>);
+    let families: Vec<Family> = vec![
+        ("one padded input", 1000, Box::new(padded_payment)),
+        ("sweep, unproven parent", 50, Box::new(|n| sweep(n, false))),
+        ("sweep, proven parent", 50, Box::new(|n| sweep(n, true))),
+        (
+            "one block, compound BUMP",
+            20,
+            Box::new(payment_from_one_block),
+        ),
+        (
+            "distinct proven parents",
+            10,
+            Box::new(|n| payment_from_distinct_parents(n, true)),
+        ),
+        ("unconfirmed chain", 100, Box::new(unconfirmed_chain)),
+    ];
+    let mut out = Vec::new();
+    for (name, start, build) in families {
+        let mut k = start;
+        let mut best = None;
+        loop {
+            let header = header_for(&build(k));
+            if header.len() > PAYMENT_HEADER_MAX {
+                break;
+            }
+            best = Some((format!("{name} at {k}"), header));
+            k += (k / 16).max(1);
+        }
+        out.push(best.unwrap_or_else(|| panic!("{name}: the first size passes the ceiling")));
+    }
+    out
+}
+
+#[test]
+fn the_paid_route_holds_the_middleware_s_bound_to_the_claim() {
+    let _g = measure_lock();
+    let mut headers: Vec<(String, String)> = all_generated()
+        .into_iter()
+        .map(|(name, beef)| (name, header_for(&beef)))
+        .collect();
+    headers.extend(largest_headers());
+    let paying = largest_paying_headers();
+    headers.extend(paying.iter().cloned());
+    let (mut largest, mut largest_len, mut slope, mut claimed) = (0usize, 0usize, 0f64, 0usize);
+    for (name, header) in &headers {
+        let len = header.len();
+        let owned = header.clone();
+        let mut answer = None;
+        let peak = peak_of(|| answer = Some(paid_request(owned)));
+        let answer = answer.unwrap();
+        assert!(
+            peak <= door_bound(header),
+            "{name}: the paid route peaked at {peak} B for a {len} B header ({answer:?})"
+        );
+        if answer == Paid::Claimed(PrefixClaim::Won) {
+            claimed += 1;
+        }
+        if answer != Paid::TooLarge && len > largest_len {
+            largest_len = len;
+            largest = peak;
+        }
+        slope = slope.max(peak.saturating_sub(DOOR_FLOOR) as f64 / len as f64);
+    }
+    // Every paying shape at the ceiling reaches the claim, and wins it.
+    for (name, header) in &paying {
+        assert_eq!(
+            paid_request(header.clone()),
+            Paid::Claimed(PrefixClaim::Won),
+            "{name}"
+        );
+    }
+    assert!(claimed >= 15, "only {claimed} payments reached the claim");
+    eprintln!(
+        "paid route to the claim: {} headers, {claimed} claims won, the largest header read {largest_len} B peaked at {largest} B, at most {slope:.2} B per header byte over the floor of {DOOR_FLOOR} B",
+        headers.len()
+    );
+}
+
+#[test]
+fn a_header_over_the_ceiling_is_refused_before_it_is_decoded() {
+    let _g = measure_lock();
+    let mut refused = 0;
+    for (name, header) in largest_headers() {
+        if header.len() <= PAYMENT_HEADER_MAX {
+            continue;
+        }
+        refused += 1;
+        let owned = header.clone();
+        let mut answer = None;
+        // The header is the caller's; nothing else is allocated.
+        let peak = peak_of(|| answer = Some(paid_request(owned)));
+        assert_eq!(answer.unwrap(), Paid::TooLarge, "{name}");
+        assert!(peak <= 4096, "{name}: {peak} B");
+    }
+    assert!(refused >= 5, "only {refused} headers over the ceiling");
+    // At the ceiling the header is read.
+    assert!(!over_the_ceiling(&"x".repeat(PAYMENT_HEADER_MAX)));
+    assert!(over_the_ceiling(&"x".repeat(PAYMENT_HEADER_MAX + 1)));
 }
 
 // ── the fan-out ─────────────────────────────────────────────────────────

@@ -246,10 +246,13 @@ const DEFAULT_SLAP_TRACKERS: &[&str] = &[
 /// Pipeline:
 /// 1. For each SLAP tracker, POST `/lookup` with `{service:"ls_ship",
 ///    query:{topics:[tm_X]}}` to discover peers that run that topic manager.
-/// 2. Decode each returned BEEF's PushDrop output — SHIP field[2] is the
-///    peer's HTTPS URL.
-/// 3. Deduplicate peer URLs, filter out our primary (we already submitted
-///    there), POST the same BEEF to each peer's `/submit`.
+/// 2. Take a host from each returned output that is a SHIP advertisement
+///    for the topic signed by the identity it names, for a public `https`
+///    origin ([`ship_host`]); every other output is skipped and counted in
+///    one log line per tracker.
+/// 3. Deduplicate the hosts, leave out our primary (we already submitted
+///    there), keep the first [`FAN_OUT_MAX_HOSTS`], and POST the same BEEF
+///    to each one's `/submit`.
 ///
 /// All errors are logged and swallowed — the primary submission already
 /// succeeded, and partial propagation is better than none.
@@ -259,13 +262,24 @@ async fn fan_out_to_mainnet_peers(primary_host: &str, tagged: &TaggedBEEF) {
         None => return,
     };
 
-    let mut peers = std::collections::HashSet::<String>::new();
+    let mut found: Vec<String> = Vec::new();
     for tracker in DEFAULT_SLAP_TRACKERS {
         match discover_peers_from_tracker(tracker, topic).await {
-            Ok(hosts) => {
-                for h in hosts {
-                    peers.insert(h);
+            Ok(answer) => {
+                if !answer.skipped.is_empty() {
+                    worker::console_warn!(
+                        "overlay fan-out: SLAP tracker {} ls_ship({}): {} advertisement(s) skipped ({} unverified, {} other topic, {} host refused, {} not SHIP, {} unreadable)",
+                        tracker,
+                        topic,
+                        answer.skipped.len(),
+                        answer.count(Skip::Unverified),
+                        answer.count(Skip::OtherTopic),
+                        answer.count(Skip::Host),
+                        answer.count(Skip::NotShip),
+                        answer.count(Skip::Unreadable)
+                    );
                 }
+                found.extend(answer.hosts);
             }
             Err(e) => {
                 worker::console_warn!(
@@ -278,12 +292,15 @@ async fn fan_out_to_mainnet_peers(primary_host: &str, tagged: &TaggedBEEF) {
         }
     }
 
-    // Drop our own host from the fan-out — already submitted there as the
-    // primary admission step. Trim trailing slashes on both sides so
-    // `https://foo.dev/` matches `https://foo.dev`.
-    let primary_norm = primary_host.trim_end_matches('/');
-    peers.remove(primary_norm);
-    peers.remove(&format!("{primary_norm}/"));
+    // Our own host is the primary admission step, already submitted.
+    let (peers, over_cap) = fan_out_peers(&found, primary_host);
+    if over_cap > 0 {
+        worker::console_warn!(
+            "overlay fan-out: {} host(s) past the first {} left out",
+            over_cap,
+            FAN_OUT_MAX_HOSTS
+        );
+    }
 
     worker::console_log!(
         "overlay fan-out: submitting {} to {} mainnet peer(s)",
@@ -302,15 +319,10 @@ async fn fan_out_to_mainnet_peers(primary_host: &str, tagged: &TaggedBEEF) {
 /// Query a SLAP tracker for hosts that run `topic`, return their URLs.
 ///
 /// Mirrors the TS SDK's `LookupResolver.query({service:'ls_ship',
-/// query:{topics:[topic]}})` → decode each output's PushDrop → extract
-/// `fields[2]` (SHIP host URL). SHIP PushDrop layout per
-/// `@bsv/overlay/src/SHIPAdvertisement.ts`:
-/// - field[0] = "SHIP" literal (4 bytes)
-/// - field[1] = host identity key (33 bytes compressed pubkey)
-/// - field[2] = host HTTPS URL (UTF-8)
-/// - field[3] = topic name (UTF-8)
-/// - field[4] = signature
-async fn discover_peers_from_tracker(tracker: &str, topic: &str) -> Result<Vec<String>, String> {
+/// query:{topics:[topic]}})`, then reads each output as `SHIPBroadcaster`
+/// does: a verified SHIP advertisement for the topic names a host
+/// ([`ship_hosts_from_lookup_answer`]).
+async fn discover_peers_from_tracker(tracker: &str, topic: &str) -> Result<ShipHosts, String> {
     let url = format!("{}/lookup", tracker.trim_end_matches('/'));
     let body = serde_json::json!({
         "service": "ls_ship",
@@ -339,7 +351,7 @@ async fn discover_peers_from_tracker(tracker: &str, topic: &str) -> Result<Vec<S
         return Err(format!("HTTP {}", status));
     }
     let body = read_body_bounded(&mut response, LOOKUP_ANSWER_MAX_BYTES).await?;
-    hosts_from_lookup_answer(&body)
+    ship_hosts_from_lookup_answer(&body, topic)
 }
 
 /// The most a tracker's lookup answer may carry. Real `ls_ship` answers
@@ -415,12 +427,143 @@ pub(crate) fn subject_output(
     std::mem::take(&mut tx.outputs).into_iter().nth(vout)
 }
 
-/// The SHIP host URLs a lookup answer names. Each output's subject is read
-/// without linking its ancestry ([`subject_output`]): the fan-out needs the
-/// one output, nothing linked.
-pub(crate) fn hosts_from_lookup_answer(body: &[u8]) -> Result<Vec<String>, String> {
-    use bsv_rs::script::templates::PushDrop;
+/// Why a lookup answer's output names no host for the fan-out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Skip {
+    /// The BEEF does not read, or it has no such output.
+    Unreadable,
+    /// The output is not a SHIP advertisement (not a PushDrop of the
+    /// advertisement's fields, another protocol, or an identity key that is
+    /// not a compressed key).
+    NotShip,
+    /// A SHIP advertisement without the one signature after its four data
+    /// fields, or whose signature is not by the key its identity links for
+    /// SHIP, or whose output that key does not lock.
+    Unverified,
+    /// A SHIP advertisement for another topic.
+    OtherTopic,
+    /// The advertised host is not a public `https` origin.
+    Host,
+}
 
+/// The SHIP hosts a lookup answer names for `topic`, and what was skipped.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct ShipHosts {
+    /// Each host's origin (`https://name`), in the answer's order, once.
+    pub hosts: Vec<String>,
+    /// The outputs that named no host, and why.
+    pub skipped: Vec<Skip>,
+}
+
+impl ShipHosts {
+    /// How many outputs were skipped for `why`.
+    pub fn count(&self, why: Skip) -> usize {
+        self.skipped.iter().filter(|s| **s == why).count()
+    }
+}
+
+/// BRC-43 protocol name SHIP advertisements are signed and locked under.
+const SHIP_PROTOCOL_NAME: &str = "service host interconnect";
+
+/// The host a SHIP advertisement for `topic` names, if the advertisement is
+/// the one the reference defines (BRC-88, as `@bsv/sdk`'s
+/// `decodeAndVerifyOverlayAdvertisement` and `@bsv/overlay-discovery-services`'
+/// `isTokenSignatureCorrectlyLinked` read it):
+///
+/// - a PushDrop of five fields: `"SHIP"`, the advertiser's identity key
+///   (compressed), the host, the topic, and a DER signature;
+/// - the signature is over the SHA-256 of the four data fields concatenated,
+///   by the key BRC-42 derives from the identity key for `anyone`, under the
+///   protocol `[2, "service host interconnect"]` and key ID `"1"`;
+/// - that same derived key locks the output;
+/// - the topic is `topic`;
+/// - the host is a public `https` origin ([`advertised_origin`]).
+///
+/// The derivation, the hash and the signature check are bsv-rs's
+/// (`KeyDeriver`, `sha256`, `PublicKey::verify`), the same calls bsv-rs's own
+/// SHIP discovery makes.
+pub(crate) fn ship_host(
+    script: &bsv_rs::script::LockingScript,
+    topic: &str,
+) -> Result<String, Skip> {
+    use bsv_rs::overlay::{decode_overlay_admin_token, Protocol};
+    use bsv_rs::primitives::{hash::sha256, Signature};
+    use bsv_rs::script::templates::PushDrop;
+    use bsv_rs::wallet::{Counterparty, KeyDeriver, Protocol as WalletProtocol, SecurityLevel};
+
+    let data = decode_overlay_admin_token(script).map_err(|_| Skip::NotShip)?;
+    if data.protocol != Protocol::Ship {
+        return Err(Skip::NotShip);
+    }
+    let token = PushDrop::decode(script).map_err(|_| Skip::NotShip)?;
+    let identity = data.identity_key.to_compressed();
+    if token.fields.get(1).map(Vec::as_slice) != Some(identity.as_slice()) {
+        return Err(Skip::NotShip);
+    }
+    let [fields @ .., signature] = token.fields.as_slice() else {
+        return Err(Skip::Unverified);
+    };
+    if fields.len() != 4 {
+        return Err(Skip::Unverified);
+    }
+    let linked = KeyDeriver::new(None)
+        .derive_public_key(
+            &WalletProtocol::new(SecurityLevel::Counterparty, SHIP_PROTOCOL_NAME),
+            "1",
+            &Counterparty::Other(data.identity_key.clone()),
+            false,
+        )
+        .map_err(|_| Skip::Unverified)?;
+    let signed = sha256(&fields.concat());
+    let signed_by_linked =
+        Signature::from_der(signature).is_ok_and(|signature| linked.verify(&signed, &signature));
+    if !signed_by_linked || linked != token.locking_public_key {
+        return Err(Skip::Unverified);
+    }
+    if data.topic_or_service != topic {
+        return Err(Skip::OtherTopic);
+    }
+    advertised_origin(&data.domain).ok_or(Skip::Host)
+}
+
+/// The origin (`https://name`) of an advertised host, if it is one the
+/// fan-out posts to: `https`, a DNS name (no IP literal), the default port,
+/// no credentials, no path but `/`, no query and no fragment, and a public
+/// name. The name rules are `@bsv/overlay-discovery-services`'
+/// `isAdvertisableURI`: no `localhost`, no `.localhost`, `.local`,
+/// `.internal` or `.home.arpa` name and no `xn--` label; and the name has a
+/// dot.
+pub(crate) fn advertised_origin(advertised: &str) -> Option<String> {
+    let url = worker::Url::parse(advertised).ok()?;
+    if url.scheme() != "https"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.port().is_some()
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return None;
+    }
+    // `None` for an IP literal.
+    let name = url.domain()?.trim_end_matches('.');
+    let private = name == "localhost"
+        || [".localhost", ".local", ".internal", ".home.arpa"]
+            .iter()
+            .any(|suffix| name.ends_with(suffix))
+        || name.split('.').any(|label| label.starts_with("xn--"));
+    if private || !name.contains('.') || name.split('.').any(str::is_empty) {
+        return None;
+    }
+    Some(format!("https://{name}"))
+}
+
+/// The SHIP hosts a lookup answer names for `topic` ([`ship_host`]). Each
+/// output's subject is read without linking its ancestry
+/// ([`subject_output`]): the fan-out needs the one output, nothing linked.
+/// An output that names no host is skipped and counted; an answer that is
+/// not JSON is an error, and an answer of another type names none.
+pub(crate) fn ship_hosts_from_lookup_answer(body: &[u8], topic: &str) -> Result<ShipHosts, String> {
     #[derive(serde::Deserialize)]
     struct LookupOutput {
         beef: Vec<u8>,
@@ -436,32 +579,42 @@ pub(crate) fn hosts_from_lookup_answer(body: &[u8]) -> Result<Vec<String>, Strin
     }
 
     let answer: LookupAnswer = serde_json::from_slice(body).map_err(|e| format!("parse: {}", e))?;
+    let mut found = ShipHosts::default();
     if answer.answer_type != "output-list" {
-        return Ok(Vec::new());
+        return Ok(found);
     }
-
-    let mut urls = Vec::new();
     for out in answer.outputs {
-        let vout = out.output_index as usize;
-        let output = match subject_output(&out.beef, vout) {
-            Some(o) => o,
-            None => continue,
-        };
-        let decoded = match PushDrop::decode(&output.locking_script) {
-            Ok(d) => d,
-            Err(_) => continue,
-        };
-        // field[2] = host URL as UTF-8 bytes.
-        if let Some(url_bytes) = decoded.fields.get(2) {
-            if let Ok(s) = std::str::from_utf8(url_bytes) {
-                let trimmed = s.trim().trim_end_matches('/').to_string();
-                if !trimmed.is_empty() && trimmed.starts_with("http") {
-                    urls.push(trimmed);
-                }
-            }
+        let host = subject_output(&out.beef, out.output_index as usize)
+            .ok_or(Skip::Unreadable)
+            .and_then(|output| ship_host(&output.locking_script, topic));
+        match host {
+            Ok(host) if !found.hosts.contains(&host) => found.hosts.push(host),
+            Ok(_) => {}
+            Err(why) => found.skipped.push(why),
         }
     }
-    Ok(urls)
+    Ok(found)
+}
+
+/// The most peers one advert is posted to (the reference's `SHIPBroadcaster`
+/// takes at most 32 hosts from its lookup).
+pub(crate) const FAN_OUT_MAX_HOSTS: usize = 32;
+
+/// The fan-out's peers: the trackers' hosts in the order found, once each,
+/// without `primary`, at most [`FAN_OUT_MAX_HOSTS`]. Returns the peers and
+/// how many hosts the cap left out.
+pub(crate) fn fan_out_peers(found: &[String], primary: &str) -> (Vec<String>, usize) {
+    let primary = advertised_origin(primary.trim_end_matches('/'))
+        .unwrap_or_else(|| primary.trim_end_matches('/').to_string());
+    let mut peers: Vec<String> = Vec::new();
+    for host in found {
+        if *host != primary && !peers.contains(host) {
+            peers.push(host.clone());
+        }
+    }
+    let over = peers.len().saturating_sub(FAN_OUT_MAX_HOSTS);
+    peers.truncate(FAN_OUT_MAX_HOSTS);
+    (peers, over)
 }
 
 /// POST a BEEF to a peer's `/submit` endpoint with the standard
@@ -658,6 +811,10 @@ mod tests {
         serde_json::to_vec(&serde_json::json!({"type": "output-list", "outputs": outputs})).unwrap()
     }
 
+    fn hosts(body: &[u8]) -> ShipHosts {
+        ship_hosts_from_lookup_answer(body, TM_UHRP_TOPIC).unwrap()
+    }
+
     #[test]
     fn the_fan_out_reads_the_subject_alone() {
         let beef = ship_answer_beef();
@@ -668,22 +825,260 @@ mod tests {
             unlinked.locking_script.to_binary(),
             linked.outputs[0].locking_script.to_binary()
         );
-        let hosts = hosts_from_lookup_answer(&answer(&[(beef.clone(), 0)])).unwrap();
-        assert_eq!(hosts, vec!["https://overlay.example.com".to_string()]);
+        // The parity fixture is a SHIP advertisement `@bsv/sdk` signed.
+        let found = hosts(&answer(&[(beef.clone(), 0)]));
+        assert_eq!(found.hosts, vec!["https://overlay.example.com".to_string()]);
+        assert!(found.skipped.is_empty());
         // An output that is not there, or a BEEF that does not parse, is skipped.
-        let hosts = hosts_from_lookup_answer(&answer(&[(beef, 3), (vec![1, 2, 3], 0)])).unwrap();
-        assert!(hosts.is_empty());
+        let found = hosts(&answer(&[(beef, 3), (vec![1, 2, 3], 0)]));
+        assert!(found.hosts.is_empty());
+        assert_eq!(found.skipped, vec![Skip::Unreadable; 2]);
     }
 
     #[test]
     fn an_unreadable_lookup_answer_is_an_error_and_another_type_is_empty() {
-        assert!(hosts_from_lookup_answer(b"not json").is_err());
-        assert!(hosts_from_lookup_answer(&[0xff, 0xfe]).is_err());
+        assert!(ship_hosts_from_lookup_answer(b"not json", TM_UHRP_TOPIC).is_err());
+        assert!(ship_hosts_from_lookup_answer(&[0xff, 0xfe], TM_UHRP_TOPIC).is_err());
         let other = br#"{"type":"freeform","result":{}}"#;
+        assert_eq!(hosts(other), ShipHosts::default());
+    }
+
+    // ── a host only from an advertisement its identity signed ───────────
+
+    use bsv_rs::overlay::{create_signed_overlay_admin_token, Protocol};
+    use bsv_rs::primitives::PrivateKey;
+    use bsv_rs::script::templates::PushDrop;
+    use bsv_rs::script::LockingScript;
+
+    fn key(n: u8) -> PrivateKey {
+        let mut k = [0u8; 32];
+        k[31] = n;
+        PrivateKey::from_bytes(&k).unwrap()
+    }
+
+    fn signed(n: u8, host: &str, topic: &str) -> LockingScript {
+        create_signed_overlay_admin_token(&key(n), Protocol::Ship, host, topic)
+    }
+
+    /// `script`'s PushDrop, its fields changed by `edit`, locked by `lock`
+    /// (the original locking key when `None`).
+    fn altered(
+        script: &LockingScript,
+        edit: impl FnOnce(&mut Vec<Vec<u8>>),
+        lock: Option<bsv_rs::primitives::PublicKey>,
+    ) -> LockingScript {
+        let token = PushDrop::decode(script).unwrap();
+        let mut fields = token.fields.clone();
+        edit(&mut fields);
+        PushDrop::new(lock.unwrap_or(token.locking_public_key), fields).lock()
+    }
+
+    #[test]
+    fn a_ship_advertisement_signed_by_its_identity_names_its_host() {
+        let host = "https://peer.example.com";
         assert_eq!(
-            hosts_from_lookup_answer(other).unwrap(),
-            Vec::<String>::new()
+            ship_host(&signed(7, host, TM_UHRP_TOPIC), TM_UHRP_TOPIC),
+            Ok(host.into())
         );
+        // The origin is what is posted to: case and a trailing slash fold.
+        assert_eq!(
+            ship_host(
+                &signed(7, "https://Peer.Example.COM/", TM_UHRP_TOPIC),
+                TM_UHRP_TOPIC
+            ),
+            Ok(host.into())
+        );
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/parity/fixtures/parity/ship_tm_uhrp.json"
+        ))
+        .unwrap();
+        let ts_signed =
+            LockingScript::from_hex(fixture["expected"]["locking_script_hex"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(
+            ship_host(&ts_signed, TM_UHRP_TOPIC),
+            Ok("https://overlay.example.com".into())
+        );
+    }
+
+    #[test]
+    fn an_advertisement_its_identity_did_not_sign_names_no_host() {
+        let good = signed(7, "https://peer.example.com", TM_UHRP_TOPIC);
+        let other_identity = key(9).public_key().to_compressed().to_vec();
+        let cases: Vec<(&str, LockingScript)> = vec![
+            // Another identity named over this one's signature.
+            (
+                "another identity",
+                altered(&good, |f| f[1] = other_identity.clone(), None),
+            ),
+            // The host changed after signing.
+            (
+                "the host changed",
+                altered(
+                    &good,
+                    |f| f[2] = b"https://elsewhere.example.com".to_vec(),
+                    None,
+                ),
+            ),
+            // The signature dropped, or a byte of it changed.
+            ("no signature", altered(&good, |f| drop(f.pop()), None)),
+            (
+                "a changed signature",
+                altered(
+                    &good,
+                    |f| {
+                        let last = f.last_mut().unwrap();
+                        let n = last.len() - 1;
+                        last[n] ^= 1;
+                    },
+                    None,
+                ),
+            ),
+            // Signed, but locked by a key the identity does not link.
+            (
+                "locked by another key",
+                altered(&good, |_| {}, Some(key(9).public_key())),
+            ),
+            // The identity's own key signing, not its linked key.
+            (
+                "signed by the identity key itself",
+                altered(
+                    &good,
+                    |f| {
+                        let data: Vec<u8> = f[..4].concat();
+                        let sig = key(7)
+                            .sign(&bsv_rs::primitives::hash::sha256(&data))
+                            .unwrap()
+                            .to_der();
+                        f[4] = sig;
+                    },
+                    None,
+                ),
+            ),
+        ];
+        for (name, script) in cases {
+            assert_eq!(
+                ship_host(&script, TM_UHRP_TOPIC),
+                Err(Skip::Unverified),
+                "{name}"
+            );
+        }
+        // A SLAP advertisement, and a script that is no PushDrop.
+        let slap = create_signed_overlay_admin_token(
+            &key(7),
+            Protocol::Slap,
+            "https://peer.example.com",
+            "ls_uhrp",
+        );
+        assert_eq!(ship_host(&slap, TM_UHRP_TOPIC), Err(Skip::NotShip));
+        let plain = LockingScript::from_binary(&[0x51]).unwrap();
+        assert_eq!(ship_host(&plain, TM_UHRP_TOPIC), Err(Skip::NotShip));
+        // Signed, for another topic.
+        assert_eq!(
+            ship_host(
+                &signed(7, "https://peer.example.com", "tm_other"),
+                TM_UHRP_TOPIC
+            ),
+            Err(Skip::OtherTopic)
+        );
+    }
+
+    #[test]
+    fn a_signed_advertisement_for_a_host_that_is_not_a_public_https_origin_names_none() {
+        for host in [
+            "http://peer.example.com",
+            "wss://peer.example.com",
+            "https+bsvauth+smf://peer.example.com",
+            "https://127.0.0.1",
+            "https://10.1.2.3",
+            "https://169.254.169.254",
+            "https://0x7f000001",
+            "https://[::1]",
+            "https://[fd00::1]",
+            "https://localhost",
+            "https://api.localhost",
+            "https://printer.local",
+            "https://svc.internal",
+            "https://box.home.arpa",
+            "https://xn--80ak6aa92e.com",
+            "https://intranet",
+            "https://user:secret@peer.example.com",
+            "https://peer.example.com:8443",
+            "https://peer.example.com/submit",
+            "https://peer.example.com/?x=1",
+            "https://peer.example.com/#x",
+            "peer.example.com",
+        ] {
+            assert_eq!(
+                ship_host(&signed(7, host, TM_UHRP_TOPIC), TM_UHRP_TOPIC),
+                Err(Skip::Host),
+                "{host}"
+            );
+        }
+        assert_eq!(advertised_origin(""), None);
+        // The default port written out is the default port.
+        assert_eq!(
+            advertised_origin("https://peer.example.com:443"),
+            Some("https://peer.example.com".into())
+        );
+    }
+
+    #[test]
+    fn a_lookup_answer_counts_what_it_skips() {
+        let tx = |script: &LockingScript| {
+            let mut beef = bsv_rs::transaction::Beef::new();
+            let id = beef
+                .merge_raw_tx(
+                    raw_tx(&[(&"22".repeat(32), 0)], &[script.to_binary()]),
+                    None,
+                )
+                .txid();
+            beef.to_binary_atomic(&id).unwrap()
+        };
+        let good = signed(7, "https://peer.example.com", TM_UHRP_TOPIC);
+        let body = answer(&[
+            (tx(&good), 0),
+            (tx(&good), 0),
+            (tx(&altered(&good, |f| drop(f.pop()), None)), 0),
+            (tx(&signed(8, "https://127.0.0.1", TM_UHRP_TOPIC)), 0),
+            (tx(&signed(8, "https://two.example.com", "tm_other")), 0),
+            (tx(&signed(8, "https://two.example.com", TM_UHRP_TOPIC)), 0),
+            (vec![9, 9], 0),
+        ]);
+        let found = hosts(&body);
+        assert_eq!(
+            found.hosts,
+            vec![
+                "https://peer.example.com".to_string(),
+                "https://two.example.com".to_string()
+            ]
+        );
+        assert_eq!(found.count(Skip::Unverified), 1);
+        assert_eq!(found.count(Skip::Host), 1);
+        assert_eq!(found.count(Skip::OtherTopic), 1);
+        assert_eq!(found.count(Skip::Unreadable), 1);
+        assert_eq!(found.skipped.len(), 4);
+    }
+
+    #[test]
+    fn the_fan_out_posts_to_each_host_once_without_the_primary_up_to_the_cap() {
+        let found: Vec<String> = ["a", "b", "a", "own", "c"]
+            .iter()
+            .map(|h| format!("https://{h}.example.com"))
+            .collect();
+        let (peers, over) = fan_out_peers(&found, "https://own.example.com/");
+        assert_eq!(peers.len(), 3);
+        assert_eq!(peers[0], "https://a.example.com");
+        assert_eq!(over, 0);
+        let many: Vec<String> = (0..40)
+            .map(|i| format!("https://p{i}.example.com"))
+            .collect();
+        let (peers, over) = fan_out_peers(&many, "https://own.example.com");
+        assert_eq!(
+            (peers.len(), over),
+            (FAN_OUT_MAX_HOSTS, 40 - FAN_OUT_MAX_HOSTS)
+        );
+        assert_eq!(peers[0], "https://p0.example.com");
     }
 
     #[test]

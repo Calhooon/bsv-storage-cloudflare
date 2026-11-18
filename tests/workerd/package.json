@@ -1,0 +1,11 @@
+{
+  "name": "storage-workerd-run",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node run.mjs"
+  },
+  "devDependencies": {
+    "miniflare": "4.20260426.0"
+  }
+}

@@ -38,10 +38,13 @@
 //!   `/find`/`/list`/`/upload`/`/renew` (upload/renew need payment, not a
 //!   cert). Revisit if a future scenario needs one.
 
-use bsv_rs::auth::transports::{HttpRequest, HttpResponse, SimplifiedFetchTransport};
+use bsv_rs::auth::transports::{
+    HttpRequest, HttpResponse, SimplifiedFetchTransport, Transport, TransportCallback,
+};
+use bsv_rs::auth::types::{AuthMessage, MessageType, AUTH_PROTOCOL_ID};
 use bsv_rs::auth::{Peer, PeerOptions};
 use bsv_rs::primitives::ec::PrivateKey;
-use bsv_rs::wallet::ProtoWallet;
+use bsv_rs::wallet::{Counterparty, ProtoWallet, Protocol, SecurityLevel, VerifySignatureArgs};
 use rand::RngCore;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -57,13 +60,56 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// (producer) and `request()` (consumer).
 type PendingMap = Arc<Mutex<HashMap<[u8; 32], oneshot::Sender<HttpResponse>>>>;
 
+/// Each General response message the transport delivered, by its request
+/// ID, kept so that this client verifies every response's signature itself.
+type KeptMap = Arc<std::sync::Mutex<HashMap<[u8; 32], AuthMessage>>>;
+
+/// [`SimplifiedFetchTransport`], keeping each General response message.
+pub struct KeepingTransport {
+    inner: SimplifiedFetchTransport,
+    kept: KeptMap,
+}
+
+#[async_trait::async_trait]
+impl Transport for KeepingTransport {
+    async fn send(&self, message: &AuthMessage) -> bsv_rs::Result<()> {
+        self.inner.send(message).await
+    }
+
+    fn set_callback(&self, callback: Box<TransportCallback>) {
+        let kept = self.kept.clone();
+        self.inner
+            .set_callback(Box::new(move |message: AuthMessage| {
+                if message.message_type == MessageType::General {
+                    if let Some(Ok(response)) =
+                        message.payload.as_deref().map(HttpResponse::from_payload)
+                    {
+                        if let Ok(mut map) = kept.lock() {
+                            map.insert(response.request_id, message.clone());
+                        }
+                    }
+                }
+                callback(message)
+            }));
+    }
+
+    fn clear_callback(&self) {
+        self.inner.clear_callback()
+    }
+}
+
 /// Authenticated HTTP client scoped to a single `base_url`. Holds a
 /// BRC-31 session for the life of the struct, so successive requests reuse
 /// the same handshake. One instance per (identity, base_url) — typical
 /// harness run creates two (one for reference, one for local).
 pub struct AuthClient {
-    peer: Arc<Peer<ProtoWallet, SimplifiedFetchTransport>>,
+    peer: Arc<Peer<ProtoWallet, KeepingTransport>>,
     pending: PendingMap,
+    kept: KeptMap,
+    key: PrivateKey,
+    // Read by the race client (`src/bin/race.rs`).
+    #[allow(dead_code)]
+    base_url: String,
 }
 
 /// A response borrowed back out of the BRC-31 wrapper. JSON bodies are
@@ -79,6 +125,11 @@ pub struct AuthResponse {
     /// that `Brc31Paid` scenarios parse to build their payment envelope.
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+    /// Whether the response carried a BRC-104 signature that verifies
+    /// against the server's identity key for this session (read by the race
+    /// client).
+    #[allow(dead_code)]
+    pub signed: bool,
 }
 
 impl AuthClient {
@@ -89,7 +140,11 @@ impl AuthClient {
     /// This is synchronous — no network I/O happens here.
     pub fn new(base_url: &str, private_key: &PrivateKey) -> Result<Self, String> {
         let wallet = ProtoWallet::new(Some(private_key.clone()));
-        let transport = SimplifiedFetchTransport::new(base_url);
+        let kept: KeptMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let transport = KeepingTransport {
+            inner: SimplifiedFetchTransport::new(base_url),
+            kept: kept.clone(),
+        };
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
 
         let peer = Arc::new(Peer::new(PeerOptions {
@@ -102,7 +157,53 @@ impl AuthClient {
         }));
         peer.start();
 
-        Ok(Self { peer, pending })
+        Ok(Self {
+            peer,
+            pending,
+            kept,
+            key: private_key.clone(),
+            base_url: base_url.to_string(),
+        })
+    }
+
+    /// The server this client talks to (read by the race client).
+    #[allow(dead_code)]
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    /// Whether `message` carries a signature by the server's identity key
+    /// over its payload, for the session of this client's it names (its
+    /// `your_nonce`, this client's session nonce).
+    async fn verifies(&self, message: &AuthMessage) -> bool {
+        let (Some(signature), Some(ours)) = (message.signature.clone(), message.your_nonce.clone())
+        else {
+            return false;
+        };
+        let Ok(session) = self
+            .peer
+            .get_authenticated_session(Some(&ours), Some(REQUEST_TIMEOUT.as_millis() as u64))
+            .await
+        else {
+            return false;
+        };
+        if session.session_nonce.as_deref() != Some(ours.as_str())
+            || session.peer_identity_key.as_ref() != Some(&message.identity_key)
+        {
+            return false;
+        }
+        let args = VerifySignatureArgs {
+            data: Some(message.signing_data()),
+            hash_to_directly_verify: None,
+            signature,
+            protocol_id: Protocol::new(SecurityLevel::Counterparty, AUTH_PROTOCOL_ID),
+            key_id: message.get_key_id(Some(&ours)),
+            counterparty: Some(Counterparty::Other(message.identity_key.clone())),
+            for_self: None,
+        };
+        ProtoWallet::new(Some(self.key.clone()))
+            .verify_signature(args)
+            .is_ok_and(|r| r.valid)
     }
 
     /// Install the general-message callback that routes responses back to
@@ -208,10 +309,20 @@ impl AuthClient {
             .map_err(|_| "response timeout — callback did not fire".to_string())?
             .map_err(|_| "response channel closed without value".to_string())?;
 
+        let message = self
+            .kept
+            .lock()
+            .ok()
+            .and_then(|mut map| map.remove(&resp.request_id));
+        let signed = match message {
+            Some(message) => self.verifies(&message).await,
+            None => false,
+        };
         Ok(AuthResponse {
             status: resp.status,
             headers: resp.headers,
             body: resp.body,
+            signed,
         })
     }
 }
@@ -247,6 +358,7 @@ mod tests {
             status: 418,
             headers: vec![("x-kind".to_string(), "teapot".to_string())],
             body: b"short and stout".to_vec(),
+            signed: false,
         };
         assert_eq!(r.status, 418);
         assert_eq!(r.body, b"short and stout");

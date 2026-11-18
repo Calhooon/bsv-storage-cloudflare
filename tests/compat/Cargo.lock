@@ -150,14 +150,14 @@ dependencies = [
 
 [[package]]
 name = "bsv-middleware-cloudflare"
-version = "0.7.4"
+version = "0.7.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b75d3c669a9cdb1bf394e6990d5a12853af15a5656fb35e2415e917d014f3e7"
+checksum = "238e4ff4d5169597e0e91b1d02814caf85635363c9c220fe6a274730ce93d270"
 dependencies = [
  "async-trait",
  "base64",
- "bsv-middleware-core 0.4.3",
- "bsv-rs 0.8.11",
+ "bsv-middleware-core 0.4.4",
+ "bsv-rs 0.8.13",
  "console_error_panic_hook",
  "futures",
  "getrandom",
@@ -189,12 +189,12 @@ dependencies = [
 
 [[package]]
 name = "bsv-middleware-core"
-version = "0.4.3"
+version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "78508102debca851b3fdb1142e597b6a3a8487f2419b305c63a8c49e4b1984eb"
+checksum = "3b891abddd34824c63a52b33bce5f10618c0a89c7ec92fddbd7fd1d266d1548e"
 dependencies = [
  "async-trait",
- "bsv-rs 0.8.11",
+ "bsv-rs 0.8.13",
  "getrandom",
  "hex",
  "serde",
@@ -255,9 +255,9 @@ dependencies = [
 
 [[package]]
 name = "bsv-rs"
-version = "0.8.11"
+version = "0.8.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7641f339ea4b6e3a084d7649a641be8d05775d3c2d98cd17f348b4a4019ecef3"
+checksum = "e71f6d1cb69bac02b3fb11224493bea7ebf3839215ec765bd9ff41551a33c5e5"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -1118,11 +1118,11 @@ checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 
 [[package]]
 name = "new"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "base64",
- "bsv-middleware-cloudflare 0.7.4",
- "bsv-rs 0.8.11",
+ "bsv-middleware-cloudflare 0.7.5",
+ "bsv-rs 0.8.13",
  "chrono",
  "console_error_panic_hook",
  "getrandom",

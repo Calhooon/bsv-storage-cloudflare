@@ -7,6 +7,8 @@
 pub use bsv_middleware_cloudflare as middleware;
 pub use bsv_rs;
 
+#[path = "../../../../src/claims.rs"]
+pub mod claims;
 #[path = "../../../../src/error.rs"]
 pub mod error;
 
@@ -27,9 +29,10 @@ pub mod validation;
 #[path = "../../../../src/wallet/mod.rs"]
 pub mod wallet;
 
-/// The SHIP hosts the fan-out takes from a tracker's lookup answer.
+/// The SHIP hosts the fan-out takes from a tracker's `tm_uhrp` lookup
+/// answer: once each, from advertisements their identity signed.
 pub fn hosts_from_lookup_answer(body: &[u8]) -> Result<Vec<String>, String> {
-    overlay::hosts_from_lookup_answer(body)
+    overlay::ship_hosts_from_lookup_answer(body, overlay::TM_UHRP_TOPIC).map(|found| found.hosts)
 }
 
 /// The bound on a tracker's lookup answer.
