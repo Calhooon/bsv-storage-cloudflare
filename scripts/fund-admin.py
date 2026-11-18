@@ -28,30 +28,105 @@ Flow per BRC-29:
      outputs from already-broadcast txs).
 
 Usage:
-    python3 scripts/fund-admin.py <satoshis>
+    ADMIN_WALLET_PRIVATE_KEY_FILE=<file> python3 scripts/fund-admin.py <satoshis>
     # defaults to 5000 sats if omitted.
 
-Secrets come from the sibling x402 skill's helpers (BRC-31 auth against
-wallet-infra) — we import brc31_helpers.py and reuse its session-cached
-JSON-RPC client.
+The admin key comes from a file: ADMIN_WALLET_PRIVATE_KEY_FILE is the path
+of a file that holds its 64 hex
+digits (whitespace around them is ignored). Set it in place for the one
+command, as above, so the key is in neither the tree, the shell's history nor
+the shell's environment afterwards. ADMIN_WALLET_PRIVATE_KEY (the digits
+themselves) is still read when it is set, but only from a file inside the
+command, never typed:
+    ADMIN_WALLET_PRIVATE_KEY="$(cat <file>)" python3 scripts/fund-admin.py <satoshis>
+Both variables are removed from this process's environment as soon as they
+are read, so no child process (openssl, the auth helper) inherits them; the
+auth helper alone is handed the key, as below. A missing or malformed key is
+refused by the variable's name; its value is never printed. The admin's
+public key is derived from it.
+
+The BRC-31 auth comes from the sibling x402 skill's helpers: we run its
+brc31_helpers.py from X402_SKILL_DIR (default: the plugin cache's
+~/.claude/plugins/cache/calgooon-x402/x402/09b016215354/skills/x402), with the
+admin key handed to it in its environment as PARITY_IDENTITY_KEY.
 """
 from __future__ import annotations
 
 import base64
 import json
 import os
+import re
 import secrets
 import subprocess
 import sys
 import urllib.parse
 import urllib.request
 
-ADMIN_PRIVKEY_HEX = (
-    "d6db75fecb84a3cb7ec2e8a8ebf826853da068679388803e9a119778d0839979"
+# secp256k1: the curve's prime, order and generator (SEC 2, section 2.4.1).
+_P = 2**256 - 2**32 - 977
+_N = 2**256 - 0x14551231950B75FC4402DA1732FC9BEBF
+_G = (
+    55066263022277343669578718895168534326250603453777594175500187360389116729240,
+    32670510020758816978083085130507043184471273380659243275938904335757337482424,
 )
-ADMIN_PUBKEY_HEX = (
-    "02837c91defe23ca5bb4ec1fccd82e1e6fcba8f80e7632d360a7cb34e851dda663"
-)
+
+
+def _add(a, b):
+    if a is None:
+        return b
+    if b is None:
+        return a
+    if a[0] == b[0] and (a[1] + b[1]) % _P == 0:
+        return None
+    if a == b:
+        m = 3 * a[0] * a[0] * pow(2 * a[1], -1, _P) % _P
+    else:
+        m = (b[1] - a[1]) * pow(b[0] - a[0], -1, _P) % _P
+    x = (m * m - a[0] - b[0]) % _P
+    return x, (m * (a[0] - x) - a[1]) % _P
+
+
+def compressed_public_key_hex(private_key_hex: str) -> str:
+    """The compressed SEC1 public key (33 bytes, hex) of a secp256k1 scalar."""
+    d, point, result = int(private_key_hex, 16), _G, None
+    while d:
+        if d & 1:
+            result = _add(result, point)
+        point, d = _add(point, point), d >> 1
+    return ("03" if result[1] & 1 else "02") + format(result[0], "064x")
+
+
+def load_admin_private_key() -> str:
+    """The admin key from ADMIN_WALLET_PRIVATE_KEY or the file named by
+    ADMIN_WALLET_PRIVATE_KEY_FILE. Every refusal names the variable and
+    never the value."""
+    # Popped, not read: no child process this script starts inherits either.
+    inline = os.environ.pop("ADMIN_WALLET_PRIVATE_KEY", None)
+    named = os.environ.pop("ADMIN_WALLET_PRIVATE_KEY_FILE", None)
+    if inline and named:
+        sys.exit("fund-admin: set ADMIN_WALLET_PRIVATE_KEY or "
+                 "ADMIN_WALLET_PRIVATE_KEY_FILE, not both")
+    if named:
+        source = "the file named by ADMIN_WALLET_PRIVATE_KEY_FILE"
+        try:
+            with open(os.path.expanduser(named), encoding="ascii") as f:
+                value = f.read().strip()
+        except (OSError, UnicodeDecodeError):
+            sys.exit(f"fund-admin: {source} cannot be read")
+    elif inline:
+        source = "ADMIN_WALLET_PRIVATE_KEY"
+        value = inline.strip()
+    else:
+        sys.exit("fund-admin: no admin key: set ADMIN_WALLET_PRIVATE_KEY "
+                 "or ADMIN_WALLET_PRIVATE_KEY_FILE (see the docstring)")
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", value) or not 0 < int(value, 16) < _N:
+        sys.exit(f"fund-admin: {source} is not a private key "
+                 "(64 hex digits, a scalar below the curve order)")
+    return value.lower()
+
+
+ADMIN_PRIVKEY_HEX = load_admin_private_key()
+ADMIN_PUBKEY_HEX = compressed_public_key_hex(ADMIN_PRIVKEY_HEX)
 WALLET_INFRA_URL = "https://wallet-infra.x402agency.com"
 LOCAL_WALLET_URL = "http://localhost:3322"
 LOCAL_ADMIN_ORIGIN = "http://admin.com"  # bypasses admin-only basket restriction
@@ -161,9 +236,13 @@ def internalize_as_admin(
     helper (which handles BRC-31 auth against any server)."""
 
     # Point the brc31_helpers script at wallet-infra using the admin privkey
-    # as PARITY_IDENTITY_KEY. We invoke the skill's CLI as a subprocess.
-    skill_dir = "/Users/johncalhoun/.claude/plugins/cache/calgooon-x402/x402/09b016215354/skills/x402"
-    env = os.environ.copy()
+    # as PARITY_IDENTITY_KEY (its environment, never its argv). We invoke the
+    # skill's CLI as a subprocess.
+    skill_dir = os.path.expanduser(os.environ.get(
+        "X402_SKILL_DIR",
+        "~/.claude/plugins/cache/calgooon-x402/x402/09b016215354/skills/x402",
+    ))
+    env = os.environ.copy()  # holds neither ADMIN_WALLET_PRIVATE_KEY variable (popped at load)
     env["PARITY_IDENTITY_KEY"] = ADMIN_PRIVKEY_HEX
     # The skill's auth path is /.well-known/auth + JSON-RPC `POST /`.
     # wallet-infra uses positional params: [authObj, args].
