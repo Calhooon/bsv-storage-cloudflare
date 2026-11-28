@@ -14,6 +14,5 @@
 //! backend-specific header names inside `requiredHeaders` differ, which is
 //! unavoidable when swapping the storage provider.
 
-pub mod custom_time;
 pub mod head;
 pub mod presign;

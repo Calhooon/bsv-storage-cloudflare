@@ -158,9 +158,10 @@ pub struct RenewRequest {
     pub offset: Option<i32>,
 }
 
-/// Success response for `POST /renew` (PROTOCOL.md §5). Field order matches
-/// TS (`src/routes/renew.ts:215–220`): `status, prevExpiryTime, newExpiryTime,
-/// amount`.
+/// Success response for `POST /renew` (PROTOCOL.md §5). The reference's
+/// four fields in its order (`status, prevExpiryTime, newExpiryTime,
+/// amount`), then `overlayAdmitted`: whether the overlay admitted the
+/// renewed advert when the Worker submitted it.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RenewResponse {
@@ -168,6 +169,7 @@ pub struct RenewResponse {
     pub prev_expiry_time: u64,
     pub new_expiry_time: u64,
     pub amount: u64,
+    pub overlay_admitted: bool,
 }
 
 // ────────────────────────────────────────────────────────────────────────────

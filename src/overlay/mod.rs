@@ -32,6 +32,7 @@ use bsv_rs::overlay::types::{Steak, TaggedBEEF};
 use worker::{Fetch, Headers, Method, Request, RequestInit};
 
 use crate::error::ERR_OVERLAY_BROADCAST;
+use crate::renewal::{reason, Admission};
 
 /// Topic name for UHRP advertisements. Matches TS
 /// `new SHIPBroadcaster(['tm_uhrp'], ...)` in `advertise.ts:85`, `renew.ts:205`.
@@ -123,6 +124,79 @@ pub async fn submit_uhrp_advert(
     fan_out_to_mainnet_peers(overlay_host, &tagged).await;
 
     Ok(())
+}
+
+/// The longest the paid `/renew` and the pass wait for the overlay's answer
+/// to one submit, in milliseconds. Past it the submit is a fault.
+pub const ADMISSION_DEADLINE_MS: u64 = 10_000;
+
+/// Submit a `tm_uhrp` advertisement to the overlay and read its answer as
+/// an [`Admission`]: admitted; refused (the overlay answered that it does
+/// not admit it, [`admission_of`]); or a fault (no answer within
+/// `deadline_ms`, a transport failure, a 5xx). After an admission the
+/// mainnet fan-out runs as [`submit_uhrp_advert`]'s does, under the same
+/// deadline, and its outcome is only logged.
+pub async fn admit_uhrp_advert(
+    env: &worker::Env,
+    overlay_host: &str,
+    beef: &[u8],
+    deadline_ms: u64,
+) -> Admission {
+    let tagged = TaggedBEEF::new(beef.to_vec(), vec![TM_UHRP_TOPIC.to_string()]);
+    let admission = match within(submit_tagged(env, overlay_host, &tagged), deadline_ms).await {
+        None => Admission::Fault("the overlay did not answer within the deadline".to_string()),
+        Some(Ok(())) => Admission::Admitted,
+        Some(Err(e)) => admission_of(&e),
+    };
+    if admission == Admission::Admitted
+        && within(fan_out_to_mainnet_peers(overlay_host, &tagged), deadline_ms)
+            .await
+            .is_none()
+    {
+        worker::console_log!("overlay fan-out: not finished within the deadline");
+    }
+    admission
+}
+
+/// A submit's failure read as the overlay's answer: an answer that it does
+/// not admit the advert (no output admitted for `tm_uhrp`, or a 4xx other
+/// than 408 and 429) is a refusal with its reason; anything else (a
+/// transport failure, a 5xx, 408, 429, a local serialization failure) is a
+/// fault.
+#[must_use]
+pub fn admission_of(e: &SubmitError) -> Admission {
+    match e {
+        SubmitError::NoOutputsAdmitted(body) => {
+            Admission::Refused(reason(&format!("no output admitted for tm_uhrp: {body}")))
+        }
+        SubmitError::HttpStatus { status, body }
+            if (400..500).contains(status) && *status != 408 && *status != 429 =>
+        {
+            Admission::Refused(reason(&format!("HTTP {status}: {body}")))
+        }
+        SubmitError::HttpStatus { status, .. } => Admission::Fault(format!("HTTP {status}")),
+        SubmitError::Transport(t) => Admission::Fault(reason(t)),
+        SubmitError::Serialize(t) => Admission::Fault(reason(t)),
+    }
+}
+
+/// `fut`'s output, or `None` when `deadline_ms` passes first.
+async fn within<F: std::future::Future>(fut: F, deadline_ms: u64) -> Option<F::Output> {
+    use std::task::Poll;
+    let mut fut = std::pin::pin!(fut);
+    let mut timer = std::pin::pin!(worker::Delay::from(std::time::Duration::from_millis(
+        deadline_ms
+    )));
+    std::future::poll_fn(|cx| {
+        if let Poll::Ready(out) = fut.as_mut().poll(cx) {
+            return Poll::Ready(Some(out));
+        }
+        if timer.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(None);
+        }
+        Poll::Pending
+    })
+    .await
 }
 
 /// Internal: POST a [`TaggedBEEF`] to `{overlay_host}/submit` with the
@@ -679,6 +753,39 @@ async fn post_beef_to_peer(peer_host: &str, tagged: &TaggedBEEF) -> Result<(), S
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    #[test]
+    fn an_answer_that_it_does_not_admit_is_a_refusal_and_the_rest_a_fault() {
+        let refused = |e: SubmitError| matches!(admission_of(&e), Admission::Refused(_));
+        assert!(refused(SubmitError::NoOutputsAdmitted("{}".into())));
+        for status in [400, 403, 404, 422] {
+            assert!(refused(SubmitError::HttpStatus {
+                status,
+                body: "no".into()
+            }));
+        }
+        for status in [408, 429, 500, 502, 503] {
+            assert_eq!(
+                admission_of(&SubmitError::HttpStatus {
+                    status,
+                    body: "b".into()
+                }),
+                Admission::Fault(format!("HTTP {status}"))
+            );
+        }
+        assert!(matches!(
+            admission_of(&SubmitError::Transport("reset".into())),
+            Admission::Fault(_)
+        ));
+        let Admission::Refused(why) = admission_of(&SubmitError::HttpStatus {
+            status: 400,
+            body: "y".repeat(1000),
+        }) else {
+            unreachable!()
+        };
+        assert_eq!(why.chars().count(), crate::renewal::REASON_MAX_CHARS);
+        assert!(why.starts_with("HTTP 400: yy"));
+    }
 
     #[test]
     fn topics_header_matches_ts_ship_broadcaster() {

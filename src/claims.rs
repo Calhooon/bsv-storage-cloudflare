@@ -83,10 +83,13 @@ pub const HOLDS_SQL: &str = "SELECT 1 AS held FROM payment_claims WHERE nonce = 
 /// (`/upload`: the presigned PUT's expiry with the object's custom-time
 /// buffer, the expiry the queue advertises; `/renew`: the new expiry).
 /// `state` is `paid` when the wallet accepted the payment and the route's
-/// answer is not yet recorded, then `granted` (the route answered 2xx) or
-/// `refused` (it answered otherwise). A row left `paid`, with `answered_at`
-/// null, is a win whose second grant write failed; a win whose first write
-/// failed has no row. The service was still one.
+/// answer is not yet recorded. `/upload` then writes `granted` (it answered
+/// 2xx) or `refused` (it answered otherwise). `/renew` writes `granted` once
+/// a broadcaster took the renewing transaction, and otherwise keeps `paid`
+/// with its answer's `status` and `answered_at`: the payment was taken and
+/// no renewal was served, and its `renewals` row says what the renewing
+/// step came to. A row left `paid` with `answered_at` null is a win whose
+/// second grant write failed; a win whose first write failed has no row.
 pub const GRANTS_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS payment_grants (\
     prefix TEXT PRIMARY KEY, txid TEXT NOT NULL, route TEXT NOT NULL, \
     identity_key TEXT NOT NULL, satoshis INTEGER NOT NULL, paid_at INTEGER NOT NULL, \
@@ -683,7 +686,8 @@ pub mod grants {
         Ok(())
     }
 
-    /// The route answered `status`, granting `granted`.
+    /// The route answered `status`, granting `granted`: `granted` for a 2xx,
+    /// `refused` otherwise (`/upload`).
     pub async fn answered(
         db: &D1Database,
         won: &Won,
@@ -695,6 +699,17 @@ pub mod grants {
         } else {
             "refused"
         };
+        answered_as(db, won, state, status, granted).await
+    }
+
+    /// The route answered `status` and the grant's state is `state`.
+    pub async fn answered_as(
+        db: &D1Database,
+        won: &Won,
+        state: &str,
+        status: u16,
+        granted: &Granted,
+    ) -> Result<(), String> {
         db.prepare(GRANT_ANSWERED_SQL)
             .bind(&[
                 won.prefix.as_str().into(),

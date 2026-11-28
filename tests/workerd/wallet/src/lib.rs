@@ -16,6 +16,23 @@
 //!   outpoint) and `processAction` records the renewal: the advert moves to
 //!   the new transaction, its script and tags (`GET /advert?tag=` answers
 //!   the advert and how many of each call it saw);
+//!   `abortAction` releases the action's advert; `findProvenTxReqs`
+//!   answers the broadcast request's status the last `processAction` (or
+//!   `POST /req`) set for a transaction (`GET /finds?txid=` counts them);
+//!   `POST /advert` also stores the advert's object (`cdn/<object>`, of
+//!   the advert's size, or another `size`, or none) in the R2 bucket the
+//!   storage Worker reads (`GET /object?key=` answers its etag and upload
+//!   time);
+//! - knobs (`/knob?create=&process=&overlay=`, each empty for the normal
+//!   answer): `createAction` refuses as a spent advert does (`spent`) or
+//!   answers a template the Worker cannot sign (`unsignable`);
+//!   `processAction` refuses the call (`refuse`), answers `failed`, records
+//!   the transaction and answers no result (`lost`, an HTTP 500), or
+//!   records it untaken (`untaken`: `sending`, its request `unsent`); the
+//!   overlay refuses (`refuse`: no output admitted) or faults (`fault`: a
+//!   503). The outpoint `createAction` spends is locked in the isolate, so
+//!   of two renewals of one advert at once one spends it and the other is
+//!   refused as a spent advert;
 //! - the overlay: `/submit` admits output 0 (and counts it), `/lookup`
 //!   answers no outputs.
 
@@ -24,6 +41,32 @@ use bsv_middleware_cloudflare::middleware::{
 };
 use serde_json::{json, Value};
 use worker::{event, Context, Delay, Env, Request, Response, Result};
+
+thread_local! {
+    /// The outpoints an open action spends (one isolate serves the
+    /// stand-in, so a check and an insert here are one step).
+    static LOCKED: std::cell::RefCell<std::collections::HashSet<String>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+/// Lock `outpoint` for an action; false when another holds it.
+fn lock(outpoint: &str) -> bool {
+    LOCKED.with(|l| l.borrow_mut().insert(outpoint.to_string()))
+}
+
+fn unlock(outpoint: &str) {
+    LOCKED.with(|l| {
+        l.borrow_mut().remove(outpoint);
+    });
+}
+
+/// The refusal wallet-infra answers for an explicit input it cannot lock.
+fn spent(outpoint: &str) -> Value {
+    json!({
+        "code": -32602,
+        "message": format!("createAction: explicit input {outpoint} is unavailable (already spent or locked by transaction_id 7)"),
+    })
+}
 
 /// A public test key; this server's identity.
 const WALLET_KEY: &str = "0000000000000000000000000000000000000000000000000000000000000002";
@@ -68,23 +111,80 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 .execute()
                 .await?;
             put_json(&kv, &format!("advert:{tag}"), &advert).await?;
+            if let Some(key) = advert["object"].as_str() {
+                let size = advert["size"].as_u64().unwrap_or(0) as usize;
+                env.bucket("UHRP_FILES")?
+                    .put(key, vec![0u8; size])
+                    .execute()
+                    .await?;
+            }
             return Response::from_json(&json!({ "seeded": tag }));
         }
         "/advert" => {
             let tag = query(&url, "tag");
             let advert = get_json(&kv, &format!("advert:{tag}")).await?;
             let mut counts = json!({});
-            for name in ["listOutputs", "createAction", "processAction"] {
+            for name in [
+                "listOutputs",
+                "createAction",
+                "processAction",
+                "abortAction",
+            ] {
                 counts[name] = json!(count(&kv, &format!("{name}:{tag}")).await?);
             }
             return Response::from_json(&json!({ "advert": advert, "calls": counts }));
         }
+        "/object" => {
+            let key = query(&url, "key");
+            return match env.bucket("UHRP_FILES")?.head(key).await? {
+                Some(o) => Response::from_json(&json!({
+                    "exists": true,
+                    "etag": o.etag(),
+                    "uploaded": o.uploaded().as_millis(),
+                    "size": o.size(),
+                })),
+                None => Response::from_json(&json!({ "exists": false })),
+            };
+        }
+        "/knob" => {
+            for name in ["create", "process", "overlay"] {
+                if let Some(value) = url.query_pairs().find(|(k, _)| k == name).map(|(_, v)| v) {
+                    kv.put(&format!("knob:{name}"), value.to_string())?
+                        .execute()
+                        .await?;
+                }
+            }
+            return Response::from_json(&json!({
+                "create": knob(&kv, "create").await?,
+                "process": knob(&kv, "process").await?,
+                "overlay": knob(&kv, "overlay").await?,
+            }));
+        }
+        "/req" if req.method() == worker::Method::Post => {
+            let txid = query(&url, "txid");
+            kv.put(&format!("req:{txid}"), query(&url, "status"))?
+                .execute()
+                .await?;
+            return Response::from_json(&json!({ "txid": txid }));
+        }
+        "/finds" => {
+            let txid = query(&url, "txid");
+            return Response::from_json(
+                &json!({ "finds": count(&kv, &format!("find:{txid}")).await? }),
+            );
+        }
         "/submit" => {
             let n = count(&kv, "submit").await? + 1;
             kv.put("submit", n.to_string())?.execute().await?;
-            return Response::from_json(
-                &json!({ "tm_uhrp": { "outputsToAdmit": [0], "coinsToRetain": [] } }),
-            );
+            return match knob(&kv, "overlay").await?.as_str() {
+                "fault" => Response::error("the stand-in overlay is down", 503),
+                "refuse" => Response::from_json(
+                    &json!({ "tm_uhrp": { "outputsToAdmit": [], "coinsToRetain": [] } }),
+                ),
+                _ => Response::from_json(
+                    &json!({ "tm_uhrp": { "outputsToAdmit": [0], "coinsToRetain": [] } }),
+                ),
+            };
         }
         "/submits" => {
             return Response::from_json(&json!({ "submits": count(&kv, "submit").await? }))
@@ -181,10 +281,14 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 .unwrap_or_default();
             bump(&kv, &format!("createAction:{tag}")).await?;
             let a = get_json(&kv, &format!("advert:{tag}")).await?;
-            if a.is_null()
-                || format!("{}.{}", a["txid"].as_str().unwrap_or_default(), a["vout"]) != outpoint
-            {
+            let create = knob(&kv, "create").await?;
+            if a.is_null() {
                 Err(json!({ "code": -32000, "message": "the outpoint is not spendable" }))
+            } else if create == "spent"
+                || format!("{}.{}", a["txid"].as_str().unwrap_or_default(), a["vout"]) != outpoint
+                || !lock(outpoint)
+            {
+                Err(spent(outpoint))
             } else {
                 let reference = format!(
                     "ref-{}-{}",
@@ -195,18 +299,29 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 put_json(
                     &kv,
                     &format!("pending:{reference}"),
-                    &json!({ "tag": tag, "lockingScript": out["lockingScript"], "tags": out["tags"] }),
+                    &json!({ "tag": tag, "outpoint": outpoint, "lockingScript": out["lockingScript"], "tags": out["tags"] }),
                 )
                 .await?;
+                let mut inputs = vec![json!({
+                    "vin": 0,
+                    "sourceTxid": a["txid"],
+                    "sourceVout": a["vout"],
+                    "sourceSatoshis": 1,
+                    "sourceLockingScript": a["lockingScript"],
+                })];
+                if create == "unsignable" {
+                    // A change input whose P2PKH key is not the Worker's.
+                    inputs.push(json!({
+                        "vin": 1,
+                        "sourceTxid": "11".repeat(32),
+                        "sourceVout": 0,
+                        "sourceSatoshis": 1000,
+                        "sourceLockingScript": format!("76a914{}88ac", "22".repeat(20)),
+                    }));
+                }
                 Ok(json!({
                     "inputBeef": a["beef"],
-                    "inputs": [{
-                        "vin": 0,
-                        "sourceTxid": a["txid"],
-                        "sourceVout": a["vout"],
-                        "sourceSatoshis": 1,
-                        "sourceLockingScript": a["lockingScript"],
-                    }],
+                    "inputs": inputs,
                     "outputs": [{ "vout": 0, "satoshis": 1, "lockingScript": out["lockingScript"] }],
                     "version": 1,
                     "lockTime": 0,
@@ -218,24 +333,78 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         Some("processAction") => {
             let args = &call["params"][1];
             let reference = args["reference"].as_str().unwrap_or_default();
+            let txid = args["txid"].as_str().unwrap_or_default().to_string();
             let pending = get_json(&kv, &format!("pending:{reference}")).await?;
             let tag = pending["tag"].as_str().unwrap_or_default().to_string();
             bump(&kv, &format!("processAction:{tag}")).await?;
             let mut a = get_json(&kv, &format!("advert:{tag}")).await?;
+            let process = knob(&kv, "process").await?;
+            let spent_outpoint = pending["outpoint"].as_str().unwrap_or_default().to_string();
             if a.is_null() || pending.is_null() {
                 Err(json!({ "code": -32000, "message": "no such action" }))
+            } else if process == "refuse" {
+                Err(json!({
+                    "code": -32602,
+                    "message": "Cannot process transaction with status 'sending'. Must be 'unsigned' or 'unprocessed'",
+                }))
+            } else if process == "failed" {
+                // The wallet's own script verdict releases the inputs.
+                unlock(&spent_outpoint);
+                kv.delete(&format!("pending:{reference}")).await?;
+                Ok(
+                    json!({ "sendWithResults": [{ "txid": txid, "status": "failed" }], "log": "input 0: script did not succeed" }),
+                )
             } else {
-                a["txid"] = args["txid"].clone();
+                a["txid"] = json!(txid);
                 a["vout"] = json!(0);
                 a["lockingScript"] = pending["lockingScript"].clone();
                 a["tags"] = pending["tags"].clone();
-                let outpoint = format!("{}.0", args["txid"].as_str().unwrap_or_default());
+                let outpoint = format!("{txid}.0");
                 kv.put(&format!("outpoint:{outpoint}"), &tag)?
                     .execute()
                     .await?;
                 put_json(&kv, &format!("advert:{tag}"), &a).await?;
                 kv.delete(&format!("pending:{reference}")).await?;
-                Ok(json!({}))
+                unlock(&spent_outpoint);
+                let status = match process.as_str() {
+                    "untaken" => "unsent",
+                    "lost" => "sending",
+                    _ => "unmined",
+                };
+                kv.put(&format!("req:{txid}"), status)?.execute().await?;
+                if process == "lost" {
+                    return Response::error("the stand-in wallet lost the answer", 500);
+                }
+                Ok(json!({ "sendWithResults": [{ "txid": txid, "status": "sending" }] }))
+            }
+        }
+        Some("abortAction") => {
+            let reference = call["params"][1]["reference"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            let pending = get_json(&kv, &format!("pending:{reference}")).await?;
+            let tag = pending["tag"].as_str().unwrap_or_default().to_string();
+            bump(&kv, &format!("abortAction:{tag}")).await?;
+            if pending.is_null() {
+                Ok(json!({ "aborted": false }))
+            } else {
+                unlock(pending["outpoint"].as_str().unwrap_or_default());
+                kv.delete(&format!("pending:{reference}")).await?;
+                Ok(json!({ "aborted": true }))
+            }
+        }
+        Some("findProvenTxReqs") => {
+            let txid = call["params"][1]["txids"][0]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            bump(&kv, &format!("find:{txid}")).await?;
+            match kv.get(&format!("req:{txid}")).text().await? {
+                Some(status) => Ok(
+                    json!([{ "provenTxReqId": 1, "txid": txid, "status": status, "attempts": 1 }]),
+                ),
+                None => Ok(json!([])),
             }
         }
         other => Err(json!({ "code": -32601, "message": format!("no method {other:?}") })),
@@ -249,6 +418,14 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             .map_err(|e| worker::Error::RustError(e.to_string())),
         None => Response::from_json(&reply),
     }
+}
+
+async fn knob(kv: &worker::kv::KvStore, name: &str) -> Result<String> {
+    Ok(kv
+        .get(&format!("knob:{name}"))
+        .text()
+        .await?
+        .unwrap_or_default())
 }
 
 fn query(url: &worker::Url, name: &str) -> String {

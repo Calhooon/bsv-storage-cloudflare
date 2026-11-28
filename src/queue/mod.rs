@@ -1,4 +1,6 @@
-//! R2 event → queue consumer → auto-advertise.
+//! R2 event → queue consumer → auto-advertise; and the paid `/renew`'s
+//! re-submit of a renewed advert ([`QueueMessage::RenewalAdvert`], handled
+//! by [`crate::pass::deliver`]).
 //!
 //! # What this replaces
 //!
@@ -149,13 +151,33 @@ pub enum ProcessOutcome {
     Retry,
 }
 
+/// A message on the post-upload queue: an R2 event, or the paid `/renew`'s
+/// re-submit of a renewed advert the overlay did not answer
+/// ([`crate::renewal`]).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum QueueMessage {
+    /// `{"renewalAdvert": "<the payment's prefix>"}`.
+    RenewalAdvert(RenewalAdvert),
+    /// An R2 event notification.
+    R2(R2EventMessage),
+}
+
+/// The re-submit of a renewed advert: the payment prefix its `renewals` row
+/// is recorded under (the row holds the advert's bytes).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RenewalAdvert {
+    pub renewal_advert: String,
+}
+
 /// Queue-consumer entry point. Called once per batch by the
 /// `#[event(queue)]` handler in `lib.rs`.
 ///
 /// Each message is processed independently. Successes and deliberate
 /// skips are ack'd; transient failures are retried (CF Queue re-delivers
 /// up to `max_retries` times, configured in `wrangler.toml`).
-pub async fn handle_batch(batch: MessageBatch<R2EventMessage>, env: &Env) {
+pub async fn handle_batch(batch: MessageBatch<QueueMessage>, env: &Env) {
     for msg_result in batch.iter() {
         let msg = match msg_result {
             Ok(m) => m,
@@ -168,7 +190,17 @@ pub async fn handle_batch(batch: MessageBatch<R2EventMessage>, env: &Env) {
             }
         };
 
-        let event = msg.body();
+        let event = match msg.body() {
+            QueueMessage::RenewalAdvert(r) => {
+                if crate::pass::deliver(env, &r.renewal_advert).await {
+                    msg.retry();
+                } else {
+                    msg.ack();
+                }
+                continue;
+            }
+            QueueMessage::R2(event) => event,
+        };
         match process_message(event, env).await {
             ProcessOutcome::Advertised => {
                 console_log!(
@@ -267,18 +299,17 @@ pub async fn process_message(event: &R2EventMessage, env: &Env) -> ProcessOutcom
     };
 
     // ── Dup-advert guard ──────────────────────────────────────────────────
-    // `/renew` extends the object's `custom-time` via a same-key copy
-    // (`storage::custom_time`), and that copy re-fires this object-create
-    // event. Without a guard we'd mint a second on-chain advert for an
-    // object whose renewed advert already exists. Ground truth lives in the
-    // wallet: skip when an unexpired, unspent advert for this object
-    // already covers the object's custom-time horizon. Checking the wallet
-    // (rather than a metadata marker stamped by the copy) also makes advert
-    // creation idempotent under CF Queues' at-least-once redelivery and
-    // under client re-PUTs through a still-valid presigned URL — any event
-    // whose advert already exists is skipped regardless of who wrote the
-    // object. Runs BEFORE the full-body SHA-256 so renewal copies never pay
-    // the memory-heavy hash.
+    // `/renew` writes nothing to the stored object, so a renewal fires no
+    // object-create event. The events that reach this guard for an object
+    // that already has an advert are CF Queues' at-least-once redelivery
+    // and a client's re-PUT through a still-valid presigned URL; both carry
+    // the object's ORIGINAL custom-time (the upload's expiry plus the
+    // 300 s buffer). The advert minted from that event has exactly that
+    // expiry, and a renewal only moves the advert's expiry later
+    // (`prevExpiry + minutes * 60`), so the file's current advert, the
+    // original or the renewed one, reaches `custom-time − 300` while it is
+    // unexpired and unspent. Ground truth lives in the wallet: skip when
+    // such an advert exists. Runs BEFORE the full-body SHA-256.
     match advert_already_covers(env, object_identifier, expiry_time).await {
         Ok(true) => {
             console_log!(
@@ -488,6 +519,63 @@ mod tests {
     use super::*;
 
     // ── R2EventMessage parsing (pure JSON, no runtime) ────────────────────
+
+    #[test]
+    fn the_queue_reads_an_r2_event_and_a_renewal_re_submit_apart() {
+        let event = r#"{"action":"PutObject","bucket":"uhrp-prod","object":{"key":"cdn/a"}}"#;
+        assert!(matches!(
+            serde_json::from_str::<QueueMessage>(event).unwrap(),
+            QueueMessage::R2(_)
+        ));
+        let resubmit = serde_json::to_string(&QueueMessage::RenewalAdvert(RenewalAdvert {
+            renewal_advert: "prefix-1".into(),
+        }))
+        .unwrap();
+        assert_eq!(resubmit, r#"{"renewalAdvert":"prefix-1"}"#);
+        assert_eq!(
+            serde_json::from_str::<QueueMessage>(&resubmit).unwrap(),
+            QueueMessage::RenewalAdvert(RenewalAdvert {
+                renewal_advert: "prefix-1".into()
+            })
+        );
+        // An event that also names the field is still read as an event.
+        let both =
+            r#"{"renewalAdvert":"p","action":"PutObject","bucket":"b","object":{"key":"cdn/a"}}"#;
+        assert!(matches!(
+            serde_json::from_str::<QueueMessage>(both).unwrap(),
+            QueueMessage::R2(_)
+        ));
+    }
+
+    #[test]
+    fn the_guard_still_skips_a_redelivered_upload_event_after_a_renewal() {
+        // The upload's advert expires at its custom-time (minted from the
+        // event); a renewal spends it and the renewed advert expires later.
+        // A redelivered or re-PUT event carries the original custom-time.
+        let custom_time = 2_000_000_000u64;
+        let now = 1_900_000_000u64;
+        let renewed = OutputItem {
+            satoshis: 1,
+            outpoint: crate::wallet::types::Outpoint {
+                txid: "00".repeat(32),
+                vout: 0,
+            },
+            spendable: true,
+            tags: Some(vec![format!("expiry_time_{}", custom_time + 30 * 60)]),
+            locking_script: None,
+        };
+        let spent_original = OutputItem {
+            spendable: false,
+            tags: Some(vec![format!("expiry_time_{custom_time}")]),
+            ..renewed.clone()
+        };
+        assert!(covering_advert_exists(
+            &[spent_original.clone(), renewed],
+            custom_time,
+            now
+        ));
+        assert!(!covering_advert_exists(&[spent_original], custom_time, now));
+    }
 
     #[test]
     fn parses_real_r2_put_event() {

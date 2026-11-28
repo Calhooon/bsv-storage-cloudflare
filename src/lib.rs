@@ -58,7 +58,9 @@ pub mod claims;
 mod error;
 mod health;
 mod overlay;
+mod pass;
 mod queue;
+mod renewal;
 mod routes;
 mod storage;
 mod types;
@@ -441,25 +443,60 @@ async fn paid_route(paid: Paid<'_>, route: PaidRoute, request_body: &[u8]) -> Re
         }
     }
     let identity_key = &auth_context.identity_key;
-    let ((body, status), granted) = match route {
+    let payment_txid = won.as_ref().map(|w| w.txid.as_str());
+    let ((body, status), granted, renewed) = match route {
         PaidRoute::Upload => {
-            routes::upload::handle_granting(request_body, identity_key, price, env).await
+            let (answer, granted) =
+                routes::upload::handle_granting(request_body, identity_key, price, env).await;
+            (answer, granted, None)
         }
         PaidRoute::Renew(prepared) => {
             let granted = prepared.granted();
-            let (body, status) =
-                routes::renew::handle(request_body, identity_key, price, prepared, env).await;
+            let renewed = routes::renew::handle(
+                request_body,
+                identity_key,
+                price,
+                prepared,
+                payment_txid,
+                env,
+            )
+            .await;
+            // Served is the take of the renewing transaction, and nothing
+            // else.
+            let served = renewed
+                .step
+                .as_ref()
+                .is_some_and(|step| step.outcome == renewal::Outcome::Taken);
+            let new_expiry = renewed.step.as_ref().and_then(|step| step.new_expiry);
             let granted = granted.map(|mut g| {
-                g.expiry_time = body["newExpiryTime"].as_u64();
+                g.expiry_time = if served { new_expiry } else { None };
                 g
             });
-            ((body, status), granted)
+            (
+                (renewed.body, renewed.status),
+                granted,
+                Some((served, renewed.step)),
+            )
         }
     };
     if let (Some(won), Some(db)) = (&won, grants_db) {
         let granted = granted.unwrap_or_default();
-        if let Err(e) = claims::grants::answered(db, won, status, &granted).await {
+        let written = match &renewed {
+            // `/renew`: `granted` when served; a taken payment with no
+            // renewal stays `paid`, its answer recorded.
+            Some((served, _)) => {
+                let state = if *served { "granted" } else { "paid" };
+                claims::grants::answered_as(db, won, state, status, &granted).await
+            }
+            None => claims::grants::answered(db, won, status, &granted).await,
+        };
+        if let Err(e) = written {
             console_error!("{path}: the grant's second write failed: {e}");
+        }
+        if let Some((_, Some(step))) = &renewed {
+            if let Err(e) = pass::record(env, db, &won.prefix, &won.txid, step).await {
+                console_error!("{path}: the renewal's record failed: {e}");
+            }
         }
     }
     match session {
@@ -653,7 +690,7 @@ async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
 /// per-message ack API exists to avoid.
 #[event(queue)]
 async fn queue_handler(
-    batch: MessageBatch<queue::R2EventMessage>,
+    batch: MessageBatch<queue::QueueMessage>,
     env: Env,
     _ctx: Context,
 ) -> Result<()> {
@@ -662,10 +699,32 @@ async fn queue_handler(
     Ok(())
 }
 
+/// The hourly pass (`wrangler.toml` `[triggers] crons`): the paid `/renew`'s
+/// rows that wait on the overlay or on the wallet's word, at most
+/// `renewal::PASS_ROWS` a run ([`pass::run`]). The Worker's only scheduled
+/// act.
+#[event(scheduled)]
+async fn hourly_pass(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
+    init_panic_hook();
+    pass::run(&env).await;
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    #[test]
+    fn a_renewal_is_granted_only_at_the_take_and_never_refused() {
+        let source = include_str!("lib.rs");
+        let route = &source[source.find("async fn paid_route(").unwrap()..];
+        let route = &route[..route.find("\n}\n").unwrap()];
+        let renew = &route[route.find("PaidRoute::Renew(prepared) =>").unwrap()..];
+        assert!(renew.contains("step.outcome == renewal::Outcome::Taken"));
+        assert!(renew.contains("let state = if *served { \"granted\" } else { \"paid\" };"));
+        assert!(!renew.contains("\"refused\""));
+        assert!(renew.contains("pass::record(env, db, &won.prefix, &won.txid, step)"));
+    }
 
     // ── #31: typed middleware errors → JSON with the TS status codes ──────
     //

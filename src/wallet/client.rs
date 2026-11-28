@@ -39,7 +39,8 @@ use worker::Env;
 use crate::error::{ERR_BEEF_PARSE, ERR_WALLET_AUTH_FAILED, ERR_WALLET_UNAVAILABLE};
 use crate::wallet::types::{
     AbortActionRequest, AbortActionResult, CreateActionRequest, CreateActionResult,
-    ListOutputsRequest, ListOutputsResult, ProcessActionRequest, ProcessActionResult,
+    FindProvenTxReqsRequest, ListOutputsRequest, ListOutputsResult, ProcessActionRequest,
+    ProcessActionResult, ProvenTxReqRow,
 };
 
 /// Env var name for the wallet-infra endpoint URL. Overridable per-deploy
@@ -206,6 +207,53 @@ impl<'a> Wallet<'a> {
         serde_json::from_value(value).map_err(|_| ERR_BEEF_PARSE)
     }
 
+    /// `createAction`, its failure kept as the wallet's answer or as no
+    /// answer ([`RpcFailure`]).
+    pub async fn create_action_answered(
+        &self,
+        req: &CreateActionRequest,
+    ) -> Result<CreateActionResult, RpcFailure> {
+        let value = self.call("createAction", req).await?;
+        serde_json::from_value(value).map_err(|e| RpcFailure::NoAnswer(e.to_string()))
+    }
+
+    /// `processAction`, its failure kept as the wallet's answer or as no
+    /// answer ([`RpcFailure`]).
+    pub async fn process_action_answered(
+        &self,
+        req: &ProcessActionRequest,
+    ) -> Result<ProcessActionResult, RpcFailure> {
+        let value = self.call("processAction", req).await?;
+        serde_json::from_value(value).map_err(|e| RpcFailure::NoAnswer(e.to_string()))
+    }
+
+    /// `findProvenTxReqs` for one transaction: the wallet's broadcast
+    /// requests for `txid`, each with its status word. One read of the
+    /// wallet storage server's `proven_tx_reqs` table; it makes and sends
+    /// nothing.
+    pub async fn find_proven_tx_reqs(&self, txid: &str) -> Result<Vec<ProvenTxReqRow>, RpcFailure> {
+        let req = FindProvenTxReqsRequest {
+            txids: vec![txid.to_string()],
+        };
+        let value = self.call("findProvenTxReqs", &req).await?;
+        serde_json::from_value(value).map_err(|e| RpcFailure::NoAnswer(e.to_string()))
+    }
+
+    /// One authenticated JSON-RPC call whose failure is read as
+    /// [`RpcFailure`]: the wallet's own error answer, or no answer.
+    async fn call<T: serde::Serialize>(&self, method: &str, args: &T) -> Result<Value, RpcFailure> {
+        let args = serde_json::to_value(args).map_err(|e| RpcFailure::NoAnswer(e.to_string()))?;
+        let mut client = self.make_storage_client();
+        client
+            .rpc_call::<Value>(method, vec![json!({}), args])
+            .await
+            .map_err(|e| {
+                let s = e.to_string();
+                worker::console_error!("wallet-infra {method} raw error: {s}");
+                RpcFailure::read(&s)
+            })
+    }
+
     /// Execute one authenticated JSON-RPC call and return the `result`
     /// field as a `Value`.
     ///
@@ -226,6 +274,53 @@ impl<'a> Wallet<'a> {
                 worker::console_error!("wallet-infra {} raw error: {}", method, s);
                 classify_rpc_error(&s)
             })
+    }
+}
+
+/// How a wallet call failed.
+///
+/// The middleware's client (`WorkerStorageClient::rpc_call`) writes a
+/// JSON-RPC error object the server answered as `RPC error: JSON-RPC error
+/// <code>: <message>` (or `JSON-RPC error (<name>): …`, `JSON-RPC error: …`
+/// when the object has no code); every other failure (the fetch, a non-2xx
+/// HTTP status, an unreadable body, a mismatched id) has no such words.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RpcFailure {
+    /// The wallet storage server answered the call with an error object:
+    /// its JSON-RPC code, when it carried one, and its message.
+    Refused { code: Option<i32>, message: String },
+    /// No answer from the wallet was read.
+    NoAnswer(String),
+}
+
+impl RpcFailure {
+    /// Read the middleware client's error text.
+    #[must_use]
+    pub fn read(text: &str) -> Self {
+        const ANSWERED: &str = "RPC error: JSON-RPC error";
+        let Some(at) = text.find(ANSWERED) else {
+            return Self::NoAnswer(text.to_string());
+        };
+        let rest = &text[at + ANSWERED.len()..];
+        if let Some(coded) = rest.strip_prefix(' ') {
+            if let Some((code, message)) = coded.split_once(": ") {
+                if let Ok(code) = code.trim().parse::<i32>() {
+                    return Self::Refused {
+                        code: Some(code),
+                        message: message.to_string(),
+                    };
+                }
+            }
+        }
+        let message = rest
+            .split_once(": ")
+            .map(|(_, m)| m)
+            .unwrap_or(rest)
+            .to_string();
+        Self::Refused {
+            code: None,
+            message,
+        }
     }
 }
 
@@ -270,6 +365,39 @@ mod tests {
             classify_rpc_error("ERR_INVALID_AUTH"),
             ERR_WALLET_AUTH_FAILED
         );
+    }
+
+    #[test]
+    fn a_wallet_error_object_is_its_answer_and_anything_else_is_none() {
+        // wallet-infra v0.7.8 answers createAction's explicit input it cannot
+        // lock with -32602 (src/storage/create_action.rs:309-312, the code
+        // from src/door/errors.rs:19); the middleware's client writes the
+        // error object as `RPC error: JSON-RPC error <code>: <message>`.
+        assert_eq!(
+            RpcFailure::read("Transport error: RPC error: JSON-RPC error -32602: createAction: explicit input ab.0 is unavailable (already spent or locked by transaction_id 7)"),
+            RpcFailure::Refused {
+                code: Some(-32602),
+                message: "createAction: explicit input ab.0 is unavailable (already spent or locked by transaction_id 7)".into(),
+            }
+        );
+        assert_eq!(
+            RpcFailure::read("RPC error: JSON-RPC error (TypeError): bad"),
+            RpcFailure::Refused {
+                code: None,
+                message: "bad".into(),
+            }
+        );
+        for none in [
+            "Transport error: Fetch error: network down",
+            "Transport error: Storage server returned 500: internal",
+            "Serialization error: Failed to parse RPC response: x - body: y",
+            "Transport error: RPC response ID mismatch: expected 1, got 2",
+        ] {
+            assert!(
+                matches!(RpcFailure::read(none), RpcFailure::NoAnswer(_)),
+                "{none}"
+            );
+        }
     }
 
     #[test]
