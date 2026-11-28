@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.3.4 (unreleased)
+## 0.3.4 (2026-11-28)
 
 - bsv-rs `0.8.15` (a caret requirement, the floor): the release the
   published advisories GHSA-f2rq-878r-pgxv, GHSA-jx5m-j63r-7fgw,
@@ -13,6 +13,9 @@
   `build.crates` names 0.3.4 and 0.8.15.
 - No source change (the version guard in `src/health.rs`'s test only), no
   binding, wrangler or route change, and no stored-data migration.
+- The advertisement figure of 0.3.3 (`ADVERT_BEEF_MAX_BYTES`, 614,400 bytes)
+  was read again at this pin and stays as it is; it is read again at each
+  bsv-rs pin of this crate.
 
 ## 0.3.3 (2026-11-28)
 
