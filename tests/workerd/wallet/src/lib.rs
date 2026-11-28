@@ -26,14 +26,22 @@
 //! - knobs (`/knob?create=&process=&overlay=`, each empty for the normal
 //!   answer): `createAction` refuses as a spent advert does (`spent`) or
 //!   answers a template the Worker cannot sign (`unsignable`), or holds its
-//!   answer 1.5 s with the advert locked (`hold`);
-//!   `processAction` refuses the call (`refuse`), answers `failed`, records
-//!   the transaction and answers no result (`lost`, an HTTP 500), or
-//!   records it untaken (`untaken`: `sending`, its request `unsent`); the
-//!   overlay refuses (`refuse`: no output admitted) or faults (`fault`: a
-//!   503). The outpoint `createAction` spends is locked in the isolate, so
-//!   of two renewals of one advert at once one spends it and the other is
-//!   refused as a spent advert;
+//!   answer 1.5 s with the advert locked (`hold`), or orders two renewals of
+//!   one advert (`gate`: the createAction that locks the advert answers once
+//!   another createAction of it has met the lock, and the re-read
+//!   `listOutputs` after that refusal answers once the lock is gone);
+//!   `processAction` refuses the call by name before recording anything
+//!   (`refuse`), answers `failed` (its request `invalid`), records the
+//!   transaction and answers no result (`lost`, an HTTP 500), records it
+//!   untaken (`untaken`: `sending`, its request `unsent`), or records it
+//!   taken and answers the refusal of a transaction already processed
+//!   (`processed`: its request `unmined`, the error `-32602` "Cannot process
+//!   transaction with status 'unmined'…"); the overlay refuses in its error
+//!   shape (`refuse`: a 400 `{"status": "error", "message": …}`), answers an
+//!   empty admission (`empty`), or faults (`fault`: a 503). The outpoint
+//!   `createAction` spends is locked in the isolate, so of two renewals of
+//!   one advert at once one spends it and the other is refused as a spent
+//!   advert;
 //! - the overlay: `/submit` admits output 0 (and counts it), `/lookup`
 //!   answers no outputs.
 
@@ -48,6 +56,34 @@ thread_local! {
     /// stand-in, so a check and an insert here are one step).
     static LOCKED: std::cell::RefCell<std::collections::HashSet<String>> =
         std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+thread_local! {
+    /// The adverts (by tag) of which a createAction met the lock.
+    static REFUSED: std::cell::RefCell<std::collections::HashSet<String>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+fn refused(tag: &str) {
+    REFUSED.with(|r| r.borrow_mut().insert(tag.to_string()));
+}
+
+fn was_refused(tag: &str) -> bool {
+    REFUSED.with(|r| r.borrow().contains(tag))
+}
+
+fn is_locked(outpoint: &str) -> bool {
+    LOCKED.with(|l| l.borrow().contains(outpoint))
+}
+
+/// Wait, 50 ms at a time and 20 s at most, until `done`.
+async fn wait_until(done: impl Fn() -> bool) {
+    for _ in 0..400 {
+        if done() {
+            return;
+        }
+        Delay::from(std::time::Duration::from_millis(50)).await;
+    }
 }
 
 /// Lock `outpoint` for an action; false when another holds it.
@@ -174,7 +210,12 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             kv.put("submit", n.to_string())?.execute().await?;
             return match knob(&kv, "overlay").await?.as_str() {
                 "fault" => Response::error("the stand-in overlay is down", 503),
-                "refuse" => Response::from_json(
+                "refuse" => Ok(Response::from_json(&json!({
+                    "status": "error",
+                    "message": "the stand-in overlay does not admit this advert",
+                }))?
+                .with_status(400)),
+                "empty" => Response::from_json(
                     &json!({ "tm_uhrp": { "outputsToAdmit": [], "coinsToRetain": [] } }),
                 ),
                 _ => Response::from_json(
@@ -252,6 +293,13 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 .unwrap_or_default()
                 .to_string();
             bump(&kv, &format!("listOutputs:{tag}")).await?;
+            if knob(&kv, "create").await? == "gate" && was_refused(&tag) {
+                // The re-read after a refusal: answered once the action that
+                // holds the advert is processed or released.
+                let a = get_json(&kv, &format!("advert:{tag}")).await?;
+                let held = format!("{}.{}", a["txid"].as_str().unwrap_or_default(), a["vout"]);
+                wait_until(|| !is_locked(&held)).await;
+            }
             match get_json(&kv, &format!("advert:{tag}")).await? {
                 Value::Null => Ok(json!({ "totalOutputs": 0, "outputs": [] })),
                 a => Ok(json!({
@@ -284,6 +332,7 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 || format!("{}.{}", a["txid"].as_str().unwrap_or_default(), a["vout"]) != outpoint
                 || !lock(outpoint)
             {
+                refused(&tag);
                 Err(spent(outpoint))
             } else {
                 let reference = format!(
@@ -302,6 +351,11 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                     // The advert stays locked a while: a second renewal of
                     // it meets the lock.
                     Delay::from(std::time::Duration::from_millis(1500)).await;
+                }
+                if create == "gate" {
+                    // The advert stays locked until a second renewal of it
+                    // has met the lock.
+                    wait_until(|| was_refused(&tag)).await;
                 }
                 let mut inputs = vec![json!({
                     "vin": 0,
@@ -344,14 +398,17 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             if a.is_null() || pending.is_null() {
                 Err(json!({ "code": -32000, "message": "no such action" }))
             } else if process == "refuse" {
+                // A refusal by name before anything is recorded.
                 Err(json!({
                     "code": -32602,
-                    "message": "Cannot process transaction with status 'sending'. Must be 'unsigned' or 'unprocessed'",
+                    "message": "processAction: the transaction does not match its action",
                 }))
             } else if process == "failed" {
-                // The wallet's own script verdict releases the inputs.
+                // The wallet's own script verdict releases the inputs and
+                // ends its request `invalid`.
                 unlock(&spent_outpoint);
                 kv.delete(&format!("pending:{reference}")).await?;
+                kv.put(&format!("req:{txid}"), "invalid")?.execute().await?;
                 Ok(
                     json!({ "sendWithResults": [{ "txid": txid, "status": "failed" }], "log": "input 0: script did not succeed" }),
                 )
@@ -376,7 +433,14 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 if process == "lost" {
                     return Response::error("the stand-in wallet lost the answer", 500);
                 }
-                Ok(json!({ "sendWithResults": [{ "txid": txid, "status": "sending" }] }))
+                if process == "processed" {
+                    Err(json!({
+                        "code": -32602,
+                        "message": format!("Cannot process transaction with status '{status}'. Must be 'unsigned' or 'unprocessed'"),
+                    }))
+                } else {
+                    Ok(json!({ "sendWithResults": [{ "txid": txid, "status": "sending" }] }))
+                }
             }
         }
         Some("abortAction") => {

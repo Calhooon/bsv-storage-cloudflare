@@ -57,14 +57,17 @@ served with the overlay admitting (the stored object's etag and upload
 time unchanged), refusing (never submitted again) and faulting (the
 queue's re-submit, four deliveries), not made at `createAction` after the
 one more try, at the signature (the action released) and at
-`processAction` (the signed 500 `ERR_RENEWAL_NOT_MADE`), no word (the
-signed 502 `ERR_RENEWAL_UNCONFIRMED`), and two payers of one file at once,
-both served; the grants and renewals rows recorded in `CLAIMS`, each
+`processAction` (the signed 500 `ERR_RENEWAL_NOT_MADE`), served when
+`processAction` refuses a transaction it already processed and its record
+reads a take, no word (the signed 502 `ERR_RENEWAL_UNCONFIRMED`), and two
+payers of one file at once in the order the stand-in enforces (the second's
+re-read after the first is processed), both served; the grants and renewals rows recorded in `CLAIMS`, each
 `/renew` row read against what the client was served and each `/upload`
 row's expiry against the custom-time it was served; the hourly pass (the
 scheduled handler, fired by hand): the race's waiting rows, each ending of
-each kind, the cap of 20 oldest first, a run with the overlay down, rows of
-other kinds left alone, no stored object touched; and the Worker without its `CLAIMS` binding and
+each kind, the cap of 20 fewest runs first and then oldest, a run with the
+overlay down and the next, a served row's grant left `paid` set `granted`,
+rows of other kinds left alone, no stored object touched; and the Worker without its `CLAIMS` binding and
 with the binding and no tables (two more Workers of the same build): a
 payment to `/upload` or `/renew` is the gate's signed 503
 `ERR_PAYMENT_UNAVAILABLE`, nothing served, the wallet not asked; and, on

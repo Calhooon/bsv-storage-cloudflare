@@ -930,9 +930,12 @@ async fn main() {
 /// faulting (the 200, `overlayAdmitted` false; a refusal never submitted
 /// again, a fault re-submitted by the queue, four deliveries in all); a
 /// renewal not made at `createAction` after the one more try, at the
-/// signature (the action released) and at `processAction` (refused, or
-/// `failed`); no word (the answer lost, or the transaction untaken); and
-/// two payers of one file at once, both served. Returns the rows the
+/// signature (the action released) and at `processAction` (refused by name
+/// with no record, or `failed`); served when `processAction` refuses a
+/// transaction it already processed and its record reads a take; no word
+/// (the answer lost, or the transaction untaken); and two payers of one
+/// file at once, in the order the stand-in enforces (the second's re-read
+/// after the first is processed), both served. Returns the rows the
 /// payments not served leave (`renew-paid`), each with the payment's txid
 /// its answer names.
 async fn renew_outcomes(
@@ -1063,7 +1066,8 @@ async fn renew_outcomes(
         );
     }
 
-    // Not made at processAction: refused (the action released), or failed.
+    // Not made at processAction: refused by name with no record of the
+    // transaction (the action released), or failed (its record invalid).
     for (word, released) in [("refuse", 1u64), ("failed", 0)] {
         let (uhrp, tag, expiry) = seed_advert(stand_in, &pk, size).await;
         knob(stand_in, "process", word).await;
@@ -1078,8 +1082,30 @@ async fn renew_outcomes(
         );
     }
 
+    // processAction refuses a transaction it already processed: its record
+    // (a take) decides, and the renewal is served.
+    {
+        let (uhrp, tag, expiry) = seed_advert(stand_in, &pk, size).await;
+        knob(stand_in, "process", "processed").await;
+        let (answer, body, sats) = renew_paid(first, payer, server, &uhrp, minutes).await;
+        knob(stand_in, "process", "").await;
+        assert_eq!(answer, served(), "{body}");
+        assert_eq!(advert(stand_in, &tag).await, (expiry + minutes * 60, 1, 1));
+        assert_eq!(releases(stand_in, &tag).await, 0);
+        let renewing = advert_raw(stand_in, &tag).await["advert"]["txid"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(finds(stand_in, &renewing).await, 1);
+        granted.push(grant(&uhrp, expiry + minutes * 60, sats, "admitted"));
+        println!(
+            "/renew with processAction refusing a transaction it already processed: its record read once (unmined), the signed 200; no release"
+        );
+    }
+
     // No word: the answer lost, or the transaction not taken.
-    for (word, asked) in [("lost", 0u64), ("untaken", 1)] {
+    // After any answer that is not a take, the record is read once.
+    for (word, asked) in [("lost", 1u64), ("untaken", 1)] {
         let (uhrp, tag, expiry) = seed_advert(stand_in, &pk, size).await;
         knob(stand_in, "process", word).await;
         let (answer, body, sats) = renew_paid(first, payer, server, &uhrp, minutes).await;
@@ -1107,7 +1133,8 @@ async fn renew_outcomes(
         );
     }
 
-    // Two payers of one file at once: both served, two extensions.
+    // Two payers of one file at once, in the order the stand-in enforces:
+    // both served, two extensions.
     {
         let (uhrp, tag, expiry) = seed_advert(stand_in, &pk, size).await;
         let body = json!({ "uhrpUrl": uhrp, "additionalMinutes": minutes }).to_string();
@@ -1117,9 +1144,10 @@ async fn renew_outcomes(
             let (prefix, sats) = quote_on(c, "/renew", &body).await;
             headers.push((payment(payer, server, &prefix, sats).0, sats));
         }
-        // createAction holds the advert locked 1.5 s: the second payer's
-        // createAction meets the first's lock.
-        knob(stand_in, "create", "hold").await;
+        // The stand-in orders the two: the createAction that locks the advert
+        // answers once the other's createAction has met the lock, and the
+        // other's re-read answers once the first is processed.
+        knob(stand_in, "create", "gate").await;
         let answers = futures_join(two.iter().zip(headers.iter()).map(|(c, (h, _))| {
             let (c, h, b) = (c.clone(), h.clone(), body.clone());
             async move { pay_on(&c, "/renew", &b, &h).await }
@@ -1141,7 +1169,7 @@ async fn renew_outcomes(
             granted.push(grant(&uhrp, *expiry, *sats, "admitted"));
         }
         println!(
-            "two payers of one file at once: both served (expiry {expiry} -> {one} -> {both}); createAction 3 (the second payer's one more try), processAction 2"
+            "two payers of one file at once, the second's re-read after the first is processed: both served (expiry {expiry} -> {one} -> {both}); createAction 3 (the second payer's one more try), processAction 2"
         );
     }
     paid_rows
