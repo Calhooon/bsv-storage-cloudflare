@@ -164,10 +164,17 @@ transaction can take the prefix.
 
 Each paid `/renew` whose renewing step ran has a `renewals` row under the
 payment's prefix (migration `0002_renewals.sql`, applied before the deploy
-as above): `payment_txid`, `renewing_txid`, `outcome` (`served`,
-`not_made`, `no_word`), `advert` (`admitted`, `not_admitted`, `refused`,
-`stopped`, or null when the advert has no duty), `runs`, `reason` (the
-overlay's), `new_expiry_time`, `advert_beef` (base64 of the renewed
+as above). The row is written, with the outcome `no_word`, before the
+renewing transaction is handed to the wallet, and settled once the route
+has the wallet's word; a request that ends between the two leaves it
+`no_word` for the pass. Its columns: `payment_txid`, `renewing_txid`,
+`outcome` (`served`, `not_made`, `no_word`), `advert` (`admitted`,
+`not_admitted`, `refused`, `stopped`, or null when the advert has no
+duty), `runs`, `reason` (the overlay's last answer that was not an
+admission, its kind first: `no answer: …`, `no answer within the
+deadline`, `HTTP <status>`, `not an admission: …`, `an empty admission:
+…`; for a refusal, `HTTP <status>: <the overlay's message>`),
+`new_expiry_time`, `advert_beef` (base64 of the renewed
 advert's Atomic BEEF, kept up to 512 KiB), `queued_until`, `queue_tries`,
 `created_at`, `updated_at`.
 
@@ -186,16 +193,25 @@ the wallet is not asked about a `no_word` row. Those rows then wait for an
 operator; the pass takes them from its first run after a deploy with the
 line.
 
-A run reads at most 20 rows, oldest
-first, of two kinds and touches each once: a row `not_admitted` whose
+A run reads at most 20 rows, fewest `runs` first and then oldest, so rows
+that keep faulting do not hold newer ones back, and touches each once: a
+served row whose grant still reads `paid` (the grant's second write did not
+land) has its grant set `granted`; a row `not_admitted` whose
 `queued_until` is null or past gets one submit of its advert to the
 overlay; a row `no_word` whose grant is `paid` gets one `findProvenTxReqs`
 question to the wallet for its `renewing_txid` (a take grants it and
 submits its advert in the same run). A fault or no word adds one to
-`runs`; at 72 runs the row is `stopped`. An overlay or a wallet that is
-down costs at most 20 of its calls an hour (a wallet call is a BRC-103
-handshake and one request). The pass makes and signs no transaction and
-touches no stored object.
+`runs`; at 72 runs the row is `stopped`. The overlay's answer is a refusal
+only when it answers a 400 or 422 in its error shape; every other answer
+is a fault and is tried again within these bounds.
+
+What the pass sends out, at most, in an hour: 20 submits to this
+deployment's overlay (the `OVERLAY_SUBMIT_URL` host, through the `OVERLAY`
+binding when it is bound), and 20 questions to the wallet (a wallet call
+is a BRC-103 handshake and one request). A row the overlay admits is then
+announced once to the other hosts, as any renewal's advert is (the SHIP
+fan-out: the trackers' lookups and the hosts they name). The pass makes
+and signs no transaction and touches no stored object.
 
 The rows waiting on an operator, and the not-made renewals (payments taken
 with no renewal served):

@@ -539,18 +539,30 @@ storage.bucket(GCP_BUCKET_NAME).file(`cdn/${objectIdentifier}`).setMetadata({
 2. The payment door: the 402, the claim, `internalizeAction`, the grant row
    `paid`.
 3. The renewing step: `createAction` spending the old advert, the
-   signature, `processAction` with `isNoSend: false`, `isDelayed: false`.
-   The wallet's answer for the renewing txid decides; a `sending` answer is
-   followed by one `findProvenTxReqs` read of that txid's broadcast
-   request. `createAction` refusing the advert as unavailable gets one
-   re-read of the current advert and one more try; a failure after
-   `createAction` and before `processAction`, or `processAction` refused
-   with an answer, is followed by the release of the action in the wallet.
+   signature, the Atomic BEEF; then the renewal's `renewals` row (the
+   payment's txid, the renewing txid, the advert's bytes, the outcome
+   `no_word`), and only then `processAction` with `isNoSend: false`,
+   `isDelayed: false`. If the row cannot be written the transaction is not
+   handed over and the renewal is not made. After any answer of
+   `processAction` that is not a take, one `findProvenTxReqs` read of the
+   renewing txid; the wallet's record decides when there is one (`unmined`,
+   `completed`: taken; `failed`, `doubleSpend`, `invalid`, `invalidTx`: not
+   made); with no record, a `-32602` or `-32001` refusal is not made and
+   anything else is no word. `createAction` refusing the advert as
+   unavailable gets one re-read of the current advert and, when it names
+   the same stored object at an expiry not lower than the first attempt's,
+   one more try, so that two payers of one file at once can both be
+   served; the second is served when that try's transaction is taken. A
+   failure after `createAction` and before `processAction`, or a refusal by
+   name with no record of the txid, is followed by the release of the
+   action in the wallet.
 4. Taken: the signed 200 `{status, prevExpiryTime, newExpiryTime, amount,
    overlayAdmitted}` and the grant `granted`. The renewed advert is then
-   submitted to the overlay (`tm_uhrp`); `overlayAdmitted` says whether it
-   admitted it. A refusal is recorded with its reason; a fault puts one
-   re-submit on the post-upload queue, then the hourly pass.
+   submitted to the overlay (`tm_uhrp`); `overlayAdmitted` is true when the
+   overlay's admission names the advert's output. A 400 or 422 in the
+   overlay's error shape is a refusal, recorded with its reason; every
+   other answer is a fault and puts one re-submit on the post-upload queue,
+   then the hourly pass.
 5. Not made: `500 ERR_RENEWAL_NOT_MADE`; no word: `502
    ERR_RENEWAL_UNCONFIRMED`. Each names `paymentTxid` and keeps the grant
    `paid`, with a `renewals` row.

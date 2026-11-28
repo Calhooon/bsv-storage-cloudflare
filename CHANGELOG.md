@@ -23,42 +23,63 @@ and reset a row.
   (no byte of it is read): a missing object, or one whose size differs from
   the advert's content length, is a free `404 ERR_FILE_NOT_FOUND`, nothing
   claimed and the wallet not asked to take a payment. After the payment
-  door, the renewing step (`createAction`, the signature, `processAction`
-  with `isNoSend: false` and `isDelayed: false`) is read by the wallet's
-  answer for the renewing txid; a `sending` answer is followed by one
-  `findProvenTxReqs` read of that txid's broadcast request. Three outcomes:
-  - **taken** (`unmined` or `completed`; `unproven` in `sendWithResults`;
-    `success` in `notDelayedResults`): the signed 200 and the grant
-    `granted`;
-  - **not made** (the call refused with a `-32602` or `-32001` answer;
-    `failed`; `doubleSpend`, `invalid`, `invalidTx`):
-    `500 ERR_RENEWAL_NOT_MADE`, "The payment was taken. The renewal was not
+  door, the renewing step: `createAction`, the signature, the Atomic BEEF;
+  then the renewal's row in `renewals` (the payment's txid, the renewing
+  txid, the advert's bytes, the outcome `no_word`); then `processAction`
+  with `isNoSend: false` and `isDelayed: false`. If the row cannot be
+  written, the renewing transaction is not handed to the wallet: the action
+  is released and the answer is the not-made one. A request that ends at
+  any point after `processAction` leaves that row for the pass.
+- **The wallet's record decides.** After any answer of `processAction`
+  that is not a take (`unproven` in `sendWithResults`, `success` in
+  `notDelayedResults`), an error included, the route reads the wallet's
+  record of the renewing txid once (`findProvenTxReqs`). Three outcomes:
+  - **taken** (the answer names a take, or the record reads `unmined` or
+    `completed`): the signed 200 and the grant `granted`;
+  - **not made** (the record reads `failed`, `doubleSpend`, `invalid` or
+    `invalidTx`; or the call was refused with a `-32602` or `-32001` error
+    and the wallet holds no record of the txid): `500
+    ERR_RENEWAL_NOT_MADE`, "The payment was taken. The renewal was not
     made. It is recorded under <txid>. A new payment renews the file.";
-  - **no word** (no answer read, any other word, or no result for the
-    txid): `502 ERR_RENEWAL_UNCONFIRMED`, "The payment was taken. This host
-    has no word yet that the renewing transaction was sent. It is recorded
-    under <txid>."
-  Both non-2xx answers carry `paymentTxid`, the payment's transaction, and
-  keep the grant `paid` with its `status` and `answered_at`; the reference
+  - **no word** (everything else: another word, no record after any other
+    answer, the read itself failing): `502 ERR_RENEWAL_UNCONFIRMED`, "The
+    payment was taken. This host has no word yet that the renewing
+    transaction was sent. It is recorded under <txid>."
+  The wallet's refusal of a transaction it has already processed ("Cannot
+  process transaction with status …") is decided by its record. Both
+  non-2xx answers carry `paymentTxid`, the payment's transaction, and keep
+  the grant `paid` with its `status` and `answered_at`; the reference
   client sends neither answer again by itself. The same payment presented
   again is the signed `409 ERR_PAYMENT_REPLAYED`.
 - **The new field.** The 200 is `{status, prevExpiryTime, newExpiryTime,
-  amount, overlayAdmitted}`: `overlayAdmitted` is `true` when the overlay
-  admitted the renewed advert, submitted after the take within 10 s.
-  Otherwise the renewal is still served: an overlay that answers it does
-  not admit the advert is recorded with its reason and never submitted
-  again by the Worker; a fault (no answer, a 5xx, 408, 429, the deadline)
-  puts one re-submit message on the post-upload queue, delivered at most
-  four times (`max_retries = 3`), 30 s apart, then the hourly pass.
+  amount, overlayAdmitted}`: `overlayAdmitted` is `true` when the overlay's
+  admission, to the submit made after the take within 10 s, names the
+  renewed advert's output for `tm_uhrp`. Otherwise the renewal is still
+  served. The overlay's answer is read in three kinds: **admitted** (a 2xx
+  admission naming the advert's output); **refused** (a 400 or 422 in the
+  overlay's error shape, `{"status": "error", "message": …}`, not marked
+  retryable), recorded with its reason and never submitted again by the
+  Worker; **a fault**, every other answer (none, the deadline, a 5xx, 408,
+  429, any other 4xx, a 2xx that is not an admission, an admission that
+  does not name the advert's output), which puts one re-submit message on
+  the post-upload queue, delivered at most four times (`max_retries = 3`),
+  30 s apart, then the hourly pass. The row's `reason` keeps the last
+  answer that was not an admission, its kind first.
 - **One more try.** When `createAction` refuses the advert as unavailable
-  (spent by another renewal), the route waits 2 s, reads the file's current
-  advert once and runs the renewing step once more from it: two payers of
-  one file at once are both served, two payments and two extensions. No
-  other refusal is tried again, and there is no third try.
+  (spent by another renewal), the route waits 2 s and reads the file's
+  current advert once. When that advert names the same stored object, of
+  the same size, at an expiry not lower than the first attempt's, the
+  renewing step runs once more from it, so that two payers of one file at
+  once can both be served: the second payer is served when that try's
+  renewing transaction is taken, and otherwise gets the answer of a payment
+  taken with no renewal. Another object's advert of the same bytes is
+  never renewed by it. No other refusal is tried again, and there is no
+  third try.
 - **Releasing the action.** A failure after `createAction` and before
-  `processAction` (the signature, the BEEF), and `processAction` refused
-  with an answer, release the action in the wallet, and with it the old
-  advert.
+  `processAction` (the signature, the BEEF, the row), and `processAction`
+  refused with a `-32602` or `-32001` error while the wallet holds no
+  record of the txid, release the action in the wallet, and with it the
+  old advert.
 - **The stored object.** `/renew` reads and writes no byte of it; its
   custom time is the one `/upload` set, and the term of record is the
   advert's expiry and the grant's. The queue's duplicate-advert guard reads
@@ -72,19 +93,28 @@ and reset a row.
   512 KiB), the queue's window and count; and its index. It alters neither
   `payment_claims` nor `payment_grants`, and `0001` is unchanged.
 - **A new scheduled act: the hourly pass** (`crons = ["0 * * * *"]`). At
-  most 20 rows a run, oldest first, each touched once: an advert not
-  admitted gets one submit (admitted; refused, kept with its reason and
-  never tried again; a fault adds a run); a `paid` grant whose renewal has
-  no word gets one `findProvenTxReqs` question for its renewing txid (a
-  take grants it and submits its advert in the same run; a failure makes
-  it `not_made`; no word adds a run). At 72 runs a row is `stopped` and
-  listed until an operator resets it. The pass makes and signs no
-  transaction, touches no stored object and no row of another kind, and
-  no request waits on it.
-- **Tests.** Native tests for the wallet's words one by one, the answers'
-  texts, the pass's steps, its statements on SQLite (the cap, the order,
-  each ending, and 0.3.3's statements on a migrated database) and source
-  tests that `/renew` and the pass touch no stored object. `tests/workerd`:
+  most 20 rows a run, fewest runs first and then oldest, each touched once:
+  a served row whose grant still reads `paid` has its grant set `granted`;
+  an advert not admitted gets one submit (admitted; refused, kept with its
+  reason and never tried again; a fault adds a run); a `paid` grant whose
+  renewal has no word gets one `findProvenTxReqs` question for its
+  renewing txid (a take grants it and submits its advert in the same run;
+  a failure makes it `not_made`; no word adds a run). At 72 runs a row is
+  `stopped` and listed until an operator resets it. So the pass makes at
+  most 20 submits an hour to this deployment's overlay (the
+  `OVERLAY_SUBMIT_URL` host, through the `OVERLAY` binding when it is
+  bound); a row the overlay admits is then announced once to the other
+  hosts, as any renewal's advert is (the SHIP fan-out). The pass makes and
+  signs no transaction, touches no stored object and no row of another
+  kind, and no request waits on it.
+- **Tests.** Native tests for the wallet's words one by one and the
+  decision table, the overlay's answers by kind, the answers' texts, the
+  one more try's rule for two adverts of the same bytes, the pass's steps,
+  its statements on SQLite (the cap, the order by runs, each ending, a
+  request cut after `processAction` and its row settled by the pass, a
+  served row's grant set `granted`, and 0.3.3's statements on a migrated
+  database) and source tests that `/renew` writes the row before
+  `processAction` and that `/renew` and the pass touch no stored object. `tests/workerd`:
   the stand-in's knobs (`/knob?create=&process=&overlay=`), the object it
   seeds for each advert, the release of an action and `findProvenTxReqs`, and the
   cases above; its second stage fires the scheduled handler. The `workerd`
