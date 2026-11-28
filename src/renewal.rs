@@ -65,6 +65,10 @@ pub const PASS_RUNS: i64 = 72;
 /// `max_retries = 3` (wrangler.toml) and the first delivery.
 pub const QUEUE_DELIVERIES: i64 = 4;
 
+/// The wait before the queue delivers a re-submit again, in seconds: four
+/// deliveries span about a minute and a half.
+pub const RESUBMIT_DELAY_SECONDS: u32 = 30;
+
 /// How long a row whose re-submit is on the queue is left to the queue
 /// before the pass takes it (seconds). The queue's four deliveries end well
 /// inside it.
@@ -680,6 +684,18 @@ mod tests {
         let consumers = &wrangler[wrangler.find("[[queues.consumers]]").unwrap()..];
         assert!(consumers.contains("\nmax_retries = 3\n"));
         assert_eq!(QUEUE_DELIVERIES, 3 + 1);
+        // The consumer asks for the delay on every re-delivery.
+        let queue = include_str!("queue/mod.rs");
+        let arm = &queue[queue.find("QueueMessage::RenewalAdvert(r) =>").unwrap()..];
+        let arm = &arm[..arm.find("continue;").unwrap()];
+        assert!(arm.contains("with_delay_seconds(crate::renewal::RESUBMIT_DELAY_SECONDS)"));
+        assert!(!arm.contains("msg.retry()"));
+        // Four deliveries end well inside the window the pass leaves them.
+        const {
+            assert!(
+                (QUEUE_DELIVERIES as u32 * RESUBMIT_DELAY_SECONDS) < QUEUE_WINDOW_SECONDS as u32
+            )
+        };
     }
 
     #[test]

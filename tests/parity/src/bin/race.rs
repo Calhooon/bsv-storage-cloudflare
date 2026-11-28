@@ -1007,7 +1007,7 @@ async fn renew_outcomes(
         assert_eq!(body["overlayAdmitted"], false, "{body}");
         assert_eq!(advert(stand_in, &tag).await, (expiry + minutes * 60, 1, 1));
         let mut waited = 0;
-        while submits(stand_in).await < before + 5 && waited < 120 {
+        while submits(stand_in).await < before + 5 && waited < 240 {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             waited += 1;
         }

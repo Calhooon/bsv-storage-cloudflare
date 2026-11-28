@@ -49,7 +49,7 @@ order, the cron line and the statements that list and reset a row.
   not admit the advert is recorded with its reason and never submitted
   again by the Worker; a fault (no answer, a 5xx, 408, 429, the deadline)
   puts one re-submit message on the post-upload queue, delivered at most
-  four times (`max_retries = 3`), then the hourly pass.
+  four times (`max_retries = 3`), 30 s apart, then the hourly pass.
 - **The stored object.** `/renew` reads and writes no byte of it; its
   custom time is the one `/upload` set, and the term of record is the
   advert's expiry and the grant's. The queue's duplicate-advert guard reads

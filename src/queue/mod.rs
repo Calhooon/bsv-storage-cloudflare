@@ -193,7 +193,11 @@ pub async fn handle_batch(batch: MessageBatch<QueueMessage>, env: &Env) {
         let event = match msg.body() {
             QueueMessage::RenewalAdvert(r) => {
                 if crate::pass::deliver(env, &r.renewal_advert).await {
-                    msg.retry();
+                    msg.retry_with_options(
+                        &worker::QueueRetryOptionsBuilder::new()
+                            .with_delay_seconds(crate::renewal::RESUBMIT_DELAY_SECONDS)
+                            .build(),
+                    );
                 } else {
                     msg.ack();
                 }
