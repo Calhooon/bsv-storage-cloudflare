@@ -66,7 +66,7 @@ import { resolve, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { readFileSync, readdirSync } from 'node:fs'
 import { randomBytes } from 'node:crypto'
-import { spawnSync } from 'node:child_process'
+import { spawn } from 'node:child_process'
 import assert from 'node:assert/strict'
 
 const { Miniflare, Log, LogLevel } = await import(process.env.MINIFLARE_MODULE ?? 'miniflare')
@@ -348,7 +348,18 @@ async function workerStage() {
     log(`the storage Worker under test: ${JSON.stringify(health.build.crates)}`)
     const old = await (await fetch(`${urls['storage-old']}/health`)).json()
     log(`the old build beside it: ${JSON.stringify(old.build.crates)}`)
-    const run = spawnSync(raceBin, [urls.storage, urls['storage-old'], urls.wallet, urls['storage-no-binding'], urls['storage-no-table']], { encoding: 'utf8', timeout: 15 * 60 * 1000 })
+    // Spawned, not run synchronously: Miniflare's loopback (its log, which
+    // the queue broker awaits after each batch) is served from this
+    // process's event loop while the race runs.
+    const run = await new Promise(done => {
+      const child = spawn(raceBin, [urls.storage, urls['storage-old'], urls.wallet, urls['storage-no-binding'], urls['storage-no-table']], { stdio: ['ignore', 'pipe', 'pipe'] })
+      let stdout = ''
+      let stderr = ''
+      child.stdout.on('data', d => { stdout += d })
+      child.stderr.on('data', d => { stderr += d })
+      const limit = setTimeout(() => child.kill('SIGKILL'), 15 * 60 * 1000)
+      child.on('close', (status, signal) => { clearTimeout(limit); done({ status, signal, stdout, stderr }) })
+    })
     let renewals = null
     let uploads = null
     let unserved = null
