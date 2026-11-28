@@ -14,8 +14,8 @@ crate-type = ["cdylib"]
 path = "src/lib.rs"
 
 [dependencies]
-bsv-middleware-cloudflare = { version = "=0.7.5", features = ["d1-claims"] }
-bsv-middleware-core = { version = "0.4.4", features = ["conformance"] }
+bsv-middleware-cloudflare = { version = "=0.7.8", features = ["d1-claims"] }
+bsv-middleware-core = { version = "0.4.7", features = ["conformance"] }
 worker = { version = "0.8", features = ["d1"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 wasm-bindgen = "0.2"

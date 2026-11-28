@@ -10,11 +10,11 @@ use bsv_middleware_cloudflare::{
     middleware::{
         auth::{handle_cors_preflight, AuthSession},
         payment::payment_headers,
-        process_auth, process_payment_with_storage, sign_json_response, AuthMiddlewareOptions,
-        AuthResult, PaymentMiddlewareOptions, PaymentResult,
+        process_auth_with_body_bounds, process_payment_with_storage, sign_json_response,
+        AuthMiddlewareOptions, AuthResult, PaymentMiddlewareOptions, PaymentResult,
     },
     types::ErrorResponse,
-    AuthCloudflareError,
+    AuthCloudflareError, BodyBounds,
 };
 use bsv_rs::primitives::PrivateKey;
 use bsv_rs::wallet::ProtoWallet;
@@ -36,6 +36,23 @@ const SESSION_TTL_SECONDS: u64 = 3600;
 /// header is refused before it is parsed or decoded, with the middleware's
 /// answer to a payment transaction it cannot read ([`payment_too_large`]).
 pub const PAYMENT_HEADER_MAX: usize = 96 * 1024;
+
+/// The most bytes of a request's body this Worker's auth layer reads before
+/// it authenticates the caller: 2 MiB. The largest authenticated body this
+/// Worker serves is a draft of at most `routes::drafts::MAX_DRAFT_BYTES`
+/// (256 KiB); a payment rides in the `X-BSV-Payment` header, not the body,
+/// and a file goes to the object store through its presigned URL, not
+/// through the Worker. A longer body is answered by the layer: 413
+/// `ERR_AUTH_BODY_TOO_LARGE`.
+pub const AUTH_BODY_MAX_BYTES: u64 = 2 * 1024 * 1024;
+
+/// The auth layer's bounds on this Worker: [`AUTH_BODY_MAX_BYTES`] for one
+/// request; the total held at once in an isolate (503 `ERR_AUTH_BODIES_FULL`
+/// with `Retry-After`) and the read's deadline (408 `ERR_AUTH_BODY_TIMEOUT`)
+/// at the middleware's defaults.
+pub fn auth_body_bounds() -> BodyBounds {
+    BodyBounds::default().with_max_request_body_bytes(AUTH_BODY_MAX_BYTES)
+}
 
 pub mod claims;
 mod error;
@@ -98,7 +115,7 @@ async fn build_signed_402(price: u64, session: &AuthSession, server_key: &str) -
 }
 
 /// BRC-29 payment processing with single-use derivation prefixes: the
-/// middleware's `process_payment_with_storage` (the 0.7.5 door, whose
+/// middleware's `process_payment_with_storage` (the 0.7.8 door, whose
 /// `internalizeAction` request is written once, through
 /// `WorkerStorageClient::internalize_action_with_tx`) over the paid routes'
 /// store ([`claims::PaidPrefixStore`]: the prefix claimed in the `CLAIMS` D1
@@ -306,7 +323,7 @@ async fn paid_route(paid: Paid<'_>, route: PaidRoute, request_body: &[u8]) -> Re
     let header = req.headers().get(payment_headers::PAYMENT).ok().flatten();
     let store = match claims::paid_store(env) {
         Ok(store) => store,
-        // `process_auth` has already used `AUTH_SESSIONS`, so this is a
+        // The auth layer has already used `AUTH_SESSIONS`, so this is a
         // config-drift backstop, not a reachable client path.
         Err(e) => {
             return middleware_error_response(
@@ -475,10 +492,14 @@ async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
         return Ok(add_cors_headers(resp));
     }
 
-    // /quote is unauthenticated per PROTOCOL.md §1.
+    // /quote is unauthenticated per PROTOCOL.md §1. Its body is read up to
+    // `routes::quote::QUOTE_BODY_MAX_BYTES`; a longer one is a 413 before
+    // any of it is parsed.
     if method == Method::Post && path == "/quote" {
-        let body = req.bytes().await?;
-        let (body, status) = routes::quote::handle(&body, &env).await;
+        let (body, status) = match routes::quote::read_body(&req).await? {
+            Some(body) => routes::quote::handle(&body, &env).await,
+            None => routes::quote::body_too_large(),
+        };
         let resp = Response::from_json(&body)?.with_status(status);
         return Ok(add_cors_headers(resp));
     }
@@ -500,10 +521,13 @@ async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
     // never the runtime's unsigned plaintext 500. No session exists on these
     // paths, so the body is stable unsigned JSON (the same posture as the
     // middleware's no-auth-headers 401, which mirrors the live TS servers).
-    let auth_result = match process_auth(req, &env, &auth_options).await {
-        Ok(result) => result,
-        Err(e) => return middleware_error_response(&e, None),
-    };
+    // The layer's own answers to a body it does not read (413, 503 with
+    // `Retry-After`, 408) are `AuthResult::Response`, returned as they are.
+    let auth_result =
+        match process_auth_with_body_bounds(req, &env, &auth_options, auth_body_bounds()).await {
+            Ok(result) => result,
+            Err(e) => return middleware_error_response(&e, None),
+        };
 
     let (auth_context, req, session, request_body) = match auth_result {
         AuthResult::Authenticated {
@@ -748,5 +772,84 @@ mod tests {
         let run = &run[..run.find("\n}\n").unwrap()];
         assert!(run.contains("PaymentResult::Required(header_transport_only(r))"));
         assert!(run.contains("PaymentResult::Failed(header_transport_only(r))"));
+    }
+
+    // ── the auth layer's figure for a request's body ─────────────────────
+
+    #[test]
+    fn the_auth_layer_reads_at_most_two_mib_of_a_body_on_this_worker() {
+        use bsv_middleware_cloudflare::core::body_bound::{BodyLedger, BoundedBody};
+        use bsv_middleware_cloudflare::{
+            DEFAULT_BODY_DEADLINE, DEFAULT_MAX_HELD_BODY_BYTES, ERR_AUTH_BODY_TOO_LARGE,
+        };
+        assert_eq!(AUTH_BODY_MAX_BYTES, 2_097_152);
+        let bounds = auth_body_bounds();
+        assert_eq!(bounds.max_request_body_bytes, AUTH_BODY_MAX_BYTES);
+        // The total and the deadline are the middleware's.
+        assert_eq!(bounds.max_held_body_bytes, DEFAULT_MAX_HELD_BODY_BYTES);
+        assert_eq!(bounds.body_deadline, DEFAULT_BODY_DEADLINE);
+        assert!(bounds.max_held_body_bytes >= bounds.max_request_body_bytes);
+        // The largest authenticated body this Worker serves, a draft, is
+        // under the figure with room to spare.
+        assert_eq!(routes::drafts::MAX_DRAFT_BYTES, 256 * 1024);
+        assert!((routes::drafts::MAX_DRAFT_BYTES as u64) * 4 < AUTH_BODY_MAX_BYTES);
+
+        // The layer's reader at this Worker's bounds: a declared length over
+        // the figure is its 413 with nothing read.
+        let ledger = BodyLedger::new();
+        let refusal = BoundedBody::admit(
+            &ledger,
+            Some(AUTH_BODY_MAX_BYTES + 1),
+            bounds.max_request_body_bytes,
+            bounds.max_held_body_bytes,
+        )
+        .unwrap_err();
+        assert_eq!(refusal.status(), 413);
+        assert_eq!(refusal.code(), ERR_AUTH_BODY_TOO_LARGE);
+        assert_eq!(refusal.to_json()["budget"], AUTH_BODY_MAX_BYTES);
+        assert_eq!(ledger.held(), 0);
+        // A body that arrives is read up to exactly the figure, and refused
+        // one byte past it.
+        let mut body = BoundedBody::admit(
+            &ledger,
+            None,
+            bounds.max_request_body_bytes,
+            bounds.max_held_body_bytes,
+        )
+        .unwrap();
+        let chunk = vec![0u8; 64 * 1024];
+        for _ in 0..32 {
+            body.push(&chunk).unwrap();
+        }
+        assert_eq!(body.len() as u64, AUTH_BODY_MAX_BYTES);
+        let refusal = body.push(&[0]).unwrap_err();
+        assert_eq!(refusal.status(), 413);
+        assert_eq!(refusal.code(), ERR_AUTH_BODY_TOO_LARGE);
+        drop(body);
+        assert_eq!(ledger.held(), 0);
+    }
+
+    #[test]
+    fn every_call_of_the_auth_layer_names_this_workers_bounds() {
+        let source = include_str!("lib.rs");
+        let code = &source[..source.find("#[cfg(test)]\nmod tests").unwrap()];
+        let mut calls = Vec::new();
+        let mut rest = code;
+        while let Some(at) = rest.find("process_auth") {
+            let tail = &rest[at..];
+            let name_len = tail
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .unwrap_or(tail.len());
+            if tail[name_len..].starts_with('(') {
+                calls.push(&tail[..name_len]);
+            }
+            rest = &tail[name_len..];
+        }
+        assert_eq!(calls, vec!["process_auth_with_body_bounds"]);
+        assert!(code.contains(
+            "process_auth_with_body_bounds(req, &env, &auth_options, auth_body_bounds())"
+        ));
+        // The layer's answers are returned as they are.
+        assert!(code.contains("AuthResult::Response(response) => return Ok(response),"));
     }
 }

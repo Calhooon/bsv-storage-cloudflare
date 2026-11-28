@@ -6,7 +6,7 @@
 
 use crate::error::{
     ERR_INTERNAL, ERR_INVALID_RETENTION_PERIOD, ERR_INVALID_SIZE, ERR_NO_RETENTION_PERIOD,
-    ERR_NO_SIZE,
+    ERR_NO_SIZE, ERR_QUOTE_TOO_LARGE,
 };
 use crate::types::{ErrorBody, QuoteRequest, QuoteResponse};
 use serde::Deserialize;
@@ -29,6 +29,79 @@ pub(crate) const MIN_SATOSHI_PRICE: u64 = 1000;
 
 /// Hard-coded maximum retention (PROTOCOL.md §1 validation, TS line 69).
 pub(crate) const MAX_RETENTION_MINUTES: f64 = 69_000_000.0;
+
+/// The most bytes of a `/quote` body this Worker reads: 4 KiB. A quote's
+/// request is two JSON numbers, `fileSize` and `retentionPeriod`, under 100
+/// bytes as JSON; the figure leaves room for whitespace and fields the route
+/// does not read. A declared `Content-Length` over it is refused with
+/// nothing read, and the read stops at the chunk that would pass it: 413
+/// [`ERR_QUOTE_TOO_LARGE`] ([`body_too_large`]), before any of the body is
+/// parsed.
+pub(crate) const QUOTE_BODY_MAX_BYTES: usize = 4 * 1024;
+
+/// Whether a declared `Content-Length` is over [`QUOTE_BODY_MAX_BYTES`]. A
+/// value that is not decimal digits is no declared length (the middleware's
+/// reading), and the body is read under the figure as it arrives.
+pub(crate) fn declared_over(content_length: Option<&str>) -> bool {
+    bsv_middleware_cloudflare::core::body_bound::declared_length(content_length)
+        .is_some_and(|n| n > QUOTE_BODY_MAX_BYTES as u64)
+}
+
+/// Whether a chunk of `chunk_len` bytes, after `held` bytes, keeps the body
+/// within [`QUOTE_BODY_MAX_BYTES`].
+pub(crate) fn chunk_fits(held: usize, chunk_len: usize) -> bool {
+    held.saturating_add(chunk_len) <= QUOTE_BODY_MAX_BYTES
+}
+
+/// The answer to a `/quote` body over [`QUOTE_BODY_MAX_BYTES`]: 413 in this
+/// Worker's error shape.
+pub(crate) fn body_too_large() -> (Value, u16) {
+    (
+        json!(ErrorBody::new(
+            ERR_QUOTE_TOO_LARGE,
+            format!("A quote's request is at most {QUOTE_BODY_MAX_BYTES} bytes.")
+        )),
+        413,
+    )
+}
+
+/// Read a `/quote` body within [`QUOTE_BODY_MAX_BYTES`]: `Ok(None)` for a
+/// declared length over the figure (nothing read) or for a body that passes
+/// it (the read cancelled at the chunk that would pass it, that chunk not
+/// copied).
+pub(crate) async fn read_body(req: &Request) -> worker::Result<Option<Vec<u8>>> {
+    use wasm_bindgen::JsCast;
+
+    let declared = req.headers().get("Content-Length").ok().flatten();
+    if declared_over(declared.as_deref()) {
+        return Ok(None);
+    }
+    let Some(stream) = req.inner().body() else {
+        return Ok(Some(Vec::new()));
+    };
+    let reader: worker::web_sys::ReadableStreamDefaultReader = stream
+        .get_reader()
+        .dyn_into()
+        .map_err(|_| worker::Error::from("body reader unavailable"))?;
+    let mut body = Vec::new();
+    loop {
+        let next = wasm_bindgen_futures::JsFuture::from(reader.read()).await?;
+        let done = js_sys::Reflect::get(&next, &"done".into())
+            .ok()
+            .and_then(|d| d.as_bool())
+            .unwrap_or(true);
+        if done {
+            break;
+        }
+        let chunk = js_sys::Uint8Array::new(&js_sys::Reflect::get(&next, &"value".into())?);
+        if !chunk_fits(body.len(), chunk.length() as usize) {
+            let _ = reader.cancel();
+            return Ok(None);
+        }
+        body.extend_from_slice(&chunk.to_vec());
+    }
+    Ok(Some(body))
+}
 
 #[derive(Debug, Deserialize)]
 struct WocRate {
@@ -396,5 +469,76 @@ mod tests {
         let (fs, rp) = validate(&req(Some(1_000_000.0), Some(1440.0)), "0").unwrap();
         assert_eq!(fs, 1_000_000.0);
         assert_eq!(rp, 1440.0);
+    }
+
+    // ── the body's figure ───────────────────────────────────────────────────
+
+    #[test]
+    fn a_quote_body_is_read_up_to_four_kib() {
+        assert_eq!(QUOTE_BODY_MAX_BYTES, 4096);
+        // A quote's honest request is far under the figure.
+        let honest = br#"{"fileSize":11000000000,"retentionPeriod":69000000}"#;
+        assert!(honest.len() < 100);
+        assert!(chunk_fits(0, honest.len()));
+        // Exactly the figure is read, in one chunk or in several.
+        assert!(chunk_fits(0, QUOTE_BODY_MAX_BYTES));
+        assert!(chunk_fits(QUOTE_BODY_MAX_BYTES - 1, 1));
+        // The chunk that would pass it is not kept.
+        assert!(!chunk_fits(0, QUOTE_BODY_MAX_BYTES + 1));
+        assert!(!chunk_fits(QUOTE_BODY_MAX_BYTES, 1));
+        assert!(!chunk_fits(usize::MAX, 1));
+    }
+
+    #[test]
+    fn a_declared_length_over_the_figure_is_refused_unread() {
+        assert!(!declared_over(None));
+        assert!(!declared_over(Some("0")));
+        assert!(!declared_over(Some("4096")));
+        assert!(!declared_over(Some(" 4096 ")));
+        assert!(declared_over(Some("4097")));
+        assert!(declared_over(Some("99999999999999999999999")));
+        // Not decimal digits: no declared length; the read is bounded as the
+        // body arrives.
+        assert!(!declared_over(Some("4097x")));
+        assert!(!declared_over(Some("-1")));
+    }
+
+    #[test]
+    fn a_quote_body_over_the_figure_is_413_in_the_workers_shape() {
+        let (body, status) = body_too_large();
+        assert_eq!(status, 413);
+        assert_eq!(
+            serde_json::to_string(&body).unwrap(),
+            r#"{"status":"error","code":"ERR_QUOTE_TOO_LARGE","description":"A quote's request is at most 4096 bytes."}"#
+        );
+    }
+
+    #[test]
+    fn the_quote_route_reads_its_body_bounded_before_it_parses() {
+        let lib = include_str!("../lib.rs");
+        let route = &lib[lib
+            .find("if method == Method::Post && path == \"/quote\"")
+            .unwrap()..];
+        let route = &route[..route.find("\n    }\n").unwrap()];
+        let read = route.find("routes::quote::read_body(&req).await?").unwrap();
+        let parse = route.find("routes::quote::handle(&body, &env)").unwrap();
+        let refuse = route
+            .find("None => routes::quote::body_too_large()")
+            .unwrap();
+        assert!(read < parse && read < refuse);
+        assert!(!route.contains(".bytes()") && !route.contains(".text()"));
+        // The read: the declared length first, then each chunk's length
+        // before it is copied.
+        let src = include_str!("quote.rs");
+        let reader = &src[src.find("pub(crate) async fn read_body(").unwrap()..];
+        let reader = &reader[..reader.find("\n}\n").unwrap()];
+        let declared = reader.find("declared_over(declared.as_deref())").unwrap();
+        let stream = reader.find("req.inner().body()").unwrap();
+        let fits = reader
+            .find("chunk_fits(body.len(), chunk.length() as usize)")
+            .unwrap();
+        let copy = reader.find("chunk.to_vec()").unwrap();
+        assert!(declared < stream && fits < copy);
+        assert!(reader[fits..copy].contains("reader.cancel()"));
     }
 }

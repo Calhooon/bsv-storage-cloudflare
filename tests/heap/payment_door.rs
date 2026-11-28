@@ -6,7 +6,7 @@
 //! (`PAYMENT_HEADER_MAX`, 96 KiB) is refused before anything is read.
 //!
 //! The paid routes run the middleware's door (bsv-middleware-cloudflare
-//! 0.7.5, core 0.4.4: `process_payment_with_storage`). It parses the
+//! 0.7.8, core 0.4.7: `process_payment_with_storage`). It parses the
 //! header's JSON, verifies the derivation prefix's HMAC, decodes the base64
 //! `transaction`, reads the BEEF's subject alone (`verify_payment_output`:
 //! output 0's script and amount; nothing linked, no script run), takes the
@@ -698,7 +698,7 @@ const HEADER_MAX: usize = 128 * 1024;
 
 /// The paid path's peak heap allowed for a header: the bound the payment
 /// middleware's own heap test holds its door to, from the header's arrival
-/// to the wallet call's send (bsv-middleware-cloudflare 0.7.5:
+/// to the wallet call's send (bsv-middleware-cloudflare 0.7.8:
 /// `middleware/payment_heap_tests.rs`): 1.25 MiB plus 4 bytes per header
 /// byte. The floor is mostly the BRC-29 key derivation, paid on every
 /// header whatever its size.

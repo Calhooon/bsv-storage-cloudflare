@@ -357,8 +357,16 @@ async fn discover_peers_from_tracker(tracker: &str, topic: &str) -> Result<ShipH
 /// The most a tracker's lookup answer may carry. Real `ls_ship` answers
 /// for `tm_uhrp` from the four trackers measure 67 to 417 KB, and up to
 /// 592 KB for any topic (2026-11); a larger answer is skipped as an
-/// unreadable one is.
+/// unreadable one is. The answer is JSON, each BEEF byte written as a
+/// decimal number; each advertisement's BEEF in it is held to
+/// [`ADVERT_BEEF_MAX_BYTES`].
 pub(crate) const LOOKUP_ANSWER_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+/// The most bytes of a SHIP advertisement's BEEF the fan-out parses:
+/// 614,400 (600 KiB), the figure this stack's Workers hold a BEEF they
+/// parse to. A longer one is skipped as an unreadable one is
+/// ([`Skip::Unreadable`]), not parsed. The figure is provisional: it is read again at this crate's next bsv-rs pin and raised to the door's natural figure then.
+pub(crate) const ADVERT_BEEF_MAX_BYTES: usize = 614_400;
 
 /// Append `chunk` to `body` unless the body would pass `cap`.
 pub(crate) fn push_bounded(body: &mut Vec<u8>, chunk: &[u8], cap: usize) -> Result<(), String> {
@@ -413,6 +421,18 @@ async fn read_body_bounded(response: &mut worker::Response, cap: usize) -> Resul
         }
     }
     Ok(body)
+}
+
+/// The subject transaction's output `vout` of an advertisement's BEEF of at
+/// most [`ADVERT_BEEF_MAX_BYTES`]; `None` for a longer one, not parsed.
+pub(crate) fn advert_output(
+    beef_bytes: &[u8],
+    vout: usize,
+) -> Option<bsv_rs::transaction::TransactionOutput> {
+    if beef_bytes.len() > ADVERT_BEEF_MAX_BYTES {
+        return None;
+    }
+    subject_output(beef_bytes, vout)
 }
 
 /// The subject transaction's output `vout`, read without linking its
@@ -561,6 +581,8 @@ pub(crate) fn advertised_origin(advertised: &str) -> Option<String> {
 /// The SHIP hosts a lookup answer names for `topic` ([`ship_host`]). Each
 /// output's subject is read without linking its ancestry
 /// ([`subject_output`]): the fan-out needs the one output, nothing linked.
+/// An output whose BEEF is longer than [`ADVERT_BEEF_MAX_BYTES`] is not
+/// parsed ([`advert_output`]).
 /// An output that names no host is skipped and counted; an answer that is
 /// not JSON is an error, and an answer of another type names none.
 pub(crate) fn ship_hosts_from_lookup_answer(body: &[u8], topic: &str) -> Result<ShipHosts, String> {
@@ -584,7 +606,7 @@ pub(crate) fn ship_hosts_from_lookup_answer(body: &[u8], topic: &str) -> Result<
         return Ok(found);
     }
     for out in answer.outputs {
-        let host = subject_output(&out.beef, out.output_index as usize)
+        let host = advert_output(&out.beef, out.output_index as usize)
             .ok_or(Skip::Unreadable)
             .and_then(|output| ship_host(&output.locking_script, topic));
         match host {
@@ -1092,5 +1114,92 @@ mod tests {
         assert_eq!(body.len(), cap, "a refused chunk is not kept");
         // Real tracker answers are under a seventh of the bound.
         assert_eq!(LOOKUP_ANSWER_MAX_BYTES, 4 * 1024 * 1024);
+    }
+
+    // ── an advertisement's BEEF is held to the figure ───────────────────
+
+    /// The parity fixture's SHIP advert as output 0 of a subject whose one
+    /// parent pads the Atomic BEEF to exactly `len` bytes.
+    fn ship_beef_of(len: usize) -> Vec<u8> {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/parity/fixtures/parity/ship_tm_uhrp.json"
+        ))
+        .unwrap();
+        let ship =
+            hex::decode(fixture["expected"]["locking_script_hex"].as_str().unwrap()).unwrap();
+        let outside = "22".repeat(32);
+        let build = |pad: usize| {
+            let mut outputs = vec![vec![0u8; 60_000]; 10];
+            outputs.push(vec![0u8; pad]);
+            let parent = raw_tx(&[(&outside, 0)], &outputs);
+            let mut beef = bsv_rs::transaction::Beef::new();
+            let parent_id = beef.merge_raw_tx(parent, None).txid();
+            let subject = raw_tx(&[(parent_id.as_str(), 0)], std::slice::from_ref(&ship));
+            let subject_id = beef.merge_raw_tx(subject, None).txid();
+            beef.to_binary_atomic(&subject_id).unwrap()
+        };
+        let base = build(1_000).len();
+        let beef = build(1_000 + len - base);
+        assert_eq!(beef.len(), len);
+        beef
+    }
+
+    /// A lookup answer of one output, written as a tracker writes it.
+    fn answer_of(beef: &[u8], index: u32) -> Vec<u8> {
+        use std::fmt::Write;
+        let mut text = String::from(r#"{"type":"output-list","outputs":[{"beef":["#);
+        for (i, byte) in beef.iter().enumerate() {
+            if i > 0 {
+                text.push(',');
+            }
+            write!(text, "{byte}").unwrap();
+        }
+        write!(text, r#"],"outputIndex":{index}}}]}}"#).unwrap();
+        text.into_bytes()
+    }
+
+    #[test]
+    fn an_advert_beef_is_parsed_up_to_the_figure_and_skipped_past_it() {
+        assert_eq!(ADVERT_BEEF_MAX_BYTES, 614_400);
+        assert!(ADVERT_BEEF_MAX_BYTES < LOOKUP_ANSWER_MAX_BYTES);
+
+        // Exactly the figure: parsed, and its host taken.
+        let at = ship_beef_of(ADVERT_BEEF_MAX_BYTES);
+        let body = answer_of(&at, 0);
+        assert!(body.len() < LOOKUP_ANSWER_MAX_BYTES);
+        let found = hosts(&body);
+        assert_eq!(found.hosts, vec!["https://overlay.example.com".to_string()]);
+        assert!(found.skipped.is_empty());
+
+        // One byte over: the same advert, which reads when parsed, is not
+        // parsed by the fan-out and is skipped as an unreadable one is.
+        let over = ship_beef_of(ADVERT_BEEF_MAX_BYTES + 1);
+        assert!(subject_output(&over, 0).is_some());
+        assert!(advert_output(&over, 0).is_none());
+        let found = hosts(&answer_of(&over, 0));
+        assert!(found.hosts.is_empty());
+        assert_eq!(found.skipped, vec![Skip::Unreadable]);
+        assert_eq!(found.count(Skip::Unreadable), 1);
+    }
+
+    #[test]
+    fn an_ordinary_advert_beef_is_far_under_the_figure() {
+        // One unproven parent and the advert: under a kilobyte.
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/parity/fixtures/parity/ship_tm_uhrp.json"
+        ))
+        .unwrap();
+        let ship =
+            hex::decode(fixture["expected"]["locking_script_hex"].as_str().unwrap()).unwrap();
+        let outside = "33".repeat(32);
+        let parent = raw_tx(&[(&outside, 0)], &[vec![0x51]]);
+        let mut beef = bsv_rs::transaction::Beef::new();
+        let parent_id = beef.merge_raw_tx(parent, None).txid();
+        let subject = raw_tx(&[(parent_id.as_str(), 0)], &[ship]);
+        let subject_id = beef.merge_raw_tx(subject, None).txid();
+        let beef = beef.to_binary_atomic(&subject_id).unwrap();
+        assert!(beef.len() < 1024, "{}", beef.len());
+        let found = hosts(&answer(&[(beef, 0)]));
+        assert_eq!(found.hosts.len(), 1);
     }
 }
