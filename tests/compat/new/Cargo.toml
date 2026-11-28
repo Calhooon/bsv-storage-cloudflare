@@ -2,7 +2,7 @@
 # comparison in ../old_against_new.rs.
 [package]
 name = "new"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 license = "MIT"
 publish = false
@@ -27,4 +27,4 @@ base64 = "0.22"
 sha2 = "0.10"
 hmac = "0.12"
 bsv-middleware-cloudflare = { version = "=0.7.5", features = ["d1-claims"] }
-bsv-rs = { version = "0.8.13", features = ["auth", "wallet", "transaction", "script", "overlay", "wasm"] }
+bsv-rs = { version = "0.8.14", features = ["auth", "wallet", "transaction", "script", "overlay", "wasm"] }

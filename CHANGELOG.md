@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.3.2 (unreleased)
+
+- bsv-rs `0.8.14` (a caret requirement, the floor): it closes, among the
+  published advisories, those reaching the features this crate enables
+  (`auth`, `wallet`, `transaction`, `script`, `overlay`, `wasm`):
+  GHSA-56fp-4337-6vfh, GHSA-wh67-gjx6-4qqh, GHSA-7vx5-cf5p-5c48,
+  GHSA-grrj-gwrr-v7r3, GHSA-63w6-rpmj-r9gg, GHSA-33px-hj7f-4cpj,
+  GHSA-mqr8-3gvc-hhg3, GHSA-fm3p-cmwv-rf6h and GHSA-4gp5-q4cj-4qjf. Every
+  lock moves to it (the root, `tests/heap`, `tests/compat`,
+  `tests/workerd/kit`, `tests/workerd/wallet`); bsv-middleware-cloudflare
+  stays `=0.7.5` (core 0.4.4). `/health`'s `build.crates` names 0.3.2 and
+  0.8.14.
+- CI: every workflow action is pinned at a full commit sha; the test job
+  fetches the locked dependency graph before the tests (`claims_store`
+  reads the middleware's source through an offline `cargo metadata`); the
+  wasm32 job's `worker-build --release` runs `--locked`.
+- No source change (the version guard in `src/health.rs`'s test only), no
+  binding, wrangler or route change, and no stored-data migration.
+
 ## 0.3.1 (2026-11-17)
 
 - The paid routes (`/upload`, `/renew`) claim each payment's derivation

@@ -156,11 +156,11 @@ The [manifest](./Cargo.toml) pins registry dependencies:
 
 | Crate | Exact version |
 |---|---|
-| `bsv-rs` | `0.8.11` (caret) |
-| `bsv-middleware-cloudflare` | `=0.7.4` |
+| `bsv-rs` | `0.8.14` (caret) |
+| `bsv-middleware-cloudflare` | `=0.7.5` |
 | `bsv-worker-build-info` | `=0.1.0` |
 
-The lock resolves middleware core 0.4.3 and holds one bsv-rs. No sibling checkout or path dependency
+The lock resolves middleware core 0.4.4 and holds one bsv-rs. No sibling checkout or path dependency
 is required, as recorded in the [0.2.0 de-path notes](./CHANGELOG.md#020-unreleased-registry-de-path-e0c7971).
 
 ```bash
