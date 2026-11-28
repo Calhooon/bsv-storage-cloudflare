@@ -500,17 +500,32 @@ fn query(url: &worker::Url, name: &str) -> String {
         .unwrap_or_default()
 }
 
+thread_local! {
+    /// Each count as this isolate made it: a bump is one step here, so two
+    /// calls at once are both counted (a key-value read and write is not).
+    static COUNTS: std::cell::RefCell<std::collections::HashMap<String, u64>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
 async fn count(kv: &worker::kv::KvStore, key: &str) -> Result<u64> {
-    Ok(kv
+    let stored = kv
         .get(key)
         .text()
         .await?
         .and_then(|v| v.parse().ok())
-        .unwrap_or(0))
+        .unwrap_or(0);
+    let here = COUNTS.with(|c| c.borrow().get(key).copied().unwrap_or(0));
+    Ok(stored.max(here))
 }
 
 async fn bump(kv: &worker::kv::KvStore, key: &str) -> Result<()> {
-    let n = count(kv, key).await? + 1;
+    let stored = count(kv, key).await?;
+    let n = COUNTS.with(|c| {
+        let mut c = c.borrow_mut();
+        let n = c.entry(key.to_string()).or_insert(0);
+        *n = (*n).max(stored) + 1;
+        *n
+    });
     kv.put(key, n.to_string())?.execute().await?;
     Ok(())
 }
