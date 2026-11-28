@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.3.2 (unreleased)
+## 0.3.2 (2026-11-28)
 
 - bsv-rs `0.8.14` (a caret requirement, the floor): it closes, among the
   published advisories, those reaching the features this crate enables
