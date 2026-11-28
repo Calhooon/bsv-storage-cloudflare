@@ -1,5 +1,54 @@
 # Changelog
 
+## 0.3.3 (2026-11-28)
+
+- bsv-middleware-cloudflare `=0.7.8` (core 0.4.7), still an exact pin;
+  bsv-rs stays `0.8.14`. Every lock moves to it (the root, `tests/heap`,
+  `tests/compat`'s `new`, `tests/workerd/kit`, `tests/workerd/wallet`), and
+  in each lock the two middleware crates alone move. The Worker compiles at
+  the new pins with no change of its own. `/health`'s `build.crates` names
+  0.3.3, 0.7.8 and 0.4.7.
+- The auth layer runs through `process_auth_with_body_bounds` with this
+  Worker's bounds (`auth_body_bounds()`): it reads at most
+  `AUTH_BODY_MAX_BYTES`, 2 MiB, of a request's body before the caller is
+  authenticated, and answers a longer one 413 `ERR_AUTH_BODY_TOO_LARGE`.
+  The largest authenticated body the Worker serves is a draft of at most
+  256 KiB (`MAX_DRAFT_BYTES`); a payment rides in the `X-BSV-Payment`
+  header, and a file goes to the object store through its presigned URL.
+  The total the layer holds at once in an isolate (503
+  `ERR_AUTH_BODIES_FULL` with `Retry-After`) and the read's deadline (408
+  `ERR_AUTH_BODY_TIMEOUT`) are the middleware's defaults. The layer's
+  answers reach the caller as the layer wrote them.
+- `/quote` reads at most `QUOTE_BODY_MAX_BYTES`, 4 KiB, of its body. A
+  quote's request is two JSON numbers, `fileSize` and `retentionPeriod`,
+  under 100 bytes as JSON; the figure leaves room for whitespace and fields
+  the route does not read. A declared `Content-Length` over the figure is
+  refused with nothing read, and the read stops at the chunk that would pass
+  it; both are 413 in the Worker's error shape, before any of the body is
+  parsed:
+  `{"status":"error","code":"ERR_QUOTE_TOO_LARGE","description":"A quote's request is at most 4096 bytes."}`.
+- The paid routes' payment door is the middleware's
+  `process_payment_with_storage`, which answers a payment longer than
+  614,400 bytes 413 `ERR_PAYMENT_SIZE`, not judged; the Worker returns the
+  door's answers as the door wrote them. The Worker's own ceiling on the
+  `X-BSV-Payment` header (96 KiB, read first) carries a payment well under
+  that figure. The Worker maps no payment verification error of its own.
+- The fan-out parses at most `ADVERT_BEEF_MAX_BYTES`, 614,400 bytes, of
+  each SHIP advertisement's BEEF in a tracker's lookup answer; a longer one
+  is skipped and counted as an unreadable one is, not parsed. The lookup
+  answer itself stays bounded at 4 MiB (`LOOKUP_ANSWER_MAX_BYTES`). The
+  figure is provisional: it is read again at this crate's next bsv-rs pin
+  and raised to the door's natural figure then.
+- Tests pin each figure: the auth bounds (2 MiB, the middleware's total and
+  deadline) and the layer's reader at them (a declared length one byte over
+  refused with nothing read; exactly the figure read, one byte more
+  refused), every call of the auth layer naming them, `/quote`'s figure
+  and its refusal before the parse, and an advertisement's BEEF of exactly
+  614,400 bytes read and one of 614,401 skipped. A Worker `Request` cannot
+  be built in a native test, so the auth entry point itself is not called
+  there.
+- No binding, wrangler, route, price or stored-data change.
+
 ## 0.3.2 (2026-11-28)
 
 - bsv-rs `0.8.14` (a caret requirement, the floor): it closes, among the

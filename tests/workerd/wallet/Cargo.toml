@@ -17,7 +17,7 @@ crate-type = ["cdylib"]
 path = "src/lib.rs"
 
 [dependencies]
-bsv-middleware-cloudflare = "=0.7.5"
+bsv-middleware-cloudflare = "=0.7.8"
 worker = "0.8"
 serde_json = { version = "1", features = ["preserve_order"] }
 getrandom = { version = "0.2", features = ["js"] }

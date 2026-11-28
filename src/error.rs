@@ -11,6 +11,9 @@ pub const ERR_UNAUTHORIZED: &str = "ERR_UNAUTHORIZED";
 
 // /quote (§1)
 pub const ERR_NO_SIZE: &str = "ERR_NO_SIZE";
+/// A `/quote` body longer than `routes::quote::QUOTE_BODY_MAX_BYTES`. 413,
+/// like `ERR_DRAFT_TOO_LARGE`.
+pub const ERR_QUOTE_TOO_LARGE: &str = "ERR_QUOTE_TOO_LARGE";
 pub const ERR_NO_RETENTION_PERIOD: &str = "ERR_NO_RETENTION_PERIOD";
 pub const ERR_INVALID_SIZE: &str = "ERR_INVALID_SIZE";
 pub const ERR_INVALID_RETENTION_PERIOD: &str = "ERR_INVALID_RETENTION_PERIOD";
