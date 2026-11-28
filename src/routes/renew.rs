@@ -34,7 +34,7 @@
 //!      third try, and any other refusal is not retried.
 //!    - A failure after `createAction` and before `processAction` (the
 //!      signature, the BEEF), or `processAction` refused with an answer:
-//!      `abortAction` releases the action and the old advert.
+//!      the action is released in the wallet, and with it the old advert.
 //! 3. Taken (a broadcaster took the renewing transaction): served. The
 //!    answer is the signed 200 `{status, prevExpiryTime, newExpiryTime,
 //!    amount, overlayAdmitted}` and the grant is `granted`, whatever
@@ -771,15 +771,15 @@ async fn renew_from(wallet: &Wallet<'_>, env: &Env, ctx: &RenewContext) -> Attem
     }
 }
 
-/// `abortAction` on the wallet's action: its inputs (the old advert, the
+/// Release the wallet's action: its inputs (the old advert, the
 /// change) are released. A failure is logged.
 async fn release(wallet: &Wallet<'_>, reference: &str) {
     let req = AbortActionRequest {
         reference: reference.to_string(),
     };
     match wallet.abort_action(&req).await {
-        Ok(r) => worker::console_log!("renew: abortAction {reference}: aborted={}", r.aborted),
-        Err(e) => worker::console_error!("renew: abortAction {reference} failed: {e}"),
+        Ok(r) => worker::console_log!("renew: the action {reference} released: {}", r.aborted),
+        Err(e) => worker::console_error!("renew: the action {reference} not released: {e}"),
     }
 }
 

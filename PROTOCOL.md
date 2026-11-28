@@ -545,7 +545,7 @@ storage.bucket(GCP_BUCKET_NAME).file(`cdn/${objectIdentifier}`).setMetadata({
    request. `createAction` refusing the advert as unavailable gets one
    re-read of the current advert and one more try; a failure after
    `createAction` and before `processAction`, or `processAction` refused
-   with an answer, is followed by `abortAction`.
+   with an answer, is followed by the release of the action in the wallet.
 4. Taken: the signed 200 `{status, prevExpiryTime, newExpiryTime, amount,
    overlayAdmitted}` and the grant `granted`. The renewed advert is then
    submitted to the overlay (`tm_uhrp`); `overlayAdmitted` says whether it

@@ -40,7 +40,8 @@ order, the cron line and the statements that list and reset a row.
   other refusal is tried again, and there is no third try.
 - **Releasing the action.** A failure after `createAction` and before
   `processAction` (the signature, the BEEF), and `processAction` refused
-  with an answer, call `abortAction`, which releases the old advert.
+  with an answer, release the action in the wallet, and with it the old
+  advert.
 - **The new field.** The 200 is `{status, prevExpiryTime, newExpiryTime,
   amount, overlayAdmitted}`: `overlayAdmitted` is `true` when the overlay
   admitted the renewed advert, submitted after the take within 10 s.
@@ -76,7 +77,7 @@ order, the cron line and the statements that list and reset a row.
   each ending, and 0.3.3's statements on a migrated database) and source
   tests that `/renew` and the pass touch no stored object. `tests/workerd`:
   the stand-in's knobs (`/knob?create=&process=&overlay=`), the object it
-  seeds for each advert, `abortAction` and `findProvenTxReqs`, and the
+  seeds for each advert, the release of an action and `findProvenTxReqs`, and the
   cases above; its second stage fires the scheduled handler. The `workerd`
   job of `ci.yml` builds the Worker, the stand-ins, v0.3.0 and the race
   client, and runs both stages on the hosted runner.

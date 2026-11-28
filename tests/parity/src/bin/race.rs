@@ -359,8 +359,8 @@ async fn advert_raw(stand_in: &str, tag: &str) -> Value {
         .unwrap()
 }
 
-async fn aborts(stand_in: &str, tag: &str) -> u64 {
-    advert_raw(stand_in, tag).await["calls"]["abortAction"]
+async fn releases(stand_in: &str, tag: &str) -> u64 {
+    advert_raw(stand_in, tag).await["calls"]["release"]
         .as_u64()
         .unwrap()
 }
@@ -1051,7 +1051,7 @@ async fn renew_outcomes(
         knob(stand_in, "create", "").await;
         assert_eq!(answer, refused(500, "ERR_RENEWAL_NOT_MADE"), "{body}");
         assert_eq!(advert(stand_in, &tag).await, (expiry, 1, 0));
-        assert_eq!(aborts(stand_in, &tag).await, 1);
+        assert_eq!(releases(stand_in, &tag).await, 1);
         paid_rows.push(json!({ "paymentTxid": body["paymentTxid"], "status": 500, "outcome": "not_made", "renewing": false }));
         // Released: a new payment renews it.
         let (again, body2, sats) = renew_paid(first, payer, server, &uhrp, minutes).await;
@@ -1059,7 +1059,7 @@ async fn renew_outcomes(
         assert_eq!(advert(stand_in, &tag).await, (expiry + minutes * 60, 2, 1));
         granted.push(grant(&uhrp, expiry + minutes * 60, sats, "admitted"));
         println!(
-            "/renew failing at the signature: abortAction once, the signed 500 ERR_RENEWAL_NOT_MADE, no processAction; a new payment then renews the advert"
+            "/renew failing at the signature: the action released once, the signed 500 ERR_RENEWAL_NOT_MADE, no processAction; a new payment then renews the advert"
         );
     }
 
@@ -1071,10 +1071,10 @@ async fn renew_outcomes(
         knob(stand_in, "process", "").await;
         assert_eq!(answer, refused(500, "ERR_RENEWAL_NOT_MADE"), "{body}");
         assert_eq!(advert(stand_in, &tag).await, (expiry, 1, 1));
-        assert_eq!(aborts(stand_in, &tag).await, released);
+        assert_eq!(releases(stand_in, &tag).await, released);
         paid_rows.push(json!({ "paymentTxid": body["paymentTxid"], "status": 500, "outcome": "not_made", "renewing": true }));
         println!(
-            "/renew with processAction {word}: the signed 500 ERR_RENEWAL_NOT_MADE; abortAction {released}; the advert unchanged"
+            "/renew with processAction {word}: the signed 500 ERR_RENEWAL_NOT_MADE; actions released {released}; the advert unchanged"
         );
     }
 

@@ -14,8 +14,12 @@ pub mod error;
 
 #[path = "../../../../src/overlay/mod.rs"]
 pub mod overlay;
+#[path = "../../../../src/pass.rs"]
+pub mod pass;
 #[path = "../../../../src/queue/mod.rs"]
 pub mod queue;
+#[path = "../../../../src/renewal.rs"]
+pub mod renewal;
 #[path = "../../../../src/routes/mod.rs"]
 pub mod routes;
 #[path = "../../../../src/storage/mod.rs"]

@@ -445,7 +445,6 @@ mod tests {
         for never in [
             "create_action",
             "process_action",
-            "abort_action",
             "sign_transaction",
             "internalize",
             "head_object",
@@ -456,6 +455,7 @@ mod tests {
         }
         // The wallet is asked one thing.
         assert_eq!(code.matches("wallet.find_proven_tx_reqs(").count(), 1);
+        assert_eq!(code.matches("wallet.").count(), 1);
         // One statement reads the rows, and the loop takes at most the cap.
         assert_eq!(code.matches("renewal::WAITING_SQL").count(), 1);
         assert!(code.contains(".take(renewal::PASS_ROWS as usize)"));

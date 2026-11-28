@@ -16,7 +16,7 @@
 //!   outpoint) and `processAction` records the renewal: the advert moves to
 //!   the new transaction, its script and tags (`GET /advert?tag=` answers
 //!   the advert and how many of each call it saw);
-//!   `abortAction` releases the action's advert; `findProvenTxReqs`
+//!   the release of an action frees its advert; `findProvenTxReqs`
 //!   answers the broadcast request's status the last `processAction` (or
 //!   `POST /req`) set for a transaction (`GET /finds?txid=` counts them);
 //!   `POST /advert` also stores the advert's object (`cdn/<object>`, of
@@ -385,7 +385,7 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 .to_string();
             let pending = get_json(&kv, &format!("pending:{reference}")).await?;
             let tag = pending["tag"].as_str().unwrap_or_default().to_string();
-            bump(&kv, &format!("abortAction:{tag}")).await?;
+            bump(&kv, &format!("release:{tag}")).await?;
             if pending.is_null() {
                 Ok(json!({ "aborted": false }))
             } else {

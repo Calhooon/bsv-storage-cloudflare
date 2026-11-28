@@ -11,7 +11,7 @@ the process, and Miniflare is disposed on every exit path. No deploy.
   storage server (BRC-103/104 through the middleware's `process_auth`;
   `makeAvailable`, `findOrInsertUser`, `internalizeAction`, which it counts
   per transaction and can be told to fail; for `/renew`, `listOutputs`,
-  `createAction`, `processAction`, `abortAction` and `findProvenTxReqs`
+  `createAction`, `processAction`, the release of an action and `findProvenTxReqs`
   over an advert the race client seeds, with its stored object in the R2
   bucket the Worker reads, which it moves to the renewal's transaction and
   counts; its knobs, `/knob?create=&process=&overlay=`, make `createAction`
