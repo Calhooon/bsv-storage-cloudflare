@@ -572,6 +572,7 @@ async fn main() {
         let (prefix, sats) = quote(&first).await;
         let (h, k) = payment(&payer, &server, &prefix, sats);
         assert_eq!(pay(&first, &h).await, served());
+        let old = fresh(old_url, &payer).await;
         let again = pay(&old, &h).await;
         let (h2, k2) = payment(&payer, &server, &prefix, sats);
         let other = pay(&old, &h2).await;
@@ -608,6 +609,7 @@ async fn main() {
     }
     // A wallet error on the old build, then this build.
     {
+        let old = fresh(old_url, &payer).await;
         let (prefix, sats) = quote(&old).await;
         let (h, k) = payment(&payer, &server, &prefix, sats);
         wallet_fails(stand_in, true).await;
@@ -636,6 +638,7 @@ async fn main() {
         wallet_fails(stand_in, false).await;
         assert_eq!(failed, wallet_error);
         let (h2, k2) = payment(&payer, &server, &prefix, sats);
+        let old = fresh(old_url, &payer).await;
         assert_eq!(pay(&old, &h).await, served());
         let old_again = pay(&old, &h).await;
         let old_other = pay(&old, &h2).await;
@@ -819,6 +822,7 @@ async fn main() {
     // signed 503); another transaction meets the fault before the gate (the
     // door's unsigned 503).
     {
+        let old = fresh(old_url, &payer).await;
         let (prefix, sats) = quote(&old).await;
         let (h, k) = payment(&payer, &server, &prefix, sats);
         wallet_fails(stand_in, true).await;
@@ -858,6 +862,7 @@ async fn main() {
             let mut all = Vec::new();
             for _ in 0..rounds {
                 // Released by the old build: a wallet error there.
+                let old = fresh(old_url, &payer).await;
                 let (prefix, sats) = quote(&old).await;
                 let (h, k) = payment(&payer, &server, &prefix, sats);
                 wallet_fails(stand_in, true).await;
@@ -1141,6 +1146,16 @@ async fn renew_outcomes(
         );
     }
     paid_rows
+}
+
+/// A client of `url` with its session open, newer than any other session
+/// of the payer's: the old build answers a request from the payer's most
+/// recent session in the key-value namespace the two builds share, so a
+/// group of requests to it starts with a fresh one.
+async fn fresh(url: &str, payer: &PrivateKey) -> Arc<AuthClient> {
+    let c = client(url, payer).await;
+    c.server_identity_hex().await.unwrap();
+    c
 }
 
 /// `n` clients of `url`, each with its session open.
