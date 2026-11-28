@@ -25,7 +25,8 @@
 //!   time);
 //! - knobs (`/knob?create=&process=&overlay=`, each empty for the normal
 //!   answer): `createAction` refuses as a spent advert does (`spent`) or
-//!   answers a template the Worker cannot sign (`unsignable`);
+//!   answers a template the Worker cannot sign (`unsignable`), or holds its
+//!   answer 1.5 s with the advert locked (`hold`);
 //!   `processAction` refuses the call (`refuse`), answers `failed`, records
 //!   the transaction and answers no result (`lost`, an HTTP 500), or
 //!   records it untaken (`untaken`: `sending`, its request `unsent`); the
@@ -297,6 +298,11 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                     &json!({ "tag": tag, "outpoint": outpoint, "lockingScript": out["lockingScript"], "tags": out["tags"] }),
                 )
                 .await?;
+                if create == "hold" {
+                    // The advert stays locked a while: a second renewal of
+                    // it meets the lock.
+                    Delay::from(std::time::Duration::from_millis(1500)).await;
+                }
                 let mut inputs = vec![json!({
                     "vin": 0,
                     "sourceTxid": a["txid"],

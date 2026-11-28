@@ -1117,11 +1117,15 @@ async fn renew_outcomes(
             let (prefix, sats) = quote_on(c, "/renew", &body).await;
             headers.push((payment(payer, server, &prefix, sats).0, sats));
         }
+        // createAction holds the advert locked 1.5 s: the second payer's
+        // createAction meets the first's lock.
+        knob(stand_in, "create", "hold").await;
         let answers = futures_join(two.iter().zip(headers.iter()).map(|(c, (h, _))| {
             let (c, h, b) = (c.clone(), h.clone(), body.clone());
             async move { pay_on(&c, "/renew", &b, &h).await }
         }))
         .await;
+        knob(stand_in, "create", "").await;
         for (a, v) in &answers {
             assert_eq!(*a, served(), "{v}");
         }
