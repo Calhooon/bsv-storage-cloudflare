@@ -310,6 +310,8 @@ async function workerStage() {
     ...extra,
   })
   const mf = new Miniflare({
+    // The scheduled handler is fired by hand (stage 11).
+    unsafeTriggerHandlers: true,
     workers: [
       storage('storage', resolve(root, 'build/worker'), {
         d1Databases: { CLAIMS: 'claims' },
@@ -430,8 +432,13 @@ async function passStage(mf, urls, db, unserved) {
   const wallet = urls.wallet
   const storageWorker = await mf.getWorker('storage')
   const runPass = async () => {
-    const result = await storageWorker.scheduled({ cron: '0 * * * *' })
-    assert.equal(result.outcome, 'ok', JSON.stringify(result))
+    if (typeof storageWorker.scheduled === 'function') {
+      const result = await storageWorker.scheduled({ cron: '0 * * * *' })
+      assert.equal(result.outcome, 'ok', JSON.stringify(result))
+    } else {
+      const response = await mf.dispatchFetch('http://localhost/cdn-cgi/handler/scheduled?cron=0+*+*+*+*')
+      assert.ok(response.ok, `${response.status} ${await response.text()}`)
+    }
   }
   const knob = q => fetch(`${wallet}/knob?${q}`).then(r => r.json())
   const setReq = (txid, status) => fetch(`${wallet}/req?txid=${txid}&status=${status}`, { method: 'POST' }).then(r => r.json())
