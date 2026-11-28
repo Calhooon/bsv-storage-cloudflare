@@ -130,12 +130,36 @@ pub async fn submit_uhrp_advert(
 /// to one submit, in milliseconds. Past it the submit is a fault.
 pub const ADMISSION_DEADLINE_MS: u64 = 10_000;
 
-/// Submit a `tm_uhrp` advertisement to the overlay and read its answer as
-/// an [`Admission`]: admitted; refused (the overlay answered that it does
-/// not admit it, [`admission_of`]); or a fault (no answer within
-/// `deadline_ms`, a transport failure, a 5xx). After an admission the
-/// mainnet fan-out runs as [`submit_uhrp_advert`]'s does, under the same
-/// deadline, and its outcome is only logged.
+/// The output of a renewing transaction that carries the renewed advert:
+/// `/renew`'s `createAction` names one output, the advert, with
+/// `randomizeOutputs: false`, and the wallet storage server keeps the
+/// caller's outputs at their index and puts change after them
+/// (wallet-infra v0.7.8 `src/storage/create_action.rs:386`, `:514-517`).
+pub const RENEWED_ADVERT_VOUT: u32 = 0;
+
+/// The statuses the overlay answers a refusal of a submit with, in its
+/// error shape: 400 (the reference's `/submit`, ts-stack
+/// `packages/overlays/overlay-express/src/OverlayExpress.ts:3040-3045`, at
+/// 57c5f13055b555b83c1ef368fff3650abd21b6ef) and 422 (a transaction the
+/// network refused, as this deployment's overlay answers it).
+pub const REFUSAL_STATUSES: [u16; 2] = [400, 422];
+
+/// The overlay's answer to one submit, as it came.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubmitAnswer {
+    /// Nothing within the deadline.
+    Deadline,
+    /// No answer was read (a transport failure).
+    NoAnswer(String),
+    /// An HTTP answer: its status and body.
+    Http { status: u16, body: String },
+}
+
+/// Submit a renewed `tm_uhrp` advertisement to the overlay and read its
+/// answer ([`read_admission`]) for the advert's output
+/// [`RENEWED_ADVERT_VOUT`]. After an admission the mainnet fan-out runs as
+/// [`submit_uhrp_advert`]'s does, under the same deadline, and its outcome
+/// is only logged.
 pub async fn admit_uhrp_advert(
     env: &worker::Env,
     overlay_host: &str,
@@ -143,11 +167,15 @@ pub async fn admit_uhrp_advert(
     deadline_ms: u64,
 ) -> Admission {
     let tagged = TaggedBEEF::new(beef.to_vec(), vec![TM_UHRP_TOPIC.to_string()]);
-    let admission = match within(submit_tagged(env, overlay_host, &tagged), deadline_ms).await {
-        None => Admission::Fault("the overlay did not answer within the deadline".to_string()),
-        Some(Ok(())) => Admission::Admitted,
-        Some(Err(e)) => admission_of(&e),
+    let answer = match within(submit_answer(env, overlay_host, &tagged), deadline_ms).await {
+        None => SubmitAnswer::Deadline,
+        Some(Ok((status, body))) => SubmitAnswer::Http { status, body },
+        Some(Err(SubmitError::Transport(why) | SubmitError::Serialize(why))) => {
+            SubmitAnswer::NoAnswer(why)
+        }
+        Some(Err(e)) => SubmitAnswer::NoAnswer(format!("{e:?}")),
     };
+    let admission = read_admission(&answer, TM_UHRP_TOPIC, RENEWED_ADVERT_VOUT);
     if admission == Admission::Admitted
         && within(fan_out_to_mainnet_peers(overlay_host, &tagged), deadline_ms)
             .await
@@ -158,26 +186,66 @@ pub async fn admit_uhrp_advert(
     admission
 }
 
-/// A submit's failure read as the overlay's answer: an answer that it does
-/// not admit the advert (no output admitted for `tm_uhrp`, or a 4xx other
-/// than 408 and 429) is a refusal with its reason; anything else (a
-/// transport failure, a 5xx, 408, 429, a local serialization failure) is a
-/// fault.
+/// Read the overlay's answer to the submit of an advert whose output is
+/// `vout`, for `topic`:
+///
+/// - **admitted**: a 2xx whose body is the overlay's admission (a STEAK)
+///   naming `vout` among the topic's `outputsToAdmit`;
+/// - **refused**: a status in [`REFUSAL_STATUSES`] whose body is the
+///   overlay's error shape, `{"status": "error", "message": …}` (or
+///   `description`), not marked `retryable`; the reason is its message;
+/// - **a fault**, every other answer: none, the deadline, a 5xx, a 408 or
+///   429, any other 4xx or a refusal status without the error shape, a 2xx
+///   that is not an admission, and an admission that does not name `vout`
+///   (the reference's engine answers the same empty admission for a
+///   transaction it admitted nothing of, one it already holds, and a topic
+///   whose check failed: ts-stack `packages/overlays/overlay/src/Engine.ts:349-354`).
+///
+/// A fault's text names its kind first.
 #[must_use]
-pub fn admission_of(e: &SubmitError) -> Admission {
-    match e {
-        SubmitError::NoOutputsAdmitted(body) => {
-            Admission::Refused(reason(&format!("no output admitted for tm_uhrp: {body}")))
+pub fn read_admission(answer: &SubmitAnswer, topic: &str, vout: u32) -> Admission {
+    let (status, body) = match answer {
+        SubmitAnswer::Deadline => {
+            return Admission::Fault("no answer within the deadline".to_string())
         }
-        SubmitError::HttpStatus { status, body }
-            if (400..500).contains(status) && *status != 408 && *status != 429 =>
-        {
-            Admission::Refused(reason(&format!("HTTP {status}: {body}")))
+        SubmitAnswer::NoAnswer(why) => {
+            return Admission::Fault(reason(&format!("no answer: {why}")))
         }
-        SubmitError::HttpStatus { status, .. } => Admission::Fault(format!("HTTP {status}")),
-        SubmitError::Transport(t) => Admission::Fault(reason(t)),
-        SubmitError::Serialize(t) => Admission::Fault(reason(t)),
+        SubmitAnswer::Http { status, body } => (*status, body),
+    };
+    if (200..300).contains(&status) {
+        return match serde_json::from_str::<Steak>(body) {
+            Ok(steak)
+                if steak
+                    .get(topic)
+                    .is_some_and(|a| a.outputs_to_admit.contains(&vout)) =>
+            {
+                Admission::Admitted
+            }
+            Ok(_) => Admission::Fault(reason(&format!("an empty admission: {body}"))),
+            Err(_) => Admission::Fault(reason(&format!("not an admission: HTTP {status}"))),
+        };
     }
+    match refusal_message(body) {
+        Some(message) if REFUSAL_STATUSES.contains(&status) => {
+            Admission::Refused(reason(&format!("HTTP {status}: {message}")))
+        }
+        _ => Admission::Fault(format!("HTTP {status}")),
+    }
+}
+
+/// The message of a body in the overlay's error shape: a JSON object with
+/// `"status": "error"` and a string `message` (or `description`), not marked
+/// `"retryable": true`.
+fn refusal_message(body: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    if value["status"].as_str() != Some("error") || value["retryable"].as_bool() == Some(true) {
+        return None;
+    }
+    value["message"]
+        .as_str()
+        .or_else(|| value["description"].as_str())
+        .map(str::to_string)
 }
 
 /// `fut`'s output, or `None` when `deadline_ms` passes first.
@@ -224,6 +292,17 @@ async fn submit_tagged(
     overlay_host: &str,
     tagged: &TaggedBEEF,
 ) -> Result<(), SubmitError> {
+    let (status, body_text) = submit_answer(env, overlay_host, tagged).await?;
+    read_submit(tagged, status, body_text)
+}
+
+/// POST a [`TaggedBEEF`] to `{overlay_host}/submit` and return the answer's
+/// status and body; an error only when no answer was read.
+async fn submit_answer(
+    env: &worker::Env,
+    overlay_host: &str,
+    tagged: &TaggedBEEF,
+) -> Result<(u16, String), SubmitError> {
     let url = format!("{}/submit", overlay_host.trim_end_matches('/'));
 
     let topics_header =
@@ -267,7 +346,11 @@ async fn submit_tagged(
 
     let status = response.status_code();
     let body_text = response.text().await.unwrap_or_default();
+    Ok((status, body_text))
+}
 
+/// `/advertise`'s and the upload queue's reading of a submit's answer.
+fn read_submit(tagged: &TaggedBEEF, status: u16, body_text: String) -> Result<(), SubmitError> {
     if !(200..300).contains(&status) {
         return Err(SubmitError::HttpStatus {
             status,
@@ -752,40 +835,139 @@ async fn post_beef_to_peer(peer_host: &str, tagged: &TaggedBEEF) -> Result<(), S
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::unwrap_used, clippy::panic)]
     use super::*;
 
-    #[test]
-    fn an_answer_that_it_does_not_admit_is_a_refusal_and_the_rest_a_fault() {
-        let refused = |e: SubmitError| matches!(admission_of(&e), Admission::Refused(_));
-        assert!(refused(SubmitError::NoOutputsAdmitted("{}".into())));
-        for status in [400, 403, 404, 422] {
-            assert!(refused(SubmitError::HttpStatus {
-                status,
-                body: "no".into()
-            }));
+    fn http(status: u16, body: &str) -> SubmitAnswer {
+        SubmitAnswer::Http {
+            status,
+            body: body.to_string(),
         }
-        for status in [408, 429, 500, 502, 503] {
+    }
+
+    fn read(answer: &SubmitAnswer) -> Admission {
+        read_admission(answer, TM_UHRP_TOPIC, RENEWED_ADVERT_VOUT)
+    }
+
+    const ERROR_SHAPE: &str =
+        r#"{"status":"error","message":"the topic manager does not admit it"}"#;
+
+    #[test]
+    fn admitted_only_when_the_admission_names_this_adverts_output() {
+        assert_eq!(RENEWED_ADVERT_VOUT, 0);
+        for status in [200, 201] {
             assert_eq!(
-                admission_of(&SubmitError::HttpStatus {
+                read(&http(
                     status,
-                    body: "b".into()
-                }),
-                Admission::Fault(format!("HTTP {status}"))
+                    r#"{"tm_uhrp":{"outputsToAdmit":[0],"coinsToRetain":[]}}"#
+                )),
+                Admission::Admitted
             );
         }
-        assert!(matches!(
-            admission_of(&SubmitError::Transport("reset".into())),
-            Admission::Fault(_)
-        ));
-        let Admission::Refused(why) = admission_of(&SubmitError::HttpStatus {
-            status: 400,
-            body: "y".repeat(1000),
-        }) else {
+        assert_eq!(
+            read(&http(
+                200,
+                r#"{"tm_uhrp":{"outputsToAdmit":[1,0],"coinsToRetain":[]},"tm_other":{"outputsToAdmit":[],"coinsToRetain":[]}}"#
+            )),
+            Admission::Admitted
+        );
+    }
+
+    #[test]
+    fn refused_only_when_the_overlay_answers_a_refusal_in_its_error_shape() {
+        for status in REFUSAL_STATUSES {
+            assert_eq!(
+                read(&http(status, ERROR_SHAPE)),
+                Admission::Refused(format!(
+                    "HTTP {status}: the topic manager does not admit it"
+                ))
+            );
+        }
+        // The reference's coded shape carries `description`.
+        assert_eq!(
+            read(&http(
+                400,
+                r#"{"status":"error","code":"ERR_SCRIPT_REFUSED","description":"script verification failed"}"#
+            )),
+            Admission::Refused("HTTP 400: script verification failed".into())
+        );
+        // A long reason is cut.
+        let long = format!(r#"{{"status":"error","message":"{}"}}"#, "y".repeat(1000));
+        let Admission::Refused(why) = read(&http(400, &long)) else {
             unreachable!()
         };
         assert_eq!(why.chars().count(), crate::renewal::REASON_MAX_CHARS);
         assert!(why.starts_with("HTTP 400: yy"));
+    }
+
+    /// Every other answer is a fault, its kind first.
+    #[test]
+    fn every_other_answer_is_a_fault_of_its_kind() {
+        let fault = |answer: SubmitAnswer, kind: &str| match read(&answer) {
+            Admission::Fault(why) => assert!(why.starts_with(kind), "{answer:?}: {why}"),
+            other => panic!("{answer:?}: {other:?}"),
+        };
+        // No answer, and the deadline.
+        fault(SubmitAnswer::Deadline, "no answer within the deadline");
+        fault(
+            SubmitAnswer::NoAnswer("connection reset".into()),
+            "no answer: connection reset",
+        );
+        // A 5xx, 408 and 429, with or without the error shape.
+        for status in [500, 502, 503, 504, 408, 429] {
+            fault(http(status, ERROR_SHAPE), &format!("HTTP {status}"));
+            fault(http(status, "down"), &format!("HTTP {status}"));
+        }
+        // Any other 4xx, even in the error shape; a refusal status without it.
+        for status in [401, 403, 404, 405, 409, 413, 421] {
+            fault(http(status, ERROR_SHAPE), &format!("HTTP {status}"));
+        }
+        for body in [
+            "Bad Request",
+            "",
+            r#"{"status":"ok","message":"x"}"#,
+            r#"{"status":"error"}"#,
+            r#"{"status":"error","message":"busy","retryable":true}"#,
+            "<html>error code: 1042</html>",
+        ] {
+            fault(http(400, body), "HTTP 400");
+            fault(http(422, body), "HTTP 422");
+        }
+        // A 2xx that is not an admission.
+        for body in ["", "OK", "[]", r#"{"status":"success"}"#, "<html></html>"] {
+            fault(http(200, body), "not an admission: HTTP 200");
+        }
+        // An empty admission: none for the topic, none of this advert's
+        // output, or no topic at all.
+        for body in [
+            r#"{"tm_uhrp":{"outputsToAdmit":[],"coinsToRetain":[]}}"#,
+            r#"{"tm_uhrp":{"outputsToAdmit":[1],"coinsToRetain":[]}}"#,
+            r#"{"tm_other":{"outputsToAdmit":[0],"coinsToRetain":[]}}"#,
+            "{}",
+        ] {
+            fault(http(200, body), "an empty admission: ");
+        }
+    }
+
+    /// `/advertise` and the upload queue keep their own reading.
+    #[test]
+    fn the_upload_adverts_reading_is_unchanged() {
+        let tagged = TaggedBEEF::new(vec![1], vec![TM_UHRP_TOPIC.to_string()]);
+        assert!(read_submit(&tagged, 200, "OK".into()).is_ok());
+        assert!(read_submit(
+            &tagged,
+            200,
+            r#"{"tm_uhrp":{"outputsToAdmit":[0],"coinsToRetain":[]}}"#.into()
+        )
+        .is_ok());
+        assert!(matches!(
+            read_submit(&tagged, 200, "{}".into()),
+            Err(SubmitError::NoOutputsAdmitted(_))
+        ));
+        assert!(matches!(
+            read_submit(&tagged, 503, "down".into()),
+            Err(SubmitError::HttpStatus { status: 503, .. })
+        ));
     }
 
     #[test]

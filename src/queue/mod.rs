@@ -317,7 +317,7 @@ pub async fn process_message(event: &R2EventMessage, env: &Env) -> ProcessOutcom
     match advert_already_covers(env, object_identifier, expiry_time).await {
         Ok(true) => {
             console_log!(
-                "queue: advert already covers custom-time={expiry_time} key={} — skipping (renewal copy or redelivery)",
+                "queue: advert already covers custom-time={expiry_time} key={} — skipping (an advert of the object stands, or a redelivery)",
                 event.object.key
             );
             return ProcessOutcome::Skipped;
@@ -465,12 +465,13 @@ async fn advert_already_covers(
 /// cover `custom_time_secs`?
 ///
 /// The advert this consumer would mint from the event carries
-/// `expiryTime == custom_time_secs` verbatim (see `process_message`),
-/// while `/renew`'s on-chain expiry EXCLUDES the 300 s buffer that
-/// custom-time carries (`custom-time = newExpiry + 300`). Tolerate the
-/// buffer: any spendable advert whose expiry reaches
-/// `custom_time_secs − 300` — and hasn't already lapsed — covers this
-/// object, so a fresh advert would be a duplicate.
+/// `expiryTime == custom_time_secs` verbatim (see `process_message`); the
+/// custom time is the upload's expiry plus the 300 s buffer
+/// (`custom-time = expiry + 300`), and a `/renew` only moves an advert's
+/// expiry later and writes no custom time. Tolerate the buffer: any
+/// spendable advert whose expiry reaches `custom_time_secs − 300` — and
+/// hasn't already lapsed — covers this object, so a fresh advert would be a
+/// duplicate.
 fn covering_advert_exists(outputs: &[OutputItem], custom_time_secs: u64, now_secs: u64) -> bool {
     let threshold = custom_time_secs.saturating_sub(CUSTOM_TIME_BUFFER_SECONDS);
     outputs.iter().any(|out| {
@@ -752,8 +753,8 @@ mod tests {
 
     #[test]
     fn dup_guard_skips_when_unexpired_advert_covers_custom_time() {
-        // Renewal shape: /renew minted expiry=10_000, then stamped
-        // custom-time = 10_300. The renewed advert covers the copy event.
+        // An advert at the term the custom time was made from: expiry
+        // 10_000, custom-time = 10_300. It covers the event.
         let outputs = vec![advert_output(Some(10_000), true)];
         assert!(covering_advert_exists(&outputs, 10_300, 5_000));
     }
@@ -782,15 +783,16 @@ mod tests {
 
     #[test]
     fn dup_guard_allows_when_advert_below_buffer_threshold() {
-        // Advert expiry short of (custom-time − 300 s buffer): the object
-        // was re-stamped past what's advertised — a new advert is due.
+        // Advert expiry short of (custom-time − 300 s buffer): the object's
+        // term is past what's advertised — a new advert is due.
         let outputs = vec![advert_output(Some(9_999), true)];
         assert!(!covering_advert_exists(&outputs, 10_300, 5_000));
     }
 
     #[test]
     fn dup_guard_tolerates_exactly_the_custom_time_buffer() {
-        // Boundary: expiry == custom-time − 300 (the exact /renew shape).
+        // Boundary: expiry == custom-time − 300 (the term the custom time
+        // was made from).
         let outputs = vec![advert_output(Some(10_000), true)];
         assert!(covering_advert_exists(&outputs, 10_300, 9_999));
     }

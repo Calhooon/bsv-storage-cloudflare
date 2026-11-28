@@ -452,12 +452,23 @@ async fn paid_route(paid: Paid<'_>, route: PaidRoute, request_body: &[u8]) -> Re
         }
         PaidRoute::Renew(prepared) => {
             let granted = prepared.granted();
+            // The renewal's row is opened before its transaction is handed
+            // to the wallet, under the won claim's prefix.
+            let ledger = match (&won, grants_db) {
+                (Some(won), Some(db)) => Some(pass::Ledger {
+                    db,
+                    prefix: &won.prefix,
+                    payment_txid: &won.txid,
+                }),
+                _ => None,
+            };
             let renewed = routes::renew::handle(
                 request_body,
                 identity_key,
                 price,
                 prepared,
                 payment_txid,
+                ledger.as_ref(),
                 env,
             )
             .await;

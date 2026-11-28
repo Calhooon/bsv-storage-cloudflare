@@ -5,49 +5,60 @@
 //!
 //! # The three outcomes of the renewing step
 //!
-//! The renewing transaction is made (`createAction`), signed, and handed to
-//! the wallet storage server with `processAction` (`isNoSend: false`,
-//! `isDelayed: false`: the wallet sends it now). What the wallet says of
-//! that transaction decides the outcome ([`read_process_answer`],
-//! [`read_req_status`]):
+//! The renewing transaction is made (`createAction`) and signed, and its row
+//! is written ([`OPEN_SQL`]: the payment's txid, the renewing txid, the
+//! advert's bytes, the outcome no word) before it is handed to the wallet
+//! storage server with `processAction` (`isNoSend: false`, `isDelayed:
+//! false`: the wallet sends it now). If that row cannot be written the
+//! transaction is not handed over: the action is released and the renewal is
+//! not made. So a request that ends at any later point leaves a row the pass
+//! asks the wallet about.
 //!
-//! - **taken** ([`Outcome::Taken`]): the wallet's word for this txid is that
-//!   a broadcaster took it. The renewal is served: the signed 200, the
-//!   grant `granted`.
-//! - **not made** ([`Outcome::NotMade`]): the wallet refused the call with
-//!   an answer, or its word for this txid is that the transaction failed.
-//!   The grant stays `paid`.
-//! - **no word** ([`Outcome::NoWord`]): no answer was read, the wallet holds
-//!   the transaction to be sent later, its answer names no result for this
-//!   txid, or names one this module does not place. The grant stays `paid`
-//!   and the pass asks the wallet again, once an hour.
+//! What the wallet says of the transaction decides the outcome
+//! ([`read_process_answer`], [`read_record`], [`decide`]):
 //!
+//! - **taken** ([`Outcome::Taken`]): `processAction`'s answer names a take
+//!   for this txid, or the wallet's record of the txid reads one. The
+//!   renewal is served: the signed 200, the grant `granted`.
+//! - **not made** ([`Outcome::NotMade`]): the wallet's record of the txid
+//!   reads a failure, or `processAction` was refused with an error by name
+//!   and the wallet holds no record of the txid. The grant stays `paid`.
+//! - **no word** ([`Outcome::NoWord`]): anything else. The grant stays
+//!   `paid` and the pass asks the wallet again, once an hour.
+//!
+//! After every answer of `processAction` that is not a take (an error, and
+//! no answer, included) the route reads the wallet's record of the txid once
+//! (`findProvenTxReqs`), and a record decides when there is one.
 //! wallet-infra's `processAction` answers a transaction it sends now with
 //! `sendWithResults: [{txid, status: "sending"}]` whether or not the
-//! broadcaster took it (the broadcaster's answer is written to the wallet's
-//! own `proven_tx_reqs` row: `unmined` when it was taken). So a `sending`
-//! word is followed by one read of that row (`findProvenTxReqs`), and the
-//! row's status is the word.
+//! broadcaster took it; the broadcaster's answer is in the record (`unmined`
+//! when it was taken).
 //!
 //! # The overlay's admission, after the take
 //!
 //! Once the renewing transaction is taken the renewal is served, whatever
 //! the overlay answers. The renewed advert is then submitted to the overlay
-//! ([`Admission`]): admitted; refused with an answer (the row is marked
-//! `refused` with the overlay's reason, listed for an operator, and never
-//! submitted again by the Worker); or a fault (no answer, a 5xx, the
-//! deadline), which puts one message on the Worker's queue: the consumer
-//! submits it again, at most [`QUEUE_DELIVERIES`] deliveries in all, and
-//! when those are spent the row stays `not_admitted` for the pass.
+//! and the answer read ([`Admission`], `crate::overlay::read_admission`):
+//! admitted (the overlay's admission names this advert's output for the
+//! topic); refused (the overlay answered the submit with a refusal in its
+//! error shape: the row is marked `refused` with the overlay's reason,
+//! listed for an operator, and never submitted again by the Worker); or a
+//! fault (every other answer, and none), which puts one message on the
+//! Worker's queue: the consumer submits it again, at most
+//! [`QUEUE_DELIVERIES`] deliveries in all, and when those are spent the row
+//! stays `not_admitted` for the pass. The row's `reason` keeps the last
+//! answer that was not an admission, its kind first.
 //!
 //! # The pass
 //!
-//! Once an hour, at most [`PASS_ROWS`] rows, oldest first, each touched once
-//! ([`WAITING_SQL`]): a row `not_admitted` gets one submit of its advert; a
-//! `paid` grant whose outcome is no word gets one question to the wallet for
-//! its renewing txid. A fault, or no word, adds one to the row's `runs`; at
-//! [`PASS_RUNS`] (three days of runs) the row is `stopped`, listed, and left
-//! until an operator resets it (DEPLOYMENT.md).
+//! Once an hour, at most [`PASS_ROWS`] rows, fewest runs first and then
+//! oldest, each touched once ([`WAITING_SQL`]): a row `not_admitted` gets
+//! one submit of its advert; a `paid` grant whose outcome is no word gets
+//! one question to the wallet for its renewing txid; a served row whose
+//! grant still reads `paid` has its grant set `granted`. A fault, or no
+//! word, adds one to the row's `runs`; at [`PASS_RUNS`] (three days of
+//! runs) the row is `stopped`, listed, and left until an operator resets it
+//! (DEPLOYMENT.md).
 
 use serde_json::{json, Value};
 
@@ -112,26 +123,20 @@ impl Outcome {
 /// What `processAction`'s answer says of the renewing transaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessWord {
-    /// The outcome is decided by the answer.
-    Decided(Outcome),
-    /// The call was refused with an answer: nothing was sent, and the
-    /// action is still the wallet's to release.
-    Refused,
-    /// `sending`: the wallet sent it, and the broadcaster's answer is in its
-    /// `proven_tx_reqs` row ([`read_req_status`]).
-    Sending,
+    /// The answer names a take for this txid.
+    Taken,
+    /// The call was refused with an error by name (a code in
+    /// [`REFUSAL_CODES`]).
+    ErrorByName,
+    /// Anything else: another word, no word for this txid, another error, no
+    /// answer.
+    Other,
 }
 
-/// Read `processAction`'s answer for `txid`.
-///
-/// - an error object with a code in [`REFUSAL_CODES`]: [`ProcessWord::Refused`];
-///   any other failure: no word;
-/// - `notDelayedResults` (the reference wallet's broadcast review) naming
-///   `txid`: `success` taken; `doubleSpend`, `invalidTx` not made; any other
-///   word (`serviceError`) no word;
-/// - `sendWithResults` naming `txid`: `unproven` taken; `failed` not made;
-///   `sending` [`ProcessWord::Sending`]; any other word no word;
-/// - neither naming `txid`: no word.
+/// Read `processAction`'s answer for `txid`: `sendWithResults` `unproven`
+/// or `notDelayedResults` `success` for `txid` is [`ProcessWord::Taken`]; an
+/// error object with a code in [`REFUSAL_CODES`] is
+/// [`ProcessWord::ErrorByName`]; everything else is [`ProcessWord::Other`].
 #[must_use]
 pub fn read_process_answer(
     answer: &Result<ProcessActionResult, RpcFailure>,
@@ -141,21 +146,15 @@ pub fn read_process_answer(
         Ok(result) => result,
         Err(RpcFailure::Refused {
             code: Some(code), ..
-        }) if REFUSAL_CODES.contains(code) => return ProcessWord::Refused,
-        Err(_) => return ProcessWord::Decided(Outcome::NoWord),
+        }) if REFUSAL_CODES.contains(code) => return ProcessWord::ErrorByName,
+        Err(_) => return ProcessWord::Other,
     };
-    if let Some(word) = word_for(result.not_delayed_results.as_ref(), txid) {
-        return ProcessWord::Decided(match word.as_str() {
-            "success" => Outcome::Taken,
-            "doubleSpend" | "invalidTx" => Outcome::NotMade,
-            _ => Outcome::NoWord,
-        });
-    }
-    match word_for(result.send_with_results.as_ref(), txid).as_deref() {
-        Some("unproven") => ProcessWord::Decided(Outcome::Taken),
-        Some("failed") => ProcessWord::Decided(Outcome::NotMade),
-        Some("sending") => ProcessWord::Sending,
-        _ => ProcessWord::Decided(Outcome::NoWord),
+    let taken = word_for(result.not_delayed_results.as_ref(), txid).as_deref() == Some("success")
+        || word_for(result.send_with_results.as_ref(), txid).as_deref() == Some("unproven");
+    if taken {
+        ProcessWord::Taken
+    } else {
+        ProcessWord::Other
     }
 }
 
@@ -169,21 +168,66 @@ fn word_for(results: Option<&Value>, txid: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Read the wallet's `proven_tx_reqs` row for `txid` (`findProvenTxReqs`):
-/// `unmined` (a broadcaster took it) and `completed` (proven) taken;
-/// `doubleSpend` and `invalid` not made; any other status (`unsent`,
-/// `sending`, `unprocessed`, …) or no row for `txid`: no word.
+/// The wallet's record of `txid` (`findProvenTxReqs`): the status of its
+/// row, or `None` when the wallet holds no record of `txid`.
+#[must_use]
+pub fn read_record(rows: &[ProvenTxReqRow], txid: &str) -> Option<String> {
+    rows.iter()
+        .find(|r| r.txid == txid)
+        .map(|r| r.status.clone())
+}
+
+/// The record's words that read a take: `unmined` (a broadcaster took it)
+/// and `completed` (proven).
+pub const RECORD_TAKEN: [&str; 2] = ["unmined", "completed"];
+
+/// The record's words that read a failure.
+pub const RECORD_FAILED: [&str; 4] = ["failed", "doubleSpend", "invalid", "invalidTx"];
+
+/// The outcome of the renewing step from `processAction`'s answer and the
+/// one read of the wallet's record (`Err(())` when the read itself failed;
+/// `Ok(None)` when the wallet holds no record of the txid):
+///
+/// | the answer | the record | outcome |
+/// |---|---|---|
+/// | a take | not read | taken |
+/// | any other | reads `unmined` or `completed` | taken |
+/// | any other | reads `failed`, `doubleSpend`, `invalid` or `invalidTx` | not made |
+/// | any other | reads another word | no word |
+/// | an error by name | none for the txid | not made |
+/// | anything else | none for the txid | no word |
+/// | any other | the read failed | no word |
+///
+/// The wallet's refusal of a transaction it has already processed
+/// ("Cannot process transaction with status …") is an error by name, so
+/// its record decides it.
+#[must_use]
+pub fn decide(word: ProcessWord, record: &Result<Option<String>, ()>) -> Outcome {
+    if word == ProcessWord::Taken {
+        return Outcome::Taken;
+    }
+    match record {
+        Ok(Some(status)) if RECORD_TAKEN.contains(&status.as_str()) => Outcome::Taken,
+        Ok(Some(status)) if RECORD_FAILED.contains(&status.as_str()) => Outcome::NotMade,
+        Ok(Some(_)) | Err(()) => Outcome::NoWord,
+        Ok(None) if word == ProcessWord::ErrorByName => Outcome::NotMade,
+        Ok(None) => Outcome::NoWord,
+    }
+}
+
+/// Whether the route releases the action: only when the renewal is not made
+/// because `processAction` was refused by name and the wallet holds no
+/// record of the txid (nothing was processed).
+#[must_use]
+pub fn release_after(word: ProcessWord, record: &Result<Option<String>, ()>) -> bool {
+    word == ProcessWord::ErrorByName && matches!(record, Ok(None))
+}
+
+/// The pass's reading of the wallet's record for `txid`: [`decide`] with no
+/// answer of `processAction` in hand.
 #[must_use]
 pub fn read_req_status(rows: &[ProvenTxReqRow], txid: &str) -> Outcome {
-    match rows
-        .iter()
-        .find(|r| r.txid == txid)
-        .map(|r| r.status.as_str())
-    {
-        Some("unmined" | "completed") => Outcome::Taken,
-        Some("doubleSpend" | "invalid") => Outcome::NotMade,
-        _ => Outcome::NoWord,
-    }
+    decide(ProcessWord::Other, &Ok(read_record(rows, txid)))
 }
 
 /// Whether a `createAction` refusal is the kind a spent advert gives: the
@@ -261,11 +305,12 @@ fn answer_body(code: &str, description: &str, payment_txid: Option<&str>) -> Val
 /// The overlay's answer to one submit of an advert.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Admission {
-    /// It admitted the advert.
+    /// Its admission names this advert's output for the topic.
     Admitted,
-    /// It answered that it does not admit it, with its reason.
+    /// It answered the submit with a refusal in its error shape, with its
+    /// reason.
     Refused(String),
-    /// No answer, a 5xx, or the deadline.
+    /// Every other answer, and none; the text names its kind first.
     Fault(String),
 }
 
@@ -293,12 +338,32 @@ pub const RENEWALS_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS renewals (\
 pub const RENEWALS_INDEX: &str =
     "CREATE INDEX IF NOT EXISTS renewals_by_age ON renewals (created_at, prefix)";
 
-/// A renewal's row, written once after the route answered.
+/// A renewal's row, opened before the renewing transaction is handed to the
+/// wallet (`?1` prefix, `?2` the payment's txid, `?3` the renewing txid,
+/// `?4` the expiry it carries, `?5` its advert's bytes): the outcome no word.
+/// It returns the prefix when the row was written, and nothing when a row of
+/// the prefix stands.
+pub const OPEN_SQL: &str = "INSERT INTO renewals \
+    (prefix, payment_txid, renewing_txid, outcome, advert, reason, new_expiry_time, \
+    advert_beef, queued_until, runs, queue_tries, created_at, updated_at) \
+    VALUES (?1, ?2, ?3, 'no_word', NULL, NULL, ?4, ?5, NULL, 0, 0, unixepoch(), unixepoch()) \
+    ON CONFLICT(prefix) DO NOTHING RETURNING prefix";
+
+/// A renewal's row once the route has its outcome: written when none was
+/// opened (a renewal not made before its transaction was handed over), and
+/// otherwise the opened row settled, while it still reads no word (the pass
+/// may have moved it first; then it is left as the pass wrote it).
 pub const RECORD_SQL: &str = "INSERT INTO renewals \
     (prefix, payment_txid, renewing_txid, outcome, advert, reason, new_expiry_time, \
     advert_beef, queued_until, runs, queue_tries, created_at, updated_at) \
     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, 0, unixepoch(), unixepoch()) \
-    ON CONFLICT(prefix) DO NOTHING";
+    ON CONFLICT(prefix) DO UPDATE SET outcome = excluded.outcome, \
+    advert = excluded.advert, reason = excluded.reason, \
+    renewing_txid = COALESCE(excluded.renewing_txid, renewals.renewing_txid), \
+    new_expiry_time = COALESCE(excluded.new_expiry_time, renewals.new_expiry_time), \
+    advert_beef = COALESCE(excluded.advert_beef, renewals.advert_beef), \
+    queued_until = excluded.queued_until, updated_at = unixepoch() \
+    WHERE renewals.outcome = 'no_word' AND renewals.advert IS NULL";
 
 /// A row whose re-submit could not be put on the queue: the pass takes it.
 pub const UNQUEUED_SQL: &str = "UPDATE renewals SET queued_until = NULL, \
@@ -309,19 +374,28 @@ pub const QUEUE_TRY_SQL: &str = "UPDATE renewals SET queue_tries = queue_tries +
     updated_at = unixepoch() WHERE prefix = ?1 AND advert = 'not_admitted' \
     AND queued_until IS NOT NULL RETURNING queue_tries, advert_beef";
 
+/// The last answer of the overlay that was not an admission, on a
+/// `not_admitted` row (`?2`, its kind first).
+pub const FAULT_SQL: &str = "UPDATE renewals SET reason = ?2, updated_at = unixepoch() \
+    WHERE prefix = ?1 AND advert = 'not_admitted'";
+
 /// The overlay admitted or refused a `not_admitted` row's advert.
 pub const ADMISSION_SQL: &str = "UPDATE renewals SET advert = ?2, reason = ?3, \
     queued_until = NULL, updated_at = unixepoch() WHERE prefix = ?1 \
     AND advert = 'not_admitted'";
 
-/// The rows the pass touches in a run (`?1` is now, in seconds): oldest
-/// first, at most [`PASS_ROWS`].
+/// The rows the pass touches in a run (`?1` is now, in seconds): fewest
+/// runs first, then oldest, at most [`PASS_ROWS`]. Three kinds: an advert
+/// the overlay has not admitted (off the queue); a `paid` grant whose
+/// renewing transaction has no word; a served row whose grant still reads
+/// `paid`.
 pub const WAITING_SQL: &str = "SELECT r.prefix, r.renewing_txid, r.outcome, r.advert, \
-    r.runs, r.new_expiry_time FROM renewals r \
+    r.runs, r.new_expiry_time, r.queued_until, g.state AS grant_state FROM renewals r \
     LEFT JOIN payment_grants g ON g.prefix = r.prefix \
     WHERE (r.advert = 'not_admitted' AND (r.queued_until IS NULL OR r.queued_until <= ?1)) \
     OR (r.outcome = 'no_word' AND r.advert IS NULL AND g.state = 'paid') \
-    ORDER BY r.created_at, r.prefix LIMIT 20";
+    OR (r.outcome = 'served' AND g.state = 'paid') \
+    ORDER BY r.runs, r.created_at, r.prefix LIMIT 20";
 
 /// A row's advert bytes (base64 of the Atomic BEEF).
 pub const BEEF_SQL: &str = "SELECT advert_beef FROM renewals WHERE prefix = ?1";
@@ -339,7 +413,8 @@ pub const WORD_SQL: &str = "UPDATE renewals SET outcome = ?2, advert = ?3, reaso
     queued_until = ?5, runs = 0, updated_at = unixepoch() WHERE prefix = ?1 \
     AND outcome = 'no_word' AND advert IS NULL";
 
-/// A taken renewal's grant, once the pass has the word.
+/// A taken renewal's grant, once the pass has the word, or when its row
+/// reads served and the grant's second write did not land.
 pub const GRANT_SERVED_SQL: &str = "UPDATE payment_grants SET state = 'granted', \
     status = 200, expiry_time = ?2, answered_at = unixepoch() WHERE prefix = ?1 \
     AND state = 'paid'";
@@ -419,23 +494,38 @@ pub fn after_delivery(tries: i64, admission: &Admission) -> (Option<Step>, bool)
     }
 }
 
-/// The two kinds of row the pass touches.
+/// The kinds of row the pass touches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Waiting {
+    /// A served renewal whose grant still reads `paid`: set `granted`.
+    Grant,
     /// A served renewal whose advert the overlay has not admitted.
     Admit,
     /// A `paid` grant whose renewing transaction has no word yet.
     Word,
 }
 
-/// The kind of a row [`WAITING_SQL`] returned.
+/// What the pass does with a row [`WAITING_SQL`] returned, in order:
+/// `queued` is whether its re-submit is still the queue's (`queued_until`
+/// after now).
 #[must_use]
-pub fn waiting(outcome: &str, advert: Option<&str>) -> Option<Waiting> {
-    match (outcome, advert) {
-        (_, Some("not_admitted")) => Some(Waiting::Admit),
-        ("no_word", None) => Some(Waiting::Word),
-        _ => None,
+pub fn waiting(
+    outcome: &str,
+    advert: Option<&str>,
+    grant_state: Option<&str>,
+    queued: bool,
+) -> Vec<Waiting> {
+    let mut kinds = Vec::new();
+    if outcome == "served" && grant_state == Some("paid") {
+        kinds.push(Waiting::Grant);
     }
+    if advert == Some("not_admitted") && !queued {
+        kinds.push(Waiting::Admit);
+    }
+    if outcome == "no_word" && advert.is_none() && grant_state == Some("paid") {
+        kinds.push(Waiting::Word);
+    }
+    kinds
 }
 
 #[cfg(test)]
@@ -457,38 +547,24 @@ mod tests {
         let sw = |status: &str| answer(json!([{ "txid": t, "status": status }]), None);
         assert_eq!(
             read_process_answer(&Ok(sw("unproven")), t),
-            ProcessWord::Decided(Outcome::Taken)
+            ProcessWord::Taken
         );
-        assert_eq!(
-            read_process_answer(&Ok(sw("sending")), t),
-            ProcessWord::Sending
-        );
-        assert_eq!(
-            read_process_answer(&Ok(sw("failed")), t),
-            ProcessWord::Decided(Outcome::NotMade)
-        );
-        for other in ["nosend", "unsent", "Sending", ""] {
+        for other in ["sending", "failed", "nosend", "unsent", "Unproven", ""] {
             assert_eq!(
                 read_process_answer(&Ok(sw(other)), t),
-                ProcessWord::Decided(Outcome::NoWord),
+                ProcessWord::Other,
                 "{other}"
             );
         }
         // A result for another transaction only, or none at all.
         let elsewhere = answer(json!([{ "txid": "bb", "status": "unproven" }]), None);
-        assert_eq!(
-            read_process_answer(&Ok(elsewhere), t),
-            ProcessWord::Decided(Outcome::NoWord)
-        );
+        assert_eq!(read_process_answer(&Ok(elsewhere), t), ProcessWord::Other);
         let empty = ProcessActionResult {
             send_with_results: None,
             not_delayed_results: None,
             log: None,
         };
-        assert_eq!(
-            read_process_answer(&Ok(empty), t),
-            ProcessWord::Decided(Outcome::NoWord)
-        );
+        assert_eq!(read_process_answer(&Ok(empty), t), ProcessWord::Other);
         // The reference wallet's broadcast review.
         let nd = |status: &str| {
             answer(
@@ -498,31 +574,35 @@ mod tests {
         };
         assert_eq!(
             read_process_answer(&Ok(nd("success")), t),
-            ProcessWord::Decided(Outcome::Taken)
+            ProcessWord::Taken
         );
-        for failed in ["doubleSpend", "invalidTx"] {
+        for other in ["doubleSpend", "invalidTx", "serviceError"] {
             assert_eq!(
-                read_process_answer(&Ok(nd(failed)), t),
-                ProcessWord::Decided(Outcome::NotMade)
+                read_process_answer(&Ok(nd(other)), t),
+                ProcessWord::Other,
+                "{other}"
             );
         }
-        assert_eq!(
-            read_process_answer(&Ok(nd("serviceError")), t),
-            ProcessWord::Decided(Outcome::NoWord)
-        );
     }
 
     #[test]
-    fn a_refused_call_and_no_answer() {
+    fn an_error_by_name_and_no_answer() {
         let t = "aa";
-        for code in [-32602, -32001] {
+        for (code, message) in [
+            (-32602, "Cannot process transaction with status 'unmined'"),
+            (
+                -32602,
+                "processAction: the transaction does not match its action",
+            ),
+            (-32001, "not found"),
+        ] {
             let refused = Err(RpcFailure::Refused {
                 code: Some(code),
-                message: "Cannot process transaction with status 'sending'".into(),
+                message: message.into(),
             });
-            assert_eq!(read_process_answer(&refused, t), ProcessWord::Refused);
+            assert_eq!(read_process_answer(&refused, t), ProcessWord::ErrorByName);
         }
-        for none in [
+        for other in [
             RpcFailure::Refused {
                 code: Some(-32603),
                 message: "An internal error has occurred.".into(),
@@ -533,11 +613,79 @@ mod tests {
             },
             RpcFailure::NoAnswer("Fetch error: timed out".into()),
         ] {
-            assert_eq!(
-                read_process_answer(&Err(none), t),
-                ProcessWord::Decided(Outcome::NoWord)
-            );
+            assert_eq!(read_process_answer(&Err(other), t), ProcessWord::Other);
         }
+    }
+
+    /// Every row of [`decide`]'s table, and the release that goes with it.
+    #[test]
+    fn the_decision_table_word_by_word() {
+        let rec = |s: &str| -> Result<Option<String>, ()> { Ok(Some(s.to_string())) };
+        let none: Result<Option<String>, ()> = Ok(None);
+        let unread: Result<Option<String>, ()> = Err(());
+        // A take in the answer serves, whatever the record.
+        for record in [rec("invalid"), none.clone(), unread.clone()] {
+            assert_eq!(decide(ProcessWord::Taken, &record), Outcome::Taken);
+            assert!(!release_after(ProcessWord::Taken, &record));
+        }
+        for word in [ProcessWord::ErrorByName, ProcessWord::Other] {
+            // The record decides when there is one.
+            for taken in ["unmined", "completed"] {
+                assert_eq!(
+                    decide(word, &rec(taken)),
+                    Outcome::Taken,
+                    "{word:?} {taken}"
+                );
+                assert!(!release_after(word, &rec(taken)));
+            }
+            for failed in ["failed", "doubleSpend", "invalid", "invalidTx"] {
+                assert_eq!(
+                    decide(word, &rec(failed)),
+                    Outcome::NotMade,
+                    "{word:?} {failed}"
+                );
+                assert!(!release_after(word, &rec(failed)));
+            }
+            for other in [
+                "unsent",
+                "sending",
+                "unprocessed",
+                "nosend",
+                "unknown",
+                "unfail",
+                "callback",
+                "unconfirmed",
+                "nonfinal",
+                "Unmined",
+                "",
+            ] {
+                assert_eq!(
+                    decide(word, &rec(other)),
+                    Outcome::NoWord,
+                    "{word:?} {other}"
+                );
+                assert!(!release_after(word, &rec(other)));
+            }
+            // The read failed: no word, never a release.
+            assert_eq!(decide(word, &unread), Outcome::NoWord);
+            assert!(!release_after(word, &unread));
+        }
+        // No record: an error by name is not made (and released); anything
+        // else is no word.
+        assert_eq!(decide(ProcessWord::ErrorByName, &none), Outcome::NotMade);
+        assert!(release_after(ProcessWord::ErrorByName, &none));
+        assert_eq!(decide(ProcessWord::Other, &none), Outcome::NoWord);
+        assert!(!release_after(ProcessWord::Other, &none));
+        // The wallet's refusal of a transaction it has already processed is
+        // never not made by itself: its record decides.
+        let processed = Err(RpcFailure::Refused {
+            code: Some(-32602),
+            message: "Cannot process transaction with status 'unmined'. Must be 'unsigned' or 'unprocessed'".into(),
+        });
+        let word = read_process_answer(&processed, "aa");
+        assert_eq!(decide(word, &rec("unmined")), Outcome::Taken);
+        assert_eq!(decide(word, &rec("sending")), Outcome::NoWord);
+        assert_eq!(decide(word, &unread), Outcome::NoWord);
     }
 
     #[test]
@@ -549,14 +697,16 @@ mod tests {
         for (status, outcome) in [
             ("unmined", Outcome::Taken),
             ("completed", Outcome::Taken),
+            ("failed", Outcome::NotMade),
             ("doubleSpend", Outcome::NotMade),
             ("invalid", Outcome::NotMade),
+            ("invalidTx", Outcome::NotMade),
             ("unsent", Outcome::NoWord),
             ("sending", Outcome::NoWord),
             ("unprocessed", Outcome::NoWord),
             ("nosend", Outcome::NoWord),
             ("unknown", Outcome::NoWord),
-            ("failed", Outcome::NoWord),
+            ("made-up", Outcome::NoWord),
         ] {
             assert_eq!(
                 read_req_status(&[row("aa", status)], "aa"),
@@ -569,6 +719,11 @@ mod tests {
             Outcome::NoWord
         );
         assert_eq!(read_req_status(&[], "aa"), Outcome::NoWord);
+        assert_eq!(
+            read_record(&[row("bb", "x"), row("aa", "unsent")], "aa").as_deref(),
+            Some("unsent")
+        );
+        assert_eq!(read_record(&[row("bb", "x")], "aa"), None);
     }
 
     #[test]
@@ -699,26 +854,53 @@ mod tests {
     }
 
     #[test]
-    fn the_pass_reads_twenty_rows_oldest_first_of_two_kinds() {
+    fn the_pass_reads_twenty_rows_fewest_runs_first_of_three_kinds() {
         assert_eq!(PASS_ROWS, 20);
-        assert!(WAITING_SQL.ends_with("ORDER BY r.created_at, r.prefix LIMIT 20"));
+        assert!(WAITING_SQL.ends_with("ORDER BY r.runs, r.created_at, r.prefix LIMIT 20"));
         assert!(WAITING_SQL.contains("r.advert = 'not_admitted'"));
         assert!(
             WAITING_SQL.contains("r.outcome = 'no_word' AND r.advert IS NULL AND g.state = 'paid'")
         );
+        assert!(WAITING_SQL.contains("r.outcome = 'served' AND g.state = 'paid'"));
+        let p = Some("paid");
+        let g = Some("granted");
         assert_eq!(
-            waiting("served", Some("not_admitted")),
-            Some(Waiting::Admit)
+            waiting("served", Some("not_admitted"), g, false),
+            vec![Waiting::Admit]
         );
-        assert_eq!(waiting("no_word", None), Some(Waiting::Word));
-        for (outcome, advert) in [
-            ("served", Some("admitted")),
-            ("served", Some("refused")),
-            ("served", Some("stopped")),
-            ("no_word", Some("stopped")),
-            ("not_made", None),
+        assert_eq!(
+            waiting("served", Some("not_admitted"), g, true),
+            Vec::<Waiting>::new()
+        );
+        assert_eq!(waiting("no_word", None, p, false), vec![Waiting::Word]);
+        // A served row whose grant reads paid: its grant first, then its
+        // advert once it is off the queue.
+        assert_eq!(
+            waiting("served", Some("not_admitted"), p, false),
+            vec![Waiting::Grant, Waiting::Admit]
+        );
+        assert_eq!(
+            waiting("served", Some("not_admitted"), p, true),
+            vec![Waiting::Grant]
+        );
+        for advert in [Some("admitted"), Some("refused"), Some("stopped")] {
+            assert_eq!(waiting("served", advert, p, false), vec![Waiting::Grant]);
+        }
+        for (outcome, advert, grant) in [
+            ("served", Some("admitted"), g),
+            ("served", Some("refused"), g),
+            ("served", Some("stopped"), g),
+            ("served", Some("admitted"), None),
+            ("no_word", Some("stopped"), p),
+            ("no_word", None, g),
+            ("no_word", None, None),
+            ("not_made", None, p),
         ] {
-            assert_eq!(waiting(outcome, advert), None, "{outcome} {advert:?}");
+            assert_eq!(
+                waiting(outcome, advert, grant, false),
+                Vec::<Waiting>::new(),
+                "{outcome} {advert:?} {grant:?}"
+            );
         }
         // Every statement that moves a row names the kind it moves.
         for sql in [
@@ -726,6 +908,7 @@ mod tests {
             ADMISSION_SQL,
             UNQUEUED_SQL,
             QUEUE_TRY_SQL,
+            FAULT_SQL,
         ] {
             assert!(sql.contains("advert = 'not_admitted'"), "{sql}");
         }
@@ -735,6 +918,10 @@ mod tests {
                 "{sql}"
             );
         }
+        assert!(
+            RECORD_SQL.ends_with("WHERE renewals.outcome = 'no_word' AND renewals.advert IS NULL")
+        );
+        assert!(OPEN_SQL.contains("'no_word', NULL"));
         assert!(GRANT_SERVED_SQL.contains("AND state = 'paid'"));
     }
 
@@ -1062,6 +1249,276 @@ mod on_sqlite {
             0
         );
         assert_eq!(column(&db, "p", "outcome"), text_value("served"));
+    }
+
+    /// The row opened before `processAction` (`None` when a row of the
+    /// prefix stands).
+    fn open(db: &Connection, prefix: &str, renewing: &str) -> Option<String> {
+        db.query_row(
+            OPEN_SQL,
+            params![prefix, "pay", renewing, 1_900_000_000i64, "YmVlZg=="],
+            |r| r.get(0),
+        )
+        .ok()
+    }
+
+    /// The pass's kinds for each row [`WAITING_SQL`] returns at `now`.
+    fn kinds_now(db: &Connection, now: i64) -> Vec<(String, Vec<Waiting>)> {
+        let mut statement = db.prepare(WAITING_SQL).unwrap();
+        let rows = statement
+            .query_map([now], |r| {
+                let outcome: String = r.get("outcome")?;
+                let advert: Option<String> = r.get("advert")?;
+                let grant: Option<String> = r.get("grant_state")?;
+                let queued: Option<i64> = r.get("queued_until")?;
+                Ok((
+                    r.get::<_, String>("prefix")?,
+                    waiting(
+                        &outcome,
+                        advert.as_deref(),
+                        grant.as_deref(),
+                        queued.is_some_and(|q| q > now),
+                    ),
+                ))
+            })
+            .unwrap();
+        rows.map(Result::unwrap).collect()
+    }
+
+    /// A request that ends after `processAction` (the wallet's call, the
+    /// overlay, the fan-out) has written only the row opened before it: the
+    /// pass finds it, asks the wallet, and the wallet's record settles it.
+    #[test]
+    fn a_request_cut_after_process_action_leaves_a_no_word_row_the_pass_resolves() {
+        let db = migrated();
+        grant(&db, "cut", "paid");
+        grant(&db, "cut-failed", "paid");
+        assert_eq!(open(&db, "cut", "renewing-1").as_deref(), Some("cut"));
+        assert_eq!(
+            open(&db, "cut-failed", "renewing-2").as_deref(),
+            Some("cut-failed")
+        );
+        // The request ends here: no second write.
+        assert_eq!(column(&db, "cut", "outcome"), text_value("no_word"));
+        assert_eq!(
+            column(&db, "cut", "renewing_txid"),
+            text_value("renewing-1")
+        );
+        assert_eq!(column(&db, "cut", "advert_beef"), text_value("YmVlZg=="));
+        assert_eq!(column(&db, "cut", "advert"), rusqlite::types::Value::Null);
+        assert_eq!(
+            kinds_now(&db, 10),
+            vec![
+                ("cut".to_string(), vec![Waiting::Word]),
+                ("cut-failed".to_string(), vec![Waiting::Word])
+            ]
+        );
+        // The pass asks the wallet: one record reads a take, the other a
+        // failure.
+        let reqs = |txid: &str, status: &str| {
+            vec![ProvenTxReqRow {
+                txid: txid.into(),
+                status: status.into(),
+            }]
+        };
+        assert_eq!(
+            after_word(
+                0,
+                read_req_status(&reqs("renewing-1", "unmined"), "renewing-1")
+            ),
+            Step::Served
+        );
+        assert_eq!(
+            after_word(
+                0,
+                read_req_status(&reqs("renewing-2", "invalid"), "renewing-2")
+            ),
+            Step::NotMade
+        );
+        let n = |sql: &str, p: &[&dyn rusqlite::ToSql]| db.execute(sql, p).unwrap();
+        assert_eq!(
+            n(
+                WORD_SQL,
+                params!["cut", "served", "admitted", None::<String>, None::<i64>]
+            ),
+            1
+        );
+        assert_eq!(n(GRANT_SERVED_SQL, params!["cut", 1_900_000_000i64]), 1);
+        assert_eq!(
+            n(
+                WORD_SQL,
+                params![
+                    "cut-failed",
+                    "not_made",
+                    None::<String>,
+                    None::<String>,
+                    None::<i64>
+                ]
+            ),
+            1
+        );
+        assert!(kinds_now(&db, 10).is_empty());
+        // A second open of a prefix writes nothing.
+        assert_eq!(open(&db, "cut", "renewing-3"), None);
+        assert_eq!(
+            column(&db, "cut", "renewing_txid"),
+            text_value("renewing-1")
+        );
+    }
+
+    /// The route's second write settles the row it opened; a row the pass
+    /// moved first is left as the pass wrote it; a renewal not made before
+    /// its transaction was handed over is written whole.
+    #[test]
+    fn the_route_settles_the_row_it_opened() {
+        let db = migrated();
+        let settle = |prefix: &str, outcome: &str, advert: Option<&str>, beef: Option<&str>| {
+            db.execute(
+                RECORD_SQL,
+                params![
+                    prefix,
+                    "pay",
+                    None::<String>,
+                    outcome,
+                    advert,
+                    None::<String>,
+                    None::<i64>,
+                    beef,
+                    None::<i64>
+                ],
+            )
+            .unwrap()
+        };
+        open(&db, "taken", "renewing-1").unwrap();
+        assert_eq!(settle("taken", "served", Some("admitted"), None), 1);
+        assert_eq!(column(&db, "taken", "outcome"), text_value("served"));
+        assert_eq!(column(&db, "taken", "advert"), text_value("admitted"));
+        // What the open wrote is kept where the second write has none.
+        assert_eq!(
+            column(&db, "taken", "renewing_txid"),
+            text_value("renewing-1")
+        );
+        assert_eq!(column(&db, "taken", "advert_beef"), text_value("YmVlZg=="));
+        assert_eq!(
+            column(&db, "taken", "new_expiry_time"),
+            rusqlite::types::Value::Integer(1_900_000_000)
+        );
+        // Once settled, a second settle moves nothing.
+        assert_eq!(settle("taken", "no_word", None, None), 0);
+        assert_eq!(column(&db, "taken", "outcome"), text_value("served"));
+        // No word stays no word, for the pass.
+        open(&db, "no-word", "renewing-2").unwrap();
+        assert_eq!(settle("no-word", "no_word", None, None), 1);
+        assert_eq!(column(&db, "no-word", "outcome"), text_value("no_word"));
+        // Not made before any transaction was handed over: written whole.
+        assert_eq!(settle("refused", "not_made", None, None), 1);
+        assert_eq!(column(&db, "refused", "outcome"), text_value("not_made"));
+        assert_eq!(
+            column(&db, "refused", "renewing_txid"),
+            rusqlite::types::Value::Null
+        );
+    }
+
+    /// Twenty rows that keep faulting do not hold newer rows back: fewest
+    /// runs first, then oldest.
+    #[test]
+    fn the_pass_takes_fewest_runs_first() {
+        let db = migrated();
+        for i in 1..=20 {
+            let prefix = format!("old{i:02}");
+            row(&db, &prefix, "served", Some("not_admitted"), i, None);
+            db.execute("UPDATE renewals SET runs = 5 WHERE prefix = ?1", [&prefix])
+                .unwrap();
+        }
+        row(&db, "new-admit", "served", Some("not_admitted"), 100, None);
+        row(&db, "new-word", "no_word", None, 101, None);
+        grant(&db, "new-word", "paid");
+        let got = waiting_now(&db, 1000);
+        assert_eq!(got.len(), 20);
+        assert_eq!(&got[..2], &strings(&["new-admit", "new-word"])[..]);
+        let expected: Vec<String> = (1..=18).map(|i| format!("old{i:02}")).collect();
+        assert_eq!(&got[2..], &expected[..]);
+        // A count of one more run moves a row behind those with fewer.
+        assert_eq!(
+            db.execute(
+                COUNTED_ADMIT_SQL,
+                params!["new-admit", 6, "not_admitted", "HTTP 503"]
+            )
+            .unwrap(),
+            1
+        );
+        let got = waiting_now(&db, 1000);
+        assert_eq!(got[0], "new-word");
+        assert!(!got.contains(&"new-admit".to_string()));
+    }
+
+    /// A served row whose grant's second write did not land: the pass sets
+    /// the grant `granted`, inside the same twenty, and then leaves it.
+    #[test]
+    fn a_served_row_whose_grant_reads_paid_is_repaired_by_the_pass() {
+        let db = migrated();
+        row(&db, "seam", "served", Some("admitted"), 1, None);
+        grant(&db, "seam", "paid");
+        row(
+            &db,
+            "seam-queued",
+            "served",
+            Some("not_admitted"),
+            2,
+            Some(5000),
+        );
+        grant(&db, "seam-queued", "paid");
+        row(&db, "whole", "served", Some("admitted"), 3, None);
+        grant(&db, "whole", "granted");
+        assert_eq!(
+            kinds_now(&db, 10),
+            vec![
+                ("seam".to_string(), vec![Waiting::Grant]),
+                ("seam-queued".to_string(), vec![Waiting::Grant])
+            ]
+        );
+        for prefix in ["seam", "seam-queued"] {
+            assert_eq!(
+                db.execute(GRANT_SERVED_SQL, params![prefix, 1_900_000_000i64])
+                    .unwrap(),
+                1
+            );
+        }
+        let state: String = db
+            .query_row(
+                "SELECT state FROM payment_grants WHERE prefix = 'seam'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "granted");
+        assert!(kinds_now(&db, 10).is_empty());
+        // Its advert, once off the queue, is the pass's as any other.
+        assert_eq!(
+            kinds_now(&db, 5000),
+            vec![("seam-queued".to_string(), vec![Waiting::Admit])]
+        );
+    }
+
+    /// The last answer that was not an admission is kept on the row.
+    #[test]
+    fn a_fault_keeps_its_kind_on_the_row() {
+        let db = migrated();
+        row(&db, "q", "served", Some("not_admitted"), 1, Some(3601));
+        assert_eq!(
+            db.execute(FAULT_SQL, params!["q", "an empty admission: {}"])
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            column(&db, "q", "reason"),
+            text_value("an empty admission: {}")
+        );
+        row(&db, "done", "served", Some("admitted"), 2, None);
+        assert_eq!(
+            db.execute(FAULT_SQL, params!["done", "HTTP 503"]).unwrap(),
+            0
+        );
     }
 
     /// The statements 0.3.3 runs on `CLAIMS` (its `claims.rs` grants

@@ -20,31 +20,40 @@
 //! 2. The renewing step ([`renew_from`]): the new PushDrop advert (fields
 //!    0-2 and 4 as before, field 3 the new expiry, re-signed), then
 //!    `createAction` spending the old advert, the signature (PushDrop for the
-//!    old advert, P2PKH for change), the Atomic BEEF of the new transaction,
-//!    and `processAction` with `isNoSend: false` and `isDelayed: false` (the
-//!    wallet sends it now). The wallet's answer for this txid decides the
-//!    outcome ([`crate::renewal`]); a `sending` answer is followed by one
-//!    read of the wallet's broadcast request for the txid
-//!    (`findProvenTxReqs`).
+//!    old advert, P2PKH for change), and the Atomic BEEF of the new
+//!    transaction. Then the renewal's row is written (`renewals`: the
+//!    payment's txid, the renewing txid, the advert's bytes, the outcome no
+//!    word), and only then `processAction` with `isNoSend: false` and
+//!    `isDelayed: false` (the wallet sends it now). If the row cannot be
+//!    written the transaction is not handed over: the action is released and
+//!    the renewal is not made. After any answer of `processAction` that is
+//!    not a take, one read of the wallet's record of the txid
+//!    (`findProvenTxReqs`); the record decides when there is one
+//!    ([`crate::renewal::decide`]).
 //!    - `createAction` refused with the answer a spent advert gives (the
 //!      explicit input is unavailable): after [`RE_READ_DELAY_MS`], one
-//!      re-read of the file's current advert and one more try of the whole
-//!      step from it, in the same request. Two payers of one file at once
-//!      are both served: two payments, two extensions. There is never a
-//!      third try, and any other refusal is not retried.
+//!      re-read of the file's current advert and, when it names the same
+//!      stored object at an expiry not lower than the first attempt's, one
+//!      more try of the whole step from it, in the same request, so that
+//!      two payers of one file at once can both be served. The second payer
+//!      is served when that try's renewing transaction is taken; otherwise
+//!      the answer is that of a payment taken with no renewal. There is
+//!      never a third try, and any other refusal is not retried.
 //!    - A failure after `createAction` and before `processAction` (the
-//!      signature, the BEEF), or `processAction` refused with an answer:
-//!      the action is released in the wallet, and with it the old advert.
+//!      signature, the BEEF, the row), or `processAction` refused with an
+//!      error by name while the wallet holds no record of the txid: the
+//!      action is released in the wallet, and with it the old advert.
 //! 3. Taken (a broadcaster took the renewing transaction): served. The
 //!    answer is the signed 200 `{status, prevExpiryTime, newExpiryTime,
 //!    amount, overlayAdmitted}` and the grant is `granted`, whatever
 //!    follows. The renewed advert is then submitted to the overlay, within
-//!    `overlay::ADMISSION_DEADLINE_MS`; `overlayAdmitted` says whether it
-//!    admitted it. A refusal is recorded with its reason and never submitted
-//!    again; a fault puts one re-submit on the Worker's queue
+//!    `overlay::ADMISSION_DEADLINE_MS`; `overlayAdmitted` says whether its
+//!    admission names the advert's output. A refusal in the overlay's error
+//!    shape is recorded with its reason and never submitted again; any other
+//!    answer is a fault and puts one re-submit on the Worker's queue
 //!    (`renewal::QUEUE_DELIVERIES` deliveries at most), then the hourly pass.
 //! 4. Not made: `500 ERR_RENEWAL_NOT_MADE`. No word: `502
-//!    ERR_RENEWAL_UNCONFIRMED`. The grant stays `paid`; `lib.rs` records the
+//!    ERR_RENEWAL_UNCONFIRMED`. The grant stays `paid`; `lib.rs` settles the
 //!    renewal's row under the payment's prefix (`renewals`), with the
 //!    renewing txid and the outcome.
 //!
@@ -87,6 +96,7 @@ use crate::error::{
     ERR_MISSING_IDENTITY_KEY, ERR_OLD_ADVERTISEMENT_NOT_FOUND,
 };
 use crate::overlay::{admit_uhrp_advert, overlay_url_from_env, ADMISSION_DEADLINE_MS};
+use crate::pass::Ledger;
 use crate::renewal::{self, Admission, Outcome, ProcessWord};
 use crate::storage::head::{head_object, UHRP_BINDING};
 use crate::types::{ErrorBody, RenewRequest, RenewResponse};
@@ -379,13 +389,16 @@ pub struct StepRecord {
 /// `price` is the satoshi figure the door charged (the answer's `amount`).
 /// `prepared` is the pre-payment step's result. `payment_txid` is the taken
 /// payment's transaction (`None` when no payment was taken), which the
-/// answers name when no renewal is served.
+/// answers name when no renewal is served. `ledger` is where the renewal's
+/// row is written before its transaction is handed to the wallet (`None`
+/// when no payment was claimed).
 pub async fn handle(
     body: &[u8],
     identity_key: &str,
     price: u64,
     prepared: PreparedRenew,
     payment_txid: Option<&str>,
+    ledger: Option<&Ledger<'_>>,
     env: &Env,
 ) -> Renewed {
     let plain = |(body, status): (Value, u16)| Renewed {
@@ -451,7 +464,7 @@ pub async fn handle(
     let Ok(wallet) = Wallet::from_env(env) else {
         return not_made(None, payment_txid);
     };
-    let (ctx, attempt) = renew_with_one_more_try(&wallet, env, ctx).await;
+    let (ctx, attempt) = renew_with_one_more_try(&wallet, env, ctx, ledger).await;
     match attempt {
         Attempt::Taken(made) => {
             let admission = admit_uhrp_advert(
@@ -545,14 +558,16 @@ struct Made {
 }
 
 /// The renewing step, and once more from the file's current advert when
-/// `createAction` refused the spent advert. Returns the advert the last try
-/// started from, and what it came to.
+/// `createAction` refused the spent advert and the re-read names the same
+/// stored object ([`same_file`]). Returns the advert the last try started
+/// from, and what it came to.
 async fn renew_with_one_more_try(
     wallet: &Wallet<'_>,
     env: &Env,
     ctx: RenewContext,
+    ledger: Option<&Ledger<'_>>,
 ) -> (RenewContext, Attempt) {
-    let first = renew_from(wallet, env, &ctx).await;
+    let first = renew_from(wallet, env, &ctx, ledger).await;
     let again = matches!(&first, Attempt::CreateRefused(f) if renewal::spent_advert(f));
     if !again {
         return (ctx, first);
@@ -567,13 +582,24 @@ async fn renew_with_one_more_try(
     )
     .await;
     match current {
-        // The same file: the price paid covers the same size.
-        PreparedRenew::Ready(next) if next.content_length == ctx.content_length => {
-            let second = renew_from(wallet, env, &next).await;
+        PreparedRenew::Ready(next) if same_file(&ctx, &next) => {
+            let second = renew_from(wallet, env, &next, ledger).await;
             (next, second)
         }
         _ => (ctx, first),
     }
+}
+
+/// Whether the re-read advert `next` may carry the one more try begun from
+/// `first`: it names the same stored object, of the same content length
+/// (the price paid covers that size), and its expiry is not lower than the
+/// first attempt's. Two uploads of the same bytes share a URL and have two
+/// objects and two adverts; the try never renews the other one.
+#[must_use]
+fn same_file(first: &RenewContext, next: &RenewContext) -> bool {
+    next.object_identifier == first.object_identifier
+        && next.content_length == first.content_length
+        && next.prev_expiry >= first.prev_expiry
 }
 
 /// The new advert's `createAction` request, the key that signs the old
@@ -697,8 +723,14 @@ fn build_advert(env: &Env, admin_key: &PrivateKey, ctx: &RenewContext) -> Option
 }
 
 /// One try of the renewing step from `ctx`: `createAction`, the signature,
-/// the Atomic BEEF, `processAction`, and the wallet's word for the txid.
-async fn renew_from(wallet: &Wallet<'_>, env: &Env, ctx: &RenewContext) -> Attempt {
+/// the Atomic BEEF, the renewal's row (`ledger`), `processAction`, and the
+/// wallet's word for the txid.
+async fn renew_from(
+    wallet: &Wallet<'_>,
+    env: &Env,
+    ctx: &RenewContext,
+    ledger: Option<&Ledger<'_>>,
+) -> Attempt {
     let admin_key = wallet.private_key().clone();
     let Some(built) = build_advert(env, &admin_key, ctx) else {
         return Attempt::NotMade { txid: None };
@@ -731,6 +763,16 @@ async fn renew_from(wallet: &Wallet<'_>, env: &Env, ctx: &RenewContext) -> Attem
         return Attempt::NotMade { txid: None };
     };
 
+    // ── The row, before the transaction is handed over: a request that ends
+    // at any later point leaves it for the pass. ──
+    if let Some(ledger) = ledger {
+        if let Err(e) = crate::pass::open(ledger, &signed.txid, built.new_expiry, &beef).await {
+            worker::console_error!("renew: the renewal's row was not written: {e}");
+            release(wallet, &template.reference).await;
+            return Attempt::NotMade { txid: None };
+        }
+    }
+
     // ── processAction: the wallet records the transaction and sends it now ──
     let process_req = ProcessActionRequest {
         is_new_tx: true,
@@ -748,21 +790,26 @@ async fn renew_from(wallet: &Wallet<'_>, env: &Env, ctx: &RenewContext) -> Attem
         new_expiry: built.new_expiry,
         beef,
     };
-    let word = match renewal::read_process_answer(&answer, &made.txid) {
-        ProcessWord::Decided(outcome) => outcome,
-        ProcessWord::Refused => {
-            release(wallet, &template.reference).await;
-            Outcome::NotMade
-        }
-        ProcessWord::Sending => match wallet.find_proven_tx_reqs(&made.txid).await {
-            Ok(rows) => renewal::read_req_status(&rows, &made.txid),
+    if let Err(failure) = &answer {
+        worker::console_error!("renew: processAction: {failure:?}");
+    }
+    // After any answer that is not a take, one read of the wallet's record.
+    let word = renewal::read_process_answer(&answer, &made.txid);
+    let record = if word == ProcessWord::Taken {
+        Ok(None)
+    } else {
+        match wallet.find_proven_tx_reqs(&made.txid).await {
+            Ok(rows) => Ok(renewal::read_record(&rows, &made.txid)),
             Err(failure) => {
                 worker::console_error!("renew: findProvenTxReqs failed: {failure:?}");
-                Outcome::NoWord
+                Err(())
             }
-        },
+        }
     };
-    match word {
+    if renewal::release_after(word, &record) {
+        release(wallet, &template.reference).await;
+    }
+    match renewal::decide(word, &record) {
         Outcome::Taken => Attempt::Taken(made),
         Outcome::NotMade => Attempt::NotMade {
             txid: Some(made.txid),
@@ -1248,18 +1295,82 @@ mod tests {
         let step = &step[..step.find("\n}\n").unwrap()];
         let sign = step.find("sign_transaction_mixed(").unwrap();
         let process = step.find("process_action_answered(").unwrap();
-        // The signature's and the BEEF's failures, before processAction, and
-        // processAction's refusal: each releases the action.
+        // The signature's, the BEEF's and the row's failures, before
+        // processAction: each releases the action.
         assert_eq!(
             step[sign..process]
                 .matches("release(wallet, &template.reference)")
                 .count(),
-            2
+            3
         );
-        let refused = &step[step.find("ProcessWord::Refused =>").unwrap()..];
-        assert!(refused[..120].contains("release(wallet, &template.reference)"));
-        // No word is never released: the wallet may still send it.
-        assert_eq!(step.matches("release(").count(), 3);
+        // After processAction, only an error by name with no record of the
+        // txid releases it: the wallet processed nothing.
+        let after = &step[process..];
+        let released = after.find("release(wallet, &template.reference)").unwrap();
+        assert!(after[..released].contains("if renewal::release_after(word, &record) {"));
+        assert_eq!(step.matches("release(").count(), 4);
+    }
+
+    /// The renewal's row is written before the renewing transaction is
+    /// handed to the wallet, and a failed write hands nothing over.
+    #[test]
+    fn the_row_is_written_before_process_action() {
+        let src = include_str!("renew.rs");
+        let step = &src[src.find("async fn renew_from(").unwrap()..];
+        let step = &step[..step.find("\n}\n").unwrap()];
+        let open = step.find("crate::pass::open(ledger, &signed.txid").unwrap();
+        let process = step.find("process_action_answered(").unwrap();
+        assert!(open < process);
+        let failed = &step[open..process];
+        let failed = &failed[..failed
+            .find("return Attempt::NotMade { txid: None };")
+            .unwrap()];
+        assert!(failed.contains("release(wallet, &template.reference)"));
+        assert_eq!(step.matches("process_action_answered(").count(), 1);
+        // The record is read after every answer that is not a take.
+        let read = &step[process..];
+        assert!(read.contains("let record = if word == ProcessWord::Taken {"));
+        assert_eq!(read.matches("find_proven_tx_reqs(").count(), 1);
+        assert!(read.contains("match renewal::decide(word, &record) {"));
+    }
+
+    fn ctx(object: &str, prev_expiry: u64, content_length: u64) -> RenewContext {
+        RenewContext {
+            uhrp_url: "uhrp://same-bytes".into(),
+            additional_minutes: 30,
+            limit: DEFAULT_LIMIT,
+            offset: DEFAULT_OFFSET,
+            prev_expiry,
+            content_length,
+            object_identifier: object.into(),
+            original_uploader_tag: None,
+            prev_txid: "aa".repeat(32),
+            prev_vout: 0,
+            beef: vec![],
+        }
+    }
+
+    /// Two uploads of the same bytes: one URL, two objects, two adverts. The
+    /// one more try goes on only from an advert of the first attempt's
+    /// object at an expiry not lower than the first attempt's.
+    #[test]
+    fn the_one_more_try_never_renews_another_files_advert() {
+        let first = ctx("object-a", 2_000, 1_000);
+        // The first attempt's object, renewed by the other payer.
+        assert!(same_file(&first, &ctx("object-a", 2_000 + 1_800, 1_000)));
+        assert!(same_file(&first, &ctx("object-a", 2_000, 1_000)));
+        // The other upload's advert of the same bytes, at any expiry.
+        for expiry in [1_000, 2_000, 9_000] {
+            assert!(!same_file(&first, &ctx("object-b", expiry, 1_000)));
+        }
+        // The same object at a lower expiry, or another size.
+        assert!(!same_file(&first, &ctx("object-a", 1_999, 1_000)));
+        assert!(!same_file(&first, &ctx("object-a", 3_000, 999)));
+        let src = include_str!("renew.rs");
+        let tries = &src[src.find("async fn renew_with_one_more_try(").unwrap()..];
+        let tries = &tries[..tries.find("\n}\n").unwrap()];
+        assert!(tries.contains("PreparedRenew::Ready(next) if same_file(&ctx, &next) =>"));
+        assert!(tries.contains("_ => (ctx, first),"));
     }
 
     // ── Body parsing ────────────────────────────────────────────────────────

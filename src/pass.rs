@@ -6,13 +6,14 @@
 //! - [`deliver`]: the queue consumer's delivery of that message;
 //! - [`run`]: the hourly pass, the Worker's only scheduled act.
 //!
-//! The pass reads at most [`renewal::PASS_ROWS`] rows a run, oldest first,
-//! and touches each once: a `not_admitted` advert gets one submit to the
-//! overlay; a `paid` grant whose renewing transaction has no word gets one
-//! `findProvenTxReqs` question to the wallet (a take serves the grant and
-//! submits its advert in the same run). It makes and signs no transaction,
-//! reads and writes no stored object, touches no row of any other kind, and
-//! no request's answer waits on it.
+//! The pass reads at most [`renewal::PASS_ROWS`] rows a run, fewest runs
+//! first and then oldest, and touches each once: a served row whose grant
+//! still reads `paid` has its grant set `granted`; a `not_admitted` advert
+//! gets one submit to the overlay; a `paid` grant whose renewing transaction
+//! has no word gets one `findProvenTxReqs` question to the wallet (a take
+//! serves the grant and submits its advert in the same run). It makes and
+//! signs no transaction, reads and writes no stored object, touches no row
+//! of any other kind, and no request's answer waits on it.
 
 use base64::Engine as _;
 use serde_json::Value;
@@ -76,9 +77,51 @@ fn advert_columns(admission: &Admission, kept: bool) -> (&'static str, Option<St
     }
 }
 
+/// Where a paid renewal's row is written: the `CLAIMS` database, the won
+/// claim's prefix, and the payment's txid.
+pub struct Ledger<'a> {
+    pub db: &'a D1Database,
+    pub prefix: &'a str,
+    pub payment_txid: &'a str,
+}
+
+/// Open the renewal's row before its renewing transaction is handed to the
+/// wallet ([`renewal::OPEN_SQL`]): the renewing txid, the expiry it carries,
+/// the advert's bytes, the outcome no word. An error when the row was not
+/// written (a row of the prefix stands, or the database failed); then the
+/// transaction is not handed over.
+pub async fn open(
+    ledger: &Ledger<'_>,
+    renewing_txid: &str,
+    new_expiry: u64,
+    beef: &[u8],
+) -> Result<(), String> {
+    let beef = kept(Some(beef));
+    let written = ledger
+        .db
+        .prepare(renewal::OPEN_SQL)
+        .bind(&[
+            ledger.prefix.into(),
+            ledger.payment_txid.into(),
+            renewing_txid.into(),
+            num(Some(new_expiry as i64)),
+            text(beef.as_deref()),
+        ])
+        .map_err(|e| e.to_string())?
+        .first::<Value>(None)
+        .await
+        .map_err(|e| e.to_string())?;
+    match written {
+        Some(_) => Ok(()),
+        None => Err("a row of the prefix stands".to_string()),
+    }
+}
+
 /// Record what the route's renewing step came to, under the payment's
-/// `prefix` (one row; a second write of the same prefix changes nothing),
-/// and put the re-submit on the queue when the overlay faulted.
+/// `prefix`: the row opened before `processAction` is settled while it
+/// still reads no word, and a renewal not made before any transaction was
+/// handed over is written whole ([`renewal::RECORD_SQL`]). The re-submit
+/// goes on the queue when the overlay's answer was a fault.
 pub async fn record(
     env: &Env,
     db: &D1Database,
@@ -196,8 +239,24 @@ pub async fn deliver(env: &Env, prefix: &str) -> bool {
             )
             .await
         }
-        _ if !again => exec(&db, renewal::UNQUEUED_SQL, &[prefix.into()]).await,
-        _ => Ok(()),
+        _ => {
+            // A fault: its kind is kept on the row; when the deliveries are
+            // spent the row is the pass's.
+            let why = match &admission {
+                Admission::Fault(why) => renewal::reason(why),
+                _ => String::new(),
+            };
+            match exec(
+                &db,
+                renewal::FAULT_SQL,
+                &[prefix.into(), why.as_str().into()],
+            )
+            .await
+            {
+                Ok(()) if !again => exec(&db, renewal::UNQUEUED_SQL, &[prefix.into()]).await,
+                other => other,
+            }
+        }
     };
     if let Err(e) = written {
         worker::console_error!("renewal {prefix}: {e}");
@@ -210,6 +269,7 @@ pub async fn deliver(env: &Env, prefix: &str) -> bool {
 #[derive(Default)]
 struct Ran {
     rows: usize,
+    granted: usize,
     admitted: usize,
     refused: usize,
     counted: usize,
@@ -240,58 +300,79 @@ pub async fn run(env: &Env) {
     };
     let overlay = overlay_url_from_env(env);
     let wallet = Wallet::from_env(env).ok();
+    let now = now_secs();
     let mut ran = Ran::default();
     for row in rows.iter().take(renewal::PASS_ROWS as usize) {
         let Some(prefix) = row["prefix"].as_str() else {
             continue;
         };
         let runs = row["runs"].as_f64().unwrap_or(0.0) as i64;
-        let kind = renewal::waiting(
+        let new_expiry = row["new_expiry_time"].as_f64().map(|e| e as i64);
+        let queued = row["queued_until"]
+            .as_f64()
+            .is_some_and(|q| (q as i64) > now);
+        let kinds = renewal::waiting(
             row["outcome"].as_str().unwrap_or_default(),
             row["advert"].as_str(),
+            row["grant_state"].as_str(),
+            queued,
         );
         ran.rows += 1;
-        let written = match kind {
-            Some(Waiting::Admit) => {
-                let admission = match beef_of(&stored(&db, prefix).await) {
-                    Some(beef) => {
-                        admit_uhrp_advert(env, &overlay, &beef, ADMISSION_DEADLINE_MS).await
-                    }
-                    None => Admission::Fault(NOT_KEPT.to_string()),
-                };
-                let step = renewal::after_submit(runs, &admission);
-                let reason = match &admission {
-                    Admission::Fault(why) => Some(renewal::reason(why)),
-                    _ => None,
-                };
-                tally(&mut ran, &step);
-                admit_step(&db, prefix, &step, reason.as_deref()).await
-            }
-            Some(Waiting::Word) => {
-                let word = match (&wallet, row["renewing_txid"].as_str()) {
-                    (Some(wallet), Some(txid)) => match wallet.find_proven_tx_reqs(txid).await {
-                        Ok(reqs) => renewal::read_req_status(&reqs, txid),
-                        Err(e) => {
-                            worker::console_log!("pass {prefix}: findProvenTxReqs: {e:?}");
-                            Outcome::NoWord
+        for kind in kinds {
+            let written = match kind {
+                Waiting::Grant => {
+                    // The row reads served and its grant's second write did
+                    // not land: the grant is set `granted`.
+                    ran.granted += 1;
+                    exec(
+                        &db,
+                        renewal::GRANT_SERVED_SQL,
+                        &[prefix.into(), num(new_expiry)],
+                    )
+                    .await
+                }
+                Waiting::Admit => {
+                    let admission = match beef_of(&stored(&db, prefix).await) {
+                        Some(beef) => {
+                            admit_uhrp_advert(env, &overlay, &beef, ADMISSION_DEADLINE_MS).await
                         }
-                    },
-                    _ => Outcome::NoWord,
-                };
-                let step = renewal::after_word(runs, word);
-                tally(&mut ran, &step);
-                let new_expiry = row["new_expiry_time"].as_f64().map(|e| e as i64);
-                word_step(env, &db, &overlay, prefix, &step, new_expiry).await
+                        None => Admission::Fault(NOT_KEPT.to_string()),
+                    };
+                    let step = renewal::after_submit(runs, &admission);
+                    let reason = match &admission {
+                        Admission::Fault(why) => Some(renewal::reason(why)),
+                        _ => None,
+                    };
+                    tally(&mut ran, &step);
+                    admit_step(&db, prefix, &step, reason.as_deref()).await
+                }
+                Waiting::Word => {
+                    let word = match (&wallet, row["renewing_txid"].as_str()) {
+                        (Some(wallet), Some(txid)) => {
+                            match wallet.find_proven_tx_reqs(txid).await {
+                                Ok(reqs) => renewal::read_req_status(&reqs, txid),
+                                Err(e) => {
+                                    worker::console_log!("pass {prefix}: findProvenTxReqs: {e:?}");
+                                    Outcome::NoWord
+                                }
+                            }
+                        }
+                        _ => Outcome::NoWord,
+                    };
+                    let step = renewal::after_word(runs, word);
+                    tally(&mut ran, &step);
+                    word_step(env, &db, &overlay, prefix, &step, new_expiry).await
+                }
+            };
+            if let Err(e) = written {
+                worker::console_error!("pass {prefix}: {e}");
             }
-            None => Ok(()),
-        };
-        if let Err(e) = written {
-            worker::console_error!("pass {prefix}: {e}");
         }
     }
     worker::console_log!(
-        "pass: {} rows; admitted {}, refused {}, counted {}, stopped {}, served {}, not made {}",
+        "pass: {} rows; grants set granted {}, admitted {}, refused {}, counted {}, stopped {}, served {}, not made {}",
         ran.rows,
+        ran.granted,
         ran.admitted,
         ran.refused,
         ran.counted,
