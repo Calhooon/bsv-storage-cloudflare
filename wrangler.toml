@@ -43,7 +43,7 @@ MIN_HOSTING_MINUTES = "15"
 [build]
 command = "worker-build --release"
 
-# The hourly pass (0.3.4, src/pass.rs): the paid /renew's rows that wait on
+# The hourly pass (0.3.5, src/pass.rs): the paid /renew's rows that wait on
 # the overlay's admission of a renewed advert or on the wallet's word for a
 # renewing transaction, at most 20 a run, oldest first. Its tables are
 # migrations/0002_renewals.sql.
@@ -89,7 +89,7 @@ bucket_name = "uhrp-prod"
 # so larger batches risk hitting the 30s Worker CPU cap under burst load.
 # The producer binding is kept for manual enqueue fallback (tests, reprocess
 # tooling) even though the primary writer is R2 itself. The paid /renew also
-# puts one message on it (0.3.4) when the overlay does not answer a renewed
+# puts one message on it (0.3.5) when the overlay does not answer a renewed
 # advert's submit: the consumer submits it again, max_retries + 1 = 4
 # deliveries at most.
 [[queues.producers]]

@@ -56,7 +56,7 @@ wrangler d1 create uhrp-payment-claims
 The paid routes claim each payment's derivation prefix in the `CLAIMS` D1
 database and record what each won claim was granted there. Its schema is
 `migrations/` (the middleware's `payment_claims` table and
-`payment_grants`, and from 0.3.4 `renewals`, migration `0002`), applied
+`payment_grants`, and from 0.3.5 `renewals`, migration `0002`), applied
 **before** the Worker that reads it is deployed:
 
 ```bash
@@ -160,7 +160,7 @@ wrangler d1 execute CLAIMS --remote --command "UPDATE payment_claims SET release
 The released transaction is then served once on its retry, and no other
 transaction can take the prefix.
 
-### The renewals and the hourly pass (0.3.4)
+### The renewals and the hourly pass (0.3.5)
 
 Each paid `/renew` whose renewing step ran has a `renewals` row under the
 payment's prefix (migration `0002_renewals.sql`, applied before the deploy
@@ -171,15 +171,22 @@ overlay's), `new_expiry_time`, `advert_beef` (base64 of the renewed
 advert's Atomic BEEF, kept up to 512 KiB), `queued_until`, `queue_tries`,
 `created_at`, `updated_at`.
 
-The Worker's scheduled handler runs the hourly pass. Its trigger is
-`wrangler.toml`'s
+The Worker's scheduled handler runs the hourly pass. Its trigger is the
+line `wrangler.toml` and `wrangler.composer.toml` both carry:
 
 ```toml
 [triggers]
 crons = ["0 * * * *"]
 ```
 
-which each deployed config carries. A run reads at most 20 rows, oldest
+Each deployed config carries it. A deployment whose config has no cron
+line serves renewals and runs no pass: once the queue's deliveries of a
+re-submit are over, an advert `not_admitted` is not submitted again, and
+the wallet is not asked about a `no_word` row. Those rows then wait for an
+operator; the pass takes them from its first run after a deploy with the
+line.
+
+A run reads at most 20 rows, oldest
 first, of two kinds and touches each once: a row `not_admitted` whose
 `queued_until` is null or past gets one submit of its advert to the
 overlay; a row `no_word` whose grant is `paid` gets one `findProvenTxReqs`
@@ -205,10 +212,10 @@ operator resets it, which puts it back to the pass with no runs:
 wrangler d1 execute CLAIMS --remote --command "UPDATE renewals SET advert = CASE WHEN outcome = 'no_word' THEN NULL ELSE 'not_admitted' END, runs = 0, queued_until = NULL, updated_at = unixepoch() WHERE prefix = '<prefix>' AND advert = 'stopped'"
 ```
 
-**A rollback to 0.3.3** keeps migration `0002` in place: 0.3.3 reads and
-writes `payment_claims` and `payment_grants` only, and `0002` alters
-neither. Remove the `[triggers]` line from the config deployed with
-0.3.3, which has no scheduled handler.
+**A rollback to 0.3.4 or 0.3.3** keeps migration `0002` in place: each
+reads and writes `payment_claims` and `payment_grants` only, and `0002`
+alters neither. Remove the `[triggers]` line from the config deployed with
+either, which has no scheduled handler.
 
 ---
 

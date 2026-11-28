@@ -1,13 +1,22 @@
 # Changelog
 
-## 0.3.4 (2026-11-28)
+## 0.3.5 (unreleased)
 
-**For an operator, before the deploy:** apply migration `0002` to each
-instance's `CLAIMS` database (`wrangler d1 migrations apply CLAIMS
---remote`, from the checkout being deployed), then deploy. The Worker
-gains one scheduled act (below): the `[triggers] crons` line of
-`wrangler.toml` is part of the deploy config. `DEPLOYMENT.md` has the
-order, the cron line and the statements that list and reset a row.
+**For an operator, two things, in this order:**
+
+1. **Migration `0002`, before the deploy.** Apply it to each instance's
+   `CLAIMS` database (`wrangler d1 migrations apply CLAIMS --remote`, from
+   the checkout being deployed; with `-c wrangler.composer.toml` for that
+   instance), then deploy.
+2. **A new scheduled act, the hourly pass.** Its trigger is the
+   `[triggers]` line `crons = ["0 * * * *"]` of the deploy config, which
+   `wrangler.toml` and `wrangler.composer.toml` both carry: one run an
+   hour, at most 20 rows a run. A deployment whose config has no cron line
+   serves renewals and runs no pass; its `not_admitted` and `no_word` rows
+   then wait for an operator.
+
+`DEPLOYMENT.md` has the order, the cron line and the statements that list
+and reset a row.
 
 - **`/renew`, in order.** Before any 402 the route HEADs the advert's
   stored object `cdn/<object identifier>` through the `UHRP_FILES` binding
@@ -33,6 +42,14 @@ order, the cron line and the statements that list and reset a row.
   keep the grant `paid` with its `status` and `answered_at`; the reference
   client sends neither answer again by itself. The same payment presented
   again is the signed `409 ERR_PAYMENT_REPLAYED`.
+- **The new field.** The 200 is `{status, prevExpiryTime, newExpiryTime,
+  amount, overlayAdmitted}`: `overlayAdmitted` is `true` when the overlay
+  admitted the renewed advert, submitted after the take within 10 s.
+  Otherwise the renewal is still served: an overlay that answers it does
+  not admit the advert is recorded with its reason and never submitted
+  again by the Worker; a fault (no answer, a 5xx, 408, 429, the deadline)
+  puts one re-submit message on the post-upload queue, delivered at most
+  four times (`max_retries = 3`), 30 s apart, then the hourly pass.
 - **One more try.** When `createAction` refuses the advert as unavailable
   (spent by another renewal), the route waits 2 s, reads the file's current
   advert once and runs the renewing step once more from it: two payers of
@@ -42,14 +59,6 @@ order, the cron line and the statements that list and reset a row.
   `processAction` (the signature, the BEEF), and `processAction` refused
   with an answer, release the action in the wallet, and with it the old
   advert.
-- **The new field.** The 200 is `{status, prevExpiryTime, newExpiryTime,
-  amount, overlayAdmitted}`: `overlayAdmitted` is `true` when the overlay
-  admitted the renewed advert, submitted after the take within 10 s.
-  Otherwise the renewal is still served: an overlay that answers it does
-  not admit the advert is recorded with its reason and never submitted
-  again by the Worker; a fault (no answer, a 5xx, 408, 429, the deadline)
-  puts one re-submit message on the post-upload queue, delivered at most
-  four times (`max_retries = 3`), 30 s apart, then the hourly pass.
 - **The stored object.** `/renew` reads and writes no byte of it; its
   custom time is the one `/upload` set, and the term of record is the
   advert's expiry and the grant's. The queue's duplicate-advert guard reads
@@ -81,6 +90,14 @@ order, the cron line and the statements that list and reset a row.
   cases above; its second stage fires the scheduled handler. The `workerd`
   job of `ci.yml` builds the Worker, the stand-ins, v0.3.0 and the race
   client, and runs both stages on the hosted runner.
+- **The version.** The package is `0.3.5` in the manifest and, where a
+  lock carries it, the lock (the root, `tests/heap`, `tests/compat`'s
+  `new`); `/health`'s `build.crates` names 0.3.5. The pins are those of
+  0.3.4: bsv-rs `0.8.15` (caret), bsv-middleware-cloudflare `=0.7.8` (core
+  0.4.7).
+
+## 0.3.4 (2026-11-28)
+
 - bsv-rs `0.8.15` (a caret requirement, the floor): the release the
   published advisories GHSA-f2rq-878r-pgxv, GHSA-jx5m-j63r-7fgw,
   GHSA-pfv3-7r7f-mhgh, GHSA-jjhc-7hvh-c3hm, GHSA-mp9c-g2q9-q3qw and
@@ -90,6 +107,8 @@ order, the cron line and the statements that list and reset a row.
   where the lock carries it, this package's own version;
   bsv-middleware-cloudflare stays `=0.7.8` (core 0.4.7). `/health`'s
   `build.crates` names 0.3.4 and 0.8.15.
+- No source change (the version guard in `src/health.rs`'s test only), no
+  binding, wrangler or route change, and no stored-data migration.
 - The advertisement figure of 0.3.3 (`ADVERT_BEEF_MAX_BYTES`, 614,400 bytes)
   was read again at this pin and stays as it is; it is read again at each
   bsv-rs pin of this crate.

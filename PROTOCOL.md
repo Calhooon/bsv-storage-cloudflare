@@ -527,7 +527,7 @@ storage.bucket(GCP_BUCKET_NAME).file(`cdn/${objectIdentifier}`).setMetadata({
 **Line References**
 - Route handler: `src/routes/renew.ts:34–229`
 
-**This Worker's `/renew` (0.3.4), in order** (`src/routes/renew.rs`,
+**This Worker's `/renew` (0.3.5), in order** (`src/routes/renew.rs`,
 `src/renewal.rs`, `src/pass.rs`):
 
 1. Before any 402: parse the body; `listOutputs` the advert by its

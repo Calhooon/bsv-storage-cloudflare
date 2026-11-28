@@ -1,4 +1,4 @@
--- 0.3.4: what each paid /renew's renewing step came to (renewals): the
+-- 0.3.5: what each paid /renew's renewing step came to (renewals): the
 -- renewing transaction, its outcome (served, not_made, no_word), the renewed
 -- advert's admission by the overlay (admitted, not_admitted, refused,
 -- stopped) with the runs of the hourly pass and the overlay's reason, the

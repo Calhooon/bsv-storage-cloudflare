@@ -1,6 +1,6 @@
 # bsv-storage-cloudflare
 
-UHRP file-storage service **0.3.4** on Cloudflare Workers, written in Rust
+UHRP file-storage service **0.3.5** on Cloudflare Workers, written in Rust
 and compiled to WASM. It implements the six client routes of
 [`@bsv/uhrp-storage-server`](https://github.com/bsv-blockchain/storage-server)
 with Cloudflare R2 for file bytes and a post-upload Queue consumer for
@@ -44,7 +44,7 @@ none of its bytes. It is served once a broadcaster takes the renewing
 transaction; the overlay's admission of the renewed advert follows it (one
 re-submit on the same queue, then an hourly pass of at most 20 rows). See
 the [renew route](./src/routes/renew.rs) and
-[DEPLOYMENT.md](./DEPLOYMENT.md#the-renewals-and-the-hourly-pass-034).
+[DEPLOYMENT.md](./DEPLOYMENT.md#the-renewals-and-the-hourly-pass-035).
 
 ## Health and release status
 
@@ -55,8 +55,8 @@ establishing wallet, overlay or storage readiness. See the
 [health implementation](./src/health.rs) and [0.2.1 release notes](./CHANGELOG.md#021).
 
 Public tags exist up to
-[`v0.3.3`](https://github.com/Calhooon/bsv-storage-cloudflare/releases/tag/v0.3.3);
-0.3.4 is this manifest's version. A live upload, public GET, hash check, advertisement and renewal round
+[`v0.3.4`](https://github.com/Calhooon/bsv-storage-cloudflare/releases/tag/v0.3.4);
+0.3.5 is this manifest's version. A live upload, public GET, hash check, advertisement and renewal round
 trip on the current line is pending. The historical checks below do not
 establish current deployment readiness.
 

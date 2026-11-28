@@ -440,7 +440,7 @@ pub(crate) const LOOKUP_ANSWER_MAX_BYTES: usize = 4 * 1024 * 1024;
 /// The most bytes of a SHIP advertisement's BEEF the fan-out parses:
 /// 614,400 (600 KiB), the figure this stack's Workers hold a BEEF they
 /// parse to. A longer one is skipped as an unreadable one is
-/// ([`Skip::Unreadable`]), not parsed. The figure is provisional: it is read again at this crate's next bsv-rs pin and raised to the door's natural figure then.
+/// ([`Skip::Unreadable`]), not parsed. The figure is provisional: it is read again at each bsv-rs pin of this crate and raised to the door's natural figure when a pin allows it.
 pub(crate) const ADVERT_BEEF_MAX_BYTES: usize = 614_400;
 
 /// Append `chunk` to `body` unless the body would pass `cap`.
