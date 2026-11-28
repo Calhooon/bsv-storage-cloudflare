@@ -156,7 +156,7 @@ The [manifest](./Cargo.toml) pins registry dependencies:
 
 | Crate | Exact version |
 |---|---|
-| `bsv-rs` | `0.8.14` (caret) |
+| `bsv-rs` | `0.8.15` (caret) |
 | `bsv-middleware-cloudflare` | `=0.7.8` |
 | `bsv-worker-build-info` | `=0.1.0` |
 

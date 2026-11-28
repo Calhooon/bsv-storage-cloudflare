@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.3.4 (unreleased)
+
+- bsv-rs `0.8.15` (a caret requirement, the floor): the release the
+  published advisories GHSA-f2rq-878r-pgxv, GHSA-jx5m-j63r-7fgw,
+  GHSA-pfv3-7r7f-mhgh, GHSA-jjhc-7hvh-c3hm, GHSA-mp9c-g2q9-q3qw and
+  GHSA-jgrp-wvcx-vxf3 name as patched. Every lock moves to it (the root,
+  `tests/heap`, `tests/compat`'s `new`, `tests/workerd/kit`,
+  `tests/workerd/wallet`), and in each lock nothing moves but bsv-rs and,
+  where the lock carries it, this package's own version;
+  bsv-middleware-cloudflare stays `=0.7.8` (core 0.4.7). `/health`'s
+  `build.crates` names 0.3.4 and 0.8.15.
+- No source change (the version guard in `src/health.rs`'s test only), no
+  binding, wrangler or route change, and no stored-data migration.
+
 ## 0.3.3 (2026-11-28)
 
 - bsv-middleware-cloudflare `=0.7.8` (core 0.4.7), still an exact pin;
