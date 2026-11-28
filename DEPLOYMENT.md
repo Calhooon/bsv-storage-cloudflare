@@ -56,14 +56,15 @@ wrangler d1 create uhrp-payment-claims
 The paid routes claim each payment's derivation prefix in the `CLAIMS` D1
 database and record what each won claim was granted there. Its schema is
 `migrations/` (the middleware's `payment_claims` table and
-`payment_grants`), applied **before** the Worker that reads it is deployed:
+`payment_grants`, and from 0.3.5 `renewals`, migration `0002`), applied
+**before** the Worker that reads it is deployed:
 
 ```bash
 wrangler d1 migrations apply CLAIMS --remote
 ```
 
 **Success**: `wrangler d1 execute CLAIMS --remote --command "SELECT name FROM sqlite_master WHERE type='table'"`
-lists `payment_claims` and `payment_grants`.
+lists `payment_claims`, `payment_grants` and `renewals`.
 
 **The order, for every instance (`wrangler.toml`, and
 `wrangler.composer.toml` with its own database and `-c
@@ -75,7 +76,7 @@ wrangler.composer.toml` on each command):**
    `<your-database-id>`).
 2. `wrangler d1 migrations apply CLAIMS --remote`, from the checkout of the
    commit being deployed.
-3. The success check above: both tables listed.
+3. The success check above: the three tables listed.
 4. Only then `wrangler deploy` (Step 6).
 
 **What the Worker answers without them.** If the `CLAIMS` binding is
@@ -130,9 +131,9 @@ A grant row's `state`:
 
 | state | meaning |
 |---|---|
-| `paid` | the wallet accepted the payment; the route's answer is not recorded yet. A row still `paid` after ten minutes (`answered_at` null) is a claim whose second grant write failed: it was served at most once |
-| `granted` | the route answered 2xx: the upload or renewal was served |
-| `refused` | the route answered otherwise (its `status`): the payment was accepted and the route did not serve it |
+| `paid` | the wallet accepted the payment and no service is recorded. With `answered_at` null after ten minutes: a claim whose second grant write failed, served at most once. On `/renew` with `answered_at` set (status 500 or 502): the payment was taken and no renewal was served; its `renewals` row says what the renewing step came to |
+| `granted` | `/upload` answered 2xx; `/renew` answered 200, a broadcaster having taken the renewing transaction (or the hourly pass found the take later) |
+| `refused` | `/upload` answered otherwise (its `status`): the payment was accepted and the route did not serve it. `/renew` never writes it |
 
 A held claim with no grant row is one of: a prefix served before 0.3.1,
 held from its key-value record (its `txid` is the record's, or none for
@@ -158,6 +159,90 @@ wrangler d1 execute CLAIMS --remote --command "UPDATE payment_claims SET release
 
 The released transaction is then served once on its retry, and no other
 transaction can take the prefix.
+
+### The renewals and the hourly pass (0.3.5)
+
+Each paid `/renew` whose renewing step ran has a `renewals` row under the
+payment's prefix (migration `0002_renewals.sql`, applied before the deploy
+as above). The row is written, with the outcome `no_word`, before the
+renewing transaction is handed to the wallet, and settled once the route
+has the wallet's word; a request that ends between the two leaves it
+`no_word` for the pass. Its columns: `payment_txid`, `renewing_txid`,
+`outcome` (`served`, `not_made`, `no_word`), `advert` (`admitted`,
+`not_admitted`, `refused`, `stopped`, or null when the advert has no
+duty), `runs`, `reason` (the overlay's last answer that was not an
+admission, its kind first: `no answer: …`, `no answer within the
+deadline`, `HTTP <status>`, `not an admission: …`, `an empty admission:
+…`; for a refusal, `HTTP <status>: <the overlay's message>`),
+`new_expiry_time`, `advert_beef` (base64 of the renewed
+advert's Atomic BEEF, kept up to 512 KiB), `queued_until`, `queue_tries`,
+`created_at`, `updated_at`.
+
+The Worker's scheduled handler runs the hourly pass. Its trigger is the
+line `wrangler.toml` and `wrangler.composer.toml` both carry:
+
+```toml
+[triggers]
+crons = ["0 * * * *"]
+```
+
+Each deployed config carries it. A deployment whose config has no cron
+line serves renewals and runs no pass: once the queue's deliveries of a
+re-submit are over, an advert `not_admitted` is not submitted again, and
+the wallet is not asked about a `no_word` row. Those rows then wait for an
+operator; the pass takes them from its first run after a deploy with the
+line.
+
+A run reads at most 20 rows, fewest `runs` first and then oldest, so rows
+that keep faulting do not hold newer ones back, and reads each once: a
+served row whose grant still reads `paid` (the grant's second write did not
+land) has its grant set `granted`; a row `not_admitted` whose
+`queued_until` is null or past gets one submit of its advert to the
+overlay; a row `no_word` whose grant is `paid` gets one `findProvenTxReqs`
+question to the wallet for its `renewing_txid` (a take grants it and
+submits its advert in the same run). A fault or no word adds one to
+`runs`; at 72 runs the row is `stopped`. While more than 20 rows wait, a
+row with more runs waits its turn, so its 72 runs can take longer than
+three days. The overlay's answer is a refusal only when it is a 400 in its
+error shape naming its script interpreter's refusal of the transaction's
+spend (the code `ERR_SCRIPT_REFUSED`, or a message starting `script
+verification failed (subject `); every other answer, every other 4xx
+included, is a fault and is tried again within these bounds.
+
+What the pass sends out, at most, in an hour: 20 submits to this
+deployment's overlay (the `OVERLAY_SUBMIT_URL` host, through the `OVERLAY`
+binding when it is bound), and 20 questions to the wallet (a wallet call
+is a BRC-103 handshake and one request). A row the overlay admits is then
+announced once to the other hosts, as any renewal's advert is (the SHIP
+fan-out: the trackers' lookups and the hosts they name). The pass makes
+and signs no transaction and touches no stored object.
+
+The rows waiting on an operator, and the not-made renewals (payments taken
+with no renewal served):
+
+```bash
+wrangler d1 execute CLAIMS --remote --command "SELECT r.prefix, r.payment_txid, r.renewing_txid, r.outcome, r.advert, r.runs, r.reason, g.satoshis, g.state, datetime(r.created_at, 'unixepoch') AS created FROM renewals r LEFT JOIN payment_grants g ON g.prefix = r.prefix WHERE r.advert IN ('refused', 'stopped') OR r.outcome IN ('not_made', 'no_word') ORDER BY r.created_at"
+```
+
+A `refused` advert is the overlay's answer, with its `reason`; the Worker
+does not submit it again. A `stopped` row is tried no more. An operator
+resets either, which puts it back to the pass with no runs:
+
+```bash
+wrangler d1 execute CLAIMS --remote --command "UPDATE renewals SET advert = CASE WHEN outcome = 'no_word' THEN NULL ELSE 'not_admitted' END, runs = 0, queued_until = NULL, updated_at = unixepoch() WHERE prefix = '<prefix>' AND advert IN ('refused', 'stopped')"
+```
+
+When to reset, by the row's `reason`: a `stopped` row once the overlay (or
+the wallet, for a row whose `outcome` is `no_word`) answers again; a
+`refused` row when the overlay's reason points at the overlay rather than
+at the transaction (its script interpreter, or a source of the transaction
+it did not hold), once that is mended. A reset row is taken by the pass at
+its next run.
+
+**A rollback to 0.3.4 or 0.3.3** keeps migration `0002` in place: each
+reads and writes `payment_claims` and `payment_grants` only, and `0002`
+alters neither. Remove the `[triggers]` line from the config deployed with
+either, which has no scheduled handler.
 
 ---
 

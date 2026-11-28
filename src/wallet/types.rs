@@ -366,6 +366,28 @@ pub struct ProcessActionResult {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// findProvenTxReqs
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Arguments of `findProvenTxReqs`: the transactions to read.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FindProvenTxReqsRequest {
+    pub txids: Vec<String>,
+}
+
+/// One row of `findProvenTxReqs`: the transaction and its broadcast
+/// request's status word. The row's other fields are not read.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProvenTxReqRow {
+    #[serde(default)]
+    pub txid: String,
+    #[serde(default)]
+    pub status: String,
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // signer output
 // ────────────────────────────────────────────────────────────────────────────
 

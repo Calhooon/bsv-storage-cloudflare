@@ -47,6 +47,9 @@ pub const ERR_OLD_ADVERTISEMENT_NOT_FOUND: &str = "ERR_OLD_ADVERTISEMENT_NOT_FOU
 pub const ERR_CREATE_ACTION_FAILED: &str = "ERR_CREATE_ACTION_FAILED";
 pub const ERR_SIGNING_OLD_ADVERTISEMENT: &str = "ERR_SIGNING_OLD_ADVERTISEMENT";
 pub const ERR_INTERNAL_RENEW: &str = "ERR_INTERNAL_RENEW";
+/// The advert's stored object is missing, or its size differs from the
+/// advert's content length: a free 404 before any payment.
+pub const ERR_FILE_NOT_FOUND: &str = "ERR_FILE_NOT_FOUND";
 
 // /advertise (§6). TS uses `ADMIN_TOKEN` body field; the Rust port replaces
 // that with a BRC-31 identity-key allowlist (`ADMIN_IDENTITY_KEYS` secret).

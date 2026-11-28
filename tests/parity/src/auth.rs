@@ -64,10 +64,15 @@ type PendingMap = Arc<Mutex<HashMap<[u8; 32], oneshot::Sender<HttpResponse>>>>;
 /// ID, kept so that this client verifies every response's signature itself.
 type KeptMap = Arc<std::sync::Mutex<HashMap<[u8; 32], AuthMessage>>>;
 
+/// What the transport's callback returns.
+type CallbackFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = bsv_rs::Result<()>> + Send>>;
+
 /// [`SimplifiedFetchTransport`], keeping each General response message.
 pub struct KeepingTransport {
     inner: SimplifiedFetchTransport,
     kept: KeptMap,
+    pending: PendingMap,
 }
 
 #[async_trait::async_trait]
@@ -78,15 +83,37 @@ impl Transport for KeepingTransport {
 
     fn set_callback(&self, callback: Box<TransportCallback>) {
         let kept = self.kept.clone();
+        let pending = self.pending.clone();
         self.inner
-            .set_callback(Box::new(move |message: AuthMessage| {
-                if message.message_type == MessageType::General {
-                    if let Some(Ok(response)) =
-                        message.payload.as_deref().map(HttpResponse::from_payload)
-                    {
-                        if let Ok(mut map) = kept.lock() {
-                            map.insert(response.request_id, message.clone());
-                        }
+            .set_callback(Box::new(move |message: AuthMessage| -> CallbackFuture {
+                let response = if message.message_type == MessageType::General {
+                    message
+                        .payload
+                        .as_deref()
+                        .map(HttpResponse::from_payload)
+                        .and_then(|r| r.ok())
+                } else {
+                    None
+                };
+                if let Some(ref response) = response {
+                    if let Ok(mut map) = kept.lock() {
+                        map.insert(response.request_id, message.clone());
+                    }
+                }
+                // An answer that carries no authentication (no yourNonce, no
+                // signature: the transport names it with this client's own
+                // identity) is not a message of the session, and the peer
+                // refuses it as one. It goes to its request as it is, which
+                // reads it as unsigned.
+                if message.your_nonce.is_none() && message.signature.is_none() {
+                    if let Some(response) = response {
+                        let pending = pending.clone();
+                        return Box::pin(async move {
+                            if let Some(tx) = pending.lock().await.remove(&response.request_id) {
+                                let _ = tx.send(response);
+                            }
+                            Ok(())
+                        });
                     }
                 }
                 callback(message)
@@ -141,11 +168,12 @@ impl AuthClient {
     pub fn new(base_url: &str, private_key: &PrivateKey) -> Result<Self, String> {
         let wallet = ProtoWallet::new(Some(private_key.clone()));
         let kept: KeptMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
         let transport = KeepingTransport {
             inner: SimplifiedFetchTransport::new(base_url),
             kept: kept.clone(),
+            pending: pending.clone(),
         };
-        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
 
         let peer = Arc::new(Peer::new(PeerOptions {
             wallet,

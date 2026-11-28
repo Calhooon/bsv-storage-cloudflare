@@ -42,10 +42,9 @@ pub(crate) const MAX_UPLOAD_BYTES: f64 = 11_000_000_000.0;
 /// Preserved verbatim — note this is 604000 seconds, NOT the full 604800 (7d) S3 max.
 const UPLOAD_URL_EXPIRES_SECONDS: u64 = 604_000;
 
-/// Custom-time buffer past expiry, `getUploadURL.ts:52`. `pub(crate)`:
-/// `/renew` re-stamps custom-time with the same buffer when extending an
-/// object, and the queue consumer's dup-advert guard tolerates it when
-/// comparing on-chain expiries against custom-time.
+/// Custom-time buffer past expiry, `getUploadURL.ts:52`. `pub(crate)`: the
+/// queue consumer's dup-advert guard tolerates it when comparing on-chain
+/// expiries against custom-time.
 pub(crate) const CUSTOM_TIME_BUFFER_SECONDS: u64 = 300;
 
 /// Handle `POST /upload`.
@@ -308,8 +307,7 @@ fn build_presigned_upload(
 }
 
 /// Format Unix-epoch **milliseconds** as ISO-8601 with `.NNNZ` suffix, matching
-/// JS `new Date(ms).toISOString()` output. `pub(crate)`: `/renew` reuses it so
-/// a renewed object's `custom-time` is byte-identical in shape to the value
+/// JS `new Date(ms).toISOString()` output: the shape of the `custom-time`
 /// the presigner stamps at upload time.
 pub(crate) fn iso8601_millis(ms: u64) -> String {
     let secs = ms / 1000;

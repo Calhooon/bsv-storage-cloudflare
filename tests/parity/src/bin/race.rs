@@ -247,6 +247,19 @@ async fn seed_advert(
     uploader: &PublicKey,
     content_length: u64,
 ) -> (String, String, u64) {
+    let (url, tag, expiry, _) =
+        seed_advert_with(stand_in, uploader, content_length, Some(content_length)).await;
+    (url, tag, expiry)
+}
+
+/// [`seed_advert`], its stored object `cdn/<object>` of `object_size` bytes
+/// (none for `None`). Returns the object's key too.
+async fn seed_advert_with(
+    stand_in: &str,
+    uploader: &PublicKey,
+    content_length: u64,
+    object_size: Option<u64>,
+) -> (String, String, u64, String) {
     let hash = sha256(&random32());
     let mut payload = vec![0xce, 0x00];
     payload.extend_from_slice(&hash);
@@ -305,6 +318,8 @@ async fn seed_advert(
             "lockingScript": hex::encode(&script),
             "tags": tags,
             "beef": beef.to_binary(),
+            "object": object_size.map(|_| format!("cdn/{object}")),
+            "size": object_size,
         }))
         .send()
         .await
@@ -313,7 +328,93 @@ async fn seed_advert(
         .await
         .unwrap();
     assert_eq!(seeded["seeded"], tag);
-    (url, tag, expiry)
+    (url, tag, expiry, format!("cdn/{object}"))
+}
+
+/// Set the stand-in's knob `name` (empty for the normal answer).
+async fn knob(stand_in: &str, name: &str, value: &str) {
+    reqwest::get(format!("{stand_in}/knob?{name}={value}"))
+        .await
+        .unwrap();
+}
+
+/// The stored object's etag and upload time, as the stand-in reads them
+/// from the bucket the Worker reads.
+async fn object(stand_in: &str, key: &str) -> Value {
+    reqwest::get(format!("{stand_in}/object?key={key}"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+
+/// The stand-in's advert for a tag as it holds it, and its call counts.
+async fn advert_raw(stand_in: &str, tag: &str) -> Value {
+    reqwest::get(format!("{stand_in}/advert?tag={tag}"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+
+async fn releases(stand_in: &str, tag: &str) -> u64 {
+    advert_raw(stand_in, tag).await["calls"]["release"]
+        .as_u64()
+        .unwrap()
+}
+
+async fn finds(stand_in: &str, txid: &str) -> u64 {
+    let v: Value = reqwest::get(format!("{stand_in}/finds?txid={txid}"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    v["finds"].as_u64().unwrap()
+}
+
+/// Quote, pay and send one `/renew` of `uhrp` for `minutes`: the answer,
+/// its body and the satoshis paid.
+async fn renew_paid(
+    c: &AuthClient,
+    payer: &PrivateKey,
+    server: &PublicKey,
+    uhrp: &str,
+    minutes: u64,
+) -> (Answer, Value, u64) {
+    let body = json!({ "uhrpUrl": uhrp, "additionalMinutes": minutes }).to_string();
+    let (prefix, sats) = quote_on(c, "/renew", &body).await;
+    let (h, _) = payment(payer, server, &prefix, sats);
+    let (answer, value) = pay_on(c, "/renew", &body, &h).await;
+    (answer, value, sats)
+}
+
+/// A request to a paid route with no payment header: the answer.
+async fn unpaid_on(c: &AuthClient, route: &str, body: &str) -> Answer {
+    let r = c
+        .request(
+            "POST",
+            route,
+            "",
+            body.as_bytes().to_vec(),
+            vec![("content-type".into(), "application/json".into())],
+        )
+        .await
+        .expect("an answer");
+    let value: Value = serde_json::from_slice(&r.body).unwrap_or(Value::Null);
+    let served = r.status == 200 && value["status"] == "success";
+    Answer {
+        status: r.status,
+        code: if served {
+            String::new()
+        } else {
+            value["code"].as_str().unwrap_or_default().to_string()
+        },
+        served,
+        signed: r.signed,
+    }
 }
 
 /// The stand-in's advert for a tag: its expiry (from its tag) and the
@@ -573,13 +674,24 @@ async fn main() {
     {
         let minutes = 90u64;
         let content_length = 2_000_000u64;
-        let (uhrp, tag, expiry) = seed_advert(stand_in, &payer.public_key(), content_length).await;
+        let (uhrp, tag, expiry, key) = seed_advert_with(
+            stand_in,
+            &payer.public_key(),
+            content_length,
+            Some(content_length),
+        )
+        .await;
+        let stored = object(stand_in, &key).await;
+        assert_eq!(stored["exists"], true);
         let body = json!({ "uhrpUrl": uhrp, "additionalMinutes": minutes }).to_string();
         let (prefix, sats) = quote_on(&first, "/renew", &body).await;
         let (h, k) = payment(&payer, &server, &prefix, sats);
         let before = submits(stand_in).await;
         let (renewed, answer) = pay_on(&first, "/renew", &body, &h).await;
         assert_eq!(renewed, served(), "{answer}");
+        assert_eq!(answer["overlayAdmitted"], true, "{answer}");
+        // The stored object is untouched: the same etag and upload time.
+        assert_eq!(object(stand_in, &key).await, stored);
         let new_expiry = expiry + minutes * 60;
         assert_eq!(answer["prevExpiryTime"].as_u64(), Some(expiry), "{answer}");
         assert_eq!(
@@ -605,11 +717,12 @@ async fn main() {
         );
         assert_eq!(submits(stand_in).await, before + 1);
         println!(
-            "/renew paid: served once (expiry {expiry} -> {new_expiry}, {minutes} minutes, {sats} sats); the same payment again: signed 409 ERR_PAYMENT_REPLAYED, the expiry unchanged, one createAction and one processAction; another transaction under the prefix: signed 400 ERR_PAYMENT_INVALID; wallet asked once"
+            "/renew paid: served once (expiry {expiry} -> {new_expiry}, {minutes} minutes, {sats} sats); the same payment again: signed 409 ERR_PAYMENT_REPLAYED, the expiry unchanged, one createAction and one processAction, overlayAdmitted true, the stored object's etag and upload time unchanged; another transaction under the prefix: signed 400 ERR_PAYMENT_INVALID; wallet asked once"
         );
         granted.push(json!({
             "uhrpUrl": uhrp, "minutes": minutes, "expiry": new_expiry,
             "satoshis": sats, "payer": payer.public_key().to_hex(), "fileSize": content_length,
+            "advert": "admitted",
         }));
     }
     for n in [2usize, 4, 16] {
@@ -646,8 +759,10 @@ async fn main() {
         granted.push(json!({
             "uhrpUrl": uhrp, "minutes": minutes, "expiry": now,
             "satoshis": sats, "payer": payer.public_key().to_hex(), "fileSize": 1_000_000,
+            "advert": "admitted",
         }));
     }
+    let paid_rows = renew_outcomes(stand_in, url, &first, &payer, &server, &mut granted).await;
 
     // 6. No CLAIMS binding; the binding and no tables.
     for (name, build) in [
@@ -802,11 +917,262 @@ async fn main() {
     }
 
     println!("renew-grants {}", serde_json::Value::Array(granted));
+    println!("renew-paid {}", serde_json::Value::Array(paid_rows));
     println!(
         "upload-grants {}",
         serde_json::Value::Array(UPLOADS.lock().unwrap().clone())
     );
     println!("race: ok");
+}
+
+/// 5b. `/renew`'s outcomes: a stored object missing or of another size (a
+/// free 404, nothing claimed); a renewal served with the overlay refusing or
+/// faulting (the 200, `overlayAdmitted` false; a refusal never submitted
+/// again, a fault re-submitted by the queue, four deliveries in all); a
+/// renewal not made at `createAction` after the one more try, at the
+/// signature (the action released) and at `processAction` (refused by name
+/// with no record, or `failed`); served when `processAction` refuses a
+/// transaction it already processed and its record reads a take; no word
+/// (the answer lost, or the transaction untaken); and two payers of one
+/// file at once, in the order the stand-in enforces (the second's re-read
+/// after the first is processed), both served. Returns the rows the
+/// payments not served leave (`renew-paid`), each with the payment's txid
+/// its answer names.
+async fn renew_outcomes(
+    stand_in: &str,
+    url: &str,
+    first: &AuthClient,
+    payer: &PrivateKey,
+    server: &PublicKey,
+    granted: &mut Vec<Value>,
+) -> Vec<Value> {
+    let pk = payer.public_key();
+    let mut paid_rows = Vec::new();
+    let minutes = 30u64;
+    let size = 1_000_000u64;
+    let grant = |uhrp: &str, expiry: u64, sats: u64, advert: &str| {
+        json!({
+            "uhrpUrl": uhrp, "minutes": minutes, "expiry": expiry,
+            "satoshis": sats, "payer": pk.to_hex(), "fileSize": size, "advert": advert,
+        })
+    };
+
+    // A missing object, and an object of another size: a free 404.
+    {
+        let (uhrp, tag, expiry, _) = seed_advert_with(stand_in, &pk, size, None).await;
+        let body = json!({ "uhrpUrl": uhrp, "additionalMinutes": minutes }).to_string();
+        let answer = unpaid_on(first, "/renew", &body).await;
+        assert_eq!(answer, refused(404, "ERR_FILE_NOT_FOUND"));
+        // A payment sent with it is not claimed: the same payment then
+        // serves the route it was quoted for.
+        let (prefix, sats) = quote(first).await;
+        let (h, k) = payment(payer, server, &prefix, sats);
+        let (with_payment, _) = pay_on(first, "/renew", &body, &h).await;
+        assert_eq!(with_payment, refused(404, "ERR_FILE_NOT_FOUND"));
+        assert_eq!(calls(stand_in, &k).await, 0);
+        assert_eq!(advert(stand_in, &tag).await, (expiry, 0, 0));
+        assert_eq!(pay(first, &h).await, served());
+        let (uhrp2, tag2, expiry2, _) = seed_advert_with(stand_in, &pk, size, Some(size - 1)).await;
+        let body2 = json!({ "uhrpUrl": uhrp2, "additionalMinutes": minutes }).to_string();
+        let other_size = unpaid_on(first, "/renew", &body2).await;
+        assert_eq!(other_size, refused(404, "ERR_FILE_NOT_FOUND"));
+        assert_eq!(advert(stand_in, &tag2).await, (expiry2, 0, 0));
+        println!(
+            "/renew of an advert whose object is missing: the signed 404 ERR_FILE_NOT_FOUND before any 402; with a payment header: the same 404, the wallet not asked, the payment then served on /upload (nothing claimed); an object of another size: the same 404; no createAction"
+        );
+    }
+
+    // Served, the overlay refusing: never submitted again.
+    {
+        let (uhrp, tag, expiry) = seed_advert(stand_in, &pk, size).await;
+        knob(stand_in, "overlay", "refuse").await;
+        let before = submits(stand_in).await;
+        let (answer, body, sats) = renew_paid(first, payer, server, &uhrp, minutes).await;
+        knob(stand_in, "overlay", "").await;
+        assert_eq!(answer, served(), "{body}");
+        assert_eq!(body["overlayAdmitted"], false, "{body}");
+        assert_eq!(advert(stand_in, &tag).await, (expiry + minutes * 60, 1, 1));
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        assert_eq!(submits(stand_in).await, before + 1);
+        granted.push(grant(&uhrp, expiry + minutes * 60, sats, "refused"));
+        println!(
+            "/renew with the overlay refusing: the signed 200, overlayAdmitted false; one submit and no other"
+        );
+    }
+
+    // Served, the overlay faulting: the queue's four deliveries, then no more.
+    {
+        let (uhrp, tag, expiry) = seed_advert(stand_in, &pk, size).await;
+        knob(stand_in, "overlay", "fault").await;
+        let before = submits(stand_in).await;
+        let (answer, body, sats) = renew_paid(first, payer, server, &uhrp, minutes).await;
+        assert_eq!(answer, served(), "{body}");
+        assert_eq!(body["overlayAdmitted"], false, "{body}");
+        assert_eq!(advert(stand_in, &tag).await, (expiry + minutes * 60, 1, 1));
+        let mut waited = 0;
+        while submits(stand_in).await < before + 5 && waited < 240 {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            waited += 1;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        knob(stand_in, "overlay", "").await;
+        let submitted = submits(stand_in).await - before;
+        assert_eq!(submitted, 5, "the route's submit and four deliveries");
+        granted.push(grant(&uhrp, expiry + minutes * 60, sats, "not_admitted"));
+        println!(
+            "/renew with the overlay faulting: the signed 200, overlayAdmitted false; the route's submit, then the queue's re-submit delivered {} times ({waited}s), then none",
+            submitted - 1
+        );
+    }
+
+    // Not made at createAction, after the one more try.
+    {
+        let (uhrp, tag, expiry) = seed_advert(stand_in, &pk, size).await;
+        knob(stand_in, "create", "spent").await;
+        let (answer, body, _) = renew_paid(first, payer, server, &uhrp, minutes).await;
+        knob(stand_in, "create", "").await;
+        assert_eq!(answer, refused(500, "ERR_RENEWAL_NOT_MADE"), "{body}");
+        let txid = body["paymentTxid"].as_str().unwrap().to_string();
+        assert_eq!(
+            body["description"],
+            format!("The payment was taken. The renewal was not made. It is recorded under {txid}. A new payment renews the file.")
+        );
+        assert_eq!(advert(stand_in, &tag).await, (expiry, 2, 0));
+        paid_rows.push(
+            json!({ "paymentTxid": txid, "status": 500, "outcome": "not_made", "renewing": false }),
+        );
+        println!(
+            "/renew with createAction refusing the spent advert: the one re-read and one more try (createAction 2), then the signed 500 ERR_RENEWAL_NOT_MADE naming the payment; no processAction; the advert unchanged"
+        );
+    }
+
+    // Not made at the signature: the action released.
+    {
+        let (uhrp, tag, expiry) = seed_advert(stand_in, &pk, size).await;
+        knob(stand_in, "create", "unsignable").await;
+        let (answer, body, _) = renew_paid(first, payer, server, &uhrp, minutes).await;
+        knob(stand_in, "create", "").await;
+        assert_eq!(answer, refused(500, "ERR_RENEWAL_NOT_MADE"), "{body}");
+        assert_eq!(advert(stand_in, &tag).await, (expiry, 1, 0));
+        assert_eq!(releases(stand_in, &tag).await, 1);
+        paid_rows.push(json!({ "paymentTxid": body["paymentTxid"], "status": 500, "outcome": "not_made", "renewing": false }));
+        // Released: a new payment renews it.
+        let (again, body2, sats) = renew_paid(first, payer, server, &uhrp, minutes).await;
+        assert_eq!(again, served(), "{body2}");
+        assert_eq!(advert(stand_in, &tag).await, (expiry + minutes * 60, 2, 1));
+        granted.push(grant(&uhrp, expiry + minutes * 60, sats, "admitted"));
+        println!(
+            "/renew failing at the signature: the action released once, the signed 500 ERR_RENEWAL_NOT_MADE, no processAction; a new payment then renews the advert"
+        );
+    }
+
+    // Not made at processAction: refused by name with no record of the
+    // transaction (the action released), or failed (its record invalid).
+    for (word, released) in [("refuse", 1u64), ("failed", 0)] {
+        let (uhrp, tag, expiry) = seed_advert(stand_in, &pk, size).await;
+        knob(stand_in, "process", word).await;
+        let (answer, body, _) = renew_paid(first, payer, server, &uhrp, minutes).await;
+        knob(stand_in, "process", "").await;
+        assert_eq!(answer, refused(500, "ERR_RENEWAL_NOT_MADE"), "{body}");
+        assert_eq!(advert(stand_in, &tag).await, (expiry, 1, 1));
+        assert_eq!(releases(stand_in, &tag).await, released);
+        paid_rows.push(json!({ "paymentTxid": body["paymentTxid"], "status": 500, "outcome": "not_made", "renewing": true }));
+        println!(
+            "/renew with processAction {word}: the signed 500 ERR_RENEWAL_NOT_MADE; actions released {released}; the advert unchanged"
+        );
+    }
+
+    // processAction refuses a transaction it already processed: its record
+    // (a take) decides, and the renewal is served.
+    {
+        let (uhrp, tag, expiry) = seed_advert(stand_in, &pk, size).await;
+        knob(stand_in, "process", "processed").await;
+        let (answer, body, sats) = renew_paid(first, payer, server, &uhrp, minutes).await;
+        knob(stand_in, "process", "").await;
+        assert_eq!(answer, served(), "{body}");
+        assert_eq!(advert(stand_in, &tag).await, (expiry + minutes * 60, 1, 1));
+        assert_eq!(releases(stand_in, &tag).await, 0);
+        let renewing = advert_raw(stand_in, &tag).await["advert"]["txid"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(finds(stand_in, &renewing).await, 1);
+        granted.push(grant(&uhrp, expiry + minutes * 60, sats, "admitted"));
+        println!(
+            "/renew with processAction refusing a transaction it already processed: its record read once (unmined), the signed 200; no release"
+        );
+    }
+
+    // No word: the answer lost, or the transaction not taken.
+    // After any answer that is not a take, the record is read once.
+    for (word, asked) in [("lost", 1u64), ("untaken", 1)] {
+        let (uhrp, tag, expiry) = seed_advert(stand_in, &pk, size).await;
+        knob(stand_in, "process", word).await;
+        let (answer, body, sats) = renew_paid(first, payer, server, &uhrp, minutes).await;
+        knob(stand_in, "process", "").await;
+        assert_eq!(answer, refused(502, "ERR_RENEWAL_UNCONFIRMED"), "{body}");
+        let txid = body["paymentTxid"].as_str().unwrap().to_string();
+        assert_eq!(
+            body["description"],
+            format!("The payment was taken. This host has no word yet that the renewing transaction was sent. It is recorded under {txid}.")
+        );
+        // The wallet holds the renewing transaction (the advert moved).
+        assert_eq!(advert(stand_in, &tag).await, (expiry + minutes * 60, 1, 1));
+        let renewing = advert_raw(stand_in, &tag).await["advert"]["txid"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(finds(stand_in, &renewing).await, asked);
+        paid_rows.push(json!({
+            "paymentTxid": txid, "status": 502, "outcome": "no_word", "renewing": true,
+            "renewingTxid": renewing, "uhrpUrl": uhrp, "expiry": expiry + minutes * 60,
+            "satoshis": sats, "word": word,
+        }));
+        println!(
+            "/renew with processAction {word}: the signed 502 ERR_RENEWAL_UNCONFIRMED naming the payment; findProvenTxReqs {asked}"
+        );
+    }
+
+    // Two payers of one file at once, in the order the stand-in enforces:
+    // both served, two extensions.
+    {
+        let (uhrp, tag, expiry) = seed_advert(stand_in, &pk, size).await;
+        let body = json!({ "uhrpUrl": uhrp, "additionalMinutes": minutes }).to_string();
+        let two = clients(url, payer, 2).await;
+        let mut headers = Vec::new();
+        for c in &two {
+            let (prefix, sats) = quote_on(c, "/renew", &body).await;
+            headers.push((payment(payer, server, &prefix, sats).0, sats));
+        }
+        // The stand-in orders the two: the createAction that locks the advert
+        // answers once the other's createAction has met the lock, and the
+        // other's re-read answers once the first is processed.
+        knob(stand_in, "create", "gate").await;
+        let answers = futures_join(two.iter().zip(headers.iter()).map(|(c, (h, _))| {
+            let (c, h, b) = (c.clone(), h.clone(), body.clone());
+            async move { pay_on(&c, "/renew", &b, &h).await }
+        }))
+        .await;
+        knob(stand_in, "create", "").await;
+        for (a, v) in &answers {
+            assert_eq!(*a, served(), "{v}");
+        }
+        let mut expiries: Vec<u64> = answers
+            .iter()
+            .map(|(_, v)| v["newExpiryTime"].as_u64().unwrap())
+            .collect();
+        expiries.sort_unstable();
+        let (one, both) = (expiry + minutes * 60, expiry + 2 * minutes * 60);
+        assert_eq!(expiries, vec![one, both]);
+        assert_eq!(advert(stand_in, &tag).await, (both, 3, 2));
+        for (expiry, (_, sats)) in expiries.iter().zip(headers.iter()) {
+            granted.push(grant(&uhrp, *expiry, *sats, "admitted"));
+        }
+        println!(
+            "two payers of one file at once, the second's re-read after the first is processed: both served (expiry {expiry} -> {one} -> {both}); createAction 3 (the second payer's one more try), processAction 2"
+        );
+    }
+    paid_rows
 }
 
 /// `n` clients of `url`, each with its session open.

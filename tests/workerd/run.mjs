@@ -42,17 +42,38 @@
 //     10. a carried release frees only its own claim: a prefix the old
 //        build released, paid here at once by its transaction and by others,
 //        72 rounds: that transaction served at most once, no other.
+//     8b. /renew's outcomes (the stand-in told to answer otherwise, its
+//        knobs): an advert whose stored object is missing or of another
+//        size is a free 404 ERR_FILE_NOT_FOUND, nothing claimed; served
+//        with the overlay admitting (overlayAdmitted true, the stored
+//        object's etag and upload time unchanged), refusing (false, never
+//        submitted again) and faulting (false, the queue's re-submit
+//        delivered four times); not made at createAction after the one more
+//        try, at the signature (the action released) and at processAction
+//        (refused by name with no record, failed): the signed 500
+//        ERR_RENEWAL_NOT_MADE, the grant paid; served when processAction
+//        refuses a transaction it already processed and its record reads a
+//        take; no word (the answer lost, the transaction untaken): the
+//        signed 502 ERR_RENEWAL_UNCONFIRMED, the grant paid; two payers of
+//        one file at once, in the order the stand-in enforces: both served,
+//        two extensions; each grant and renewals row read against what the
+//        client was served;
+//     11. the hourly pass (the scheduled handler, fired by hand): the race's
+//        waiting rows, each ending of each kind, the cap of 20 fewest runs
+//        first and then oldest, a run with the overlay down and the next
+//        one, a served row's grant left paid set granted, rows of other
+//        kinds left alone, no stored object touched.
 //
 // Build first (worker-build 0.8.4, --release): kit/, wallet/ and the
 // repository root. Then `npm ci && node run.mjs store` (or `worker`).
 import { resolve, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { readFileSync } from 'node:fs'
+import { readFileSync, readdirSync } from 'node:fs'
 import { randomBytes } from 'node:crypto'
-import { spawnSync } from 'node:child_process'
+import { spawn } from 'node:child_process'
 import assert from 'node:assert/strict'
 
-const { Miniflare } = await import(process.env.MINIFLARE_MODULE ?? 'miniflare')
+const { Miniflare, Log, LogLevel } = await import(process.env.MINIFLARE_MODULE ?? 'miniflare')
 
 const here = dirname(fileURLToPath(import.meta.url))
 const stage = process.argv[2] ?? 'store'
@@ -63,14 +84,18 @@ const modulesRules = [
   { type: 'CompiledWasm', include: ['**/*.wasm'] },
 ]
 
-/// The migration's statements, for a fresh local D1.
-const migration = readFileSync(resolve(here, '../../migrations/0001_payment_claims.sql'), 'utf8')
-  .split('\n')
-  .filter(l => !l.startsWith('--'))
-  .join('\n')
-  .split(';')
-  .map(s => s.trim())
-  .filter(Boolean)
+/// The migrations' statements, in order, for a fresh local D1.
+const migrationsDir = resolve(here, '../../migrations')
+const migration = readdirSync(migrationsDir)
+  .filter(f => f.endsWith('.sql'))
+  .sort()
+  .flatMap(f => readFileSync(resolve(migrationsDir, f), 'utf8')
+    .split('\n')
+    .filter(l => !l.startsWith('--'))
+    .join('\n')
+    .split(';')
+    .map(s => s.trim())
+    .filter(Boolean))
 
 async function migrate(db) {
   for (const statement of migration) await db.prepare(statement).run()
@@ -289,8 +314,16 @@ async function workerStage() {
     ...extra,
   })
   const mf = new Miniflare({
+    // The scheduled handler is fired by hand (stage 11).
+    unsafeTriggerHandlers: true,
+    // The queue's deliveries (each batch's acks) in the log.
+    log: new Log(LogLevel.INFO),
     workers: [
-      storage('storage', resolve(root, 'build/worker'), { d1Databases: { CLAIMS: 'claims' } }),
+      storage('storage', resolve(root, 'build/worker'), {
+        d1Databases: { CLAIMS: 'claims' },
+        // The consumer of the post-upload queue (wrangler.toml's figures).
+        queueConsumers: { 'uhrp-post-upload': { maxBatchSize: 10, maxBatchTimeout: 1, maxRetries: 3 } },
+      }),
       storage('storage-old', oldBuild, {}),
       storage('storage-no-binding', resolve(root, 'build/worker'), {}),
       storage('storage-no-table', resolve(root, 'build/worker'), { d1Databases: { CLAIMS: 'claims-empty' } }),
@@ -303,6 +336,9 @@ async function workerStage() {
         compatibilityDate: '2024-01-01',
         bindings: { WALLET_DELAY_MS: '150' },
         kvNamespaces: { AUTH_SESSIONS: 'wallet-sessions', STAND_IN: 'stand-in' },
+        // The bucket the storage Worker reads: the stand-in seeds each
+        // advert's object in it.
+        r2Buckets: { UHRP_FILES: 'files' },
         unsafeDirectSockets: [{ host: '127.0.0.1', port: 0 }],
       },
     ],
@@ -316,11 +352,24 @@ async function workerStage() {
     log(`the storage Worker under test: ${JSON.stringify(health.build.crates)}`)
     const old = await (await fetch(`${urls['storage-old']}/health`)).json()
     log(`the old build beside it: ${JSON.stringify(old.build.crates)}`)
-    const run = spawnSync(raceBin, [urls.storage, urls['storage-old'], urls.wallet, urls['storage-no-binding'], urls['storage-no-table']], { encoding: 'utf8', timeout: 8 * 60 * 1000 })
+    // Spawned, not run synchronously: Miniflare's loopback (its log, which
+    // the queue broker awaits after each batch) is served from this
+    // process's event loop while the race runs.
+    const run = await new Promise(done => {
+      const child = spawn(raceBin, [urls.storage, urls['storage-old'], urls.wallet, urls['storage-no-binding'], urls['storage-no-table']], { stdio: ['ignore', 'pipe', 'pipe'] })
+      let stdout = ''
+      let stderr = ''
+      child.stdout.on('data', d => { stdout += d })
+      child.stderr.on('data', d => { stderr += d })
+      const limit = setTimeout(() => child.kill('SIGKILL'), 15 * 60 * 1000)
+      child.on('close', (status, signal) => { clearTimeout(limit); done({ status, signal, stdout, stderr }) })
+    })
     let renewals = null
     let uploads = null
+    let unserved = null
     for (const line of (run.stdout ?? '').split('\n').filter(Boolean)) {
       if (line.startsWith('renew-grants ')) renewals = JSON.parse(line.slice('renew-grants '.length))
+      else if (line.startsWith('renew-paid ')) unserved = JSON.parse(line.slice('renew-paid '.length))
       else if (line.startsWith('upload-grants ')) uploads = JSON.parse(line.slice('upload-grants '.length))
       else log(line)
     }
@@ -330,20 +379,48 @@ async function workerStage() {
     const claims = await db.prepare('SELECT COUNT(*) AS n, SUM(released) AS released FROM payment_claims').first()
     log(`CLAIMS after the run: ${claims.n} claims (${claims.released} released); ${grants.results.length} grants: ${JSON.stringify(grants.results.reduce((a, g) => { const k = `${g.route} ${g.state} ${g.status}`; a[k] = (a[k] ?? 0) + 1; return a }, {}))}`)
     for (const g of grants.results) {
-      assert.equal(g.state, 'granted')
-      assert.ok(g.object && g.expiry && g.answered && g.file_size > 0 && g.minutes > 0 && g.satoshis > 0, JSON.stringify(g))
+      if (g.state === 'granted') {
+        assert.ok(g.object && g.expiry && g.answered && g.file_size > 0 && g.minutes > 0 && g.satoshis > 0, JSON.stringify(g))
+      } else {
+        // A taken payment with no renewal served: `paid`, its answer recorded.
+        assert.equal(g.state, 'paid', JSON.stringify(g))
+        assert.equal(g.route, '/renew', JSON.stringify(g))
+        assert.ok(g.answered && [500, 502].includes(g.status), JSON.stringify(g))
+      }
     }
-    // Each renewal's grant: one row, as the race client saw it served.
-    assert.ok(renewals && renewals.length === 4, 'renew-grants')
-    for (const r of renewals) {
-      const rows = (await db.prepare("SELECT route, uhrp_url, minutes, expiry_time, satoshis, identity_key, state, status, file_size FROM payment_grants WHERE route = '/renew' AND uhrp_url = ?").bind(r.uhrpUrl).all()).results
-      assert.equal(rows.length, 1, JSON.stringify(rows))
-      const [g] = rows
+    assert.equal((await db.prepare("SELECT COUNT(*) AS n FROM payment_grants WHERE route = '/renew' AND state = 'refused'").first()).n, 0)
+    // Each renewal served: its grant and its renewals row, as the race
+    // client saw it served (two payers of one file: two rows, two expiries).
+    assert.ok(renewals && renewals.length === 10, 'renew-grants')
+    const byUrl = new Map()
+    for (const r of renewals) byUrl.set(r.uhrpUrl, [...(byUrl.get(r.uhrpUrl) ?? []), r])
+    for (const [url, expected] of byUrl) {
+      const rows = (await db.prepare("SELECT g.route, g.uhrp_url, g.minutes, g.expiry_time, g.satoshis, g.identity_key, g.state, g.status, g.file_size, r.outcome, r.advert, r.queue_tries, r.queued_until FROM payment_grants g JOIN renewals r ON r.prefix = g.prefix WHERE g.route = '/renew' AND g.uhrp_url = ? AND g.state = 'granted' ORDER BY g.expiry_time").bind(url).all()).results
+      expected.sort((a, b) => a.expiry - b.expiry)
+      assert.equal(rows.length, expected.length, JSON.stringify(rows))
+      rows.forEach((g, i) => {
+        const r = expected[i]
+        assert.deepEqual(
+          [g.route, g.uhrp_url, g.minutes, g.expiry_time, g.satoshis, g.identity_key, g.state, g.status, g.file_size, g.outcome, g.advert],
+          ['/renew', r.uhrpUrl, r.minutes, r.expiry, r.satoshis, r.payer, 'granted', 200, r.fileSize, 'served', r.advert],
+        )
+        // The overlay's fault: the queue's four deliveries, then the pass's.
+        if (r.advert === 'not_admitted') assert.deepEqual([g.queue_tries, g.queued_until], [4, null])
+      })
+    }
+    // Each payment taken with no renewal served: `paid`, and its renewals row.
+    assert.ok(unserved && unserved.length === 6, 'renew-paid')
+    for (const u of unserved) {
+      const row = await db.prepare('SELECT g.state, g.status, g.answered_at IS NOT NULL AS answered, g.expiry_time, r.outcome, r.renewing_txid, r.payment_txid, r.advert, r.new_expiry_time FROM payment_grants g JOIN renewals r ON r.prefix = g.prefix WHERE g.txid = ?').bind(u.paymentTxid).first()
+      assert.ok(row, JSON.stringify(u))
       assert.deepEqual(
-        [g.route, g.uhrp_url, g.minutes, g.expiry_time, g.satoshis, g.identity_key, g.state, g.status, g.file_size],
-        ['/renew', r.uhrpUrl, r.minutes, r.expiry, r.satoshis, r.payer, 'granted', 200, r.fileSize],
+        [row.state, row.status, row.answered, row.expiry_time, row.outcome, row.payment_txid, row.advert, row.renewing_txid !== null],
+        ['paid', u.status, 1, null, u.outcome, u.paymentTxid, null, u.renewing],
+        JSON.stringify(u),
       )
+      if (u.renewingTxid) assert.deepEqual([row.renewing_txid, row.new_expiry_time], [u.renewingTxid, u.expiry])
     }
+    log(`the /renew grants: ${renewals.length} served (granted, status 200, each with its renewals row: served, the overlay's answer ${[...new Set(renewals.map(r => r.advert))].join('/')}); ${unserved.length} taken and not served (paid, status 500/502, the renewals row not_made/no_word with the payment's txid); no /renew grant refused`)
     // Each upload's grant: its expiry is the custom-time signed into the PUT.
     assert.ok(uploads && uploads.length > 0, 'upload-grants')
     for (const u of uploads) {
@@ -352,7 +429,7 @@ async function workerStage() {
       assert.equal(rows[0].expiry_time, Date.parse(u.customTime) / 1000, JSON.stringify(u))
     }
     log(`the /upload grants: ${uploads.length} rows, each expiry_time the custom-time the client was served`)
-    log(`the /renew grants: ${renewals.length} rows, one per renewal, each (route /renew, its uhrpUrl, minutes ${renewals.map(r => r.minutes).join('/')}, the new expiry, satoshis, the payer's key, state granted, status 200) as the client was served`)
+    await passStage(mf, urls, db, unserved)
     const empty = await mf.getD1Database('CLAIMS', 'storage-no-table')
     const tables = (await empty.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE '_cf%' AND name NOT LIKE 'sqlite%'").all()).results
     assert.deepEqual(tables, [])
@@ -360,6 +437,200 @@ async function workerStage() {
   } finally {
     await mf.dispose()
   }
+}
+
+// 11. The hourly pass (the storage Worker's scheduled handler), fired here
+// by hand: the rows the race left (an advert the queue could not get
+// admitted, two renewals with no word), then rows written for it: each
+// ending of each kind, the cap of 20 fewest runs first and then oldest, a
+// run with the overlay down and the next, a served row whose grant reads
+// paid, rows of other kinds and rows still on the queue left alone, and no
+// stored object touched.
+async function passStage(mf, urls, db, unserved) {
+  const wallet = urls.wallet
+  const storageWorker = await mf.getWorker('storage')
+  const runPass = async () => {
+    if (typeof storageWorker.scheduled === 'function') {
+      const result = await storageWorker.scheduled({ cron: '0 * * * *' })
+      assert.equal(result.outcome, 'ok', JSON.stringify(result))
+    } else {
+      const response = await mf.dispatchFetch('http://localhost/cdn-cgi/handler/scheduled?cron=0+*+*+*+*')
+      assert.ok(response.ok, `${response.status} ${await response.text()}`)
+    }
+  }
+  const knob = q => fetch(`${wallet}/knob?${q}`).then(r => r.json())
+  const setReq = (txid, status) => fetch(`${wallet}/req?txid=${txid}&status=${status}`, { method: 'POST' }).then(r => r.json())
+  const submits = async () => (await (await fetch(`${wallet}/submits`)).json()).submits
+  const finds = async txid => (await (await fetch(`${wallet}/finds?txid=${txid}`)).json()).finds
+  const renewal = prefix => db.prepare('SELECT * FROM renewals WHERE prefix = ?').bind(prefix).first()
+  const grantOf = prefix => db.prepare('SELECT state, status, expiry_time FROM payment_grants WHERE prefix = ?').bind(prefix).first()
+  const waiting = async () => (await db.prepare("SELECT r.prefix FROM renewals r LEFT JOIN payment_grants g ON g.prefix = r.prefix WHERE (r.advert = 'not_admitted' AND (r.queued_until IS NULL OR r.queued_until <= unixepoch())) OR (r.outcome = 'no_word' AND r.advert IS NULL AND g.state = 'paid') OR (r.outcome = 'served' AND g.state = 'paid')").all()).results.map(r => r.prefix)
+  const bucket = await mf.getR2Bucket('UHRP_FILES', 'storage')
+  const objects = async () => {
+    const listed = await bucket.list({ limit: 1000 })
+    return listed.objects.map(o => `${o.key} ${o.etag} ${o.uploaded.getTime()}`).sort()
+  }
+  const objectsBefore = await objects()
+
+  // The race's rows: the advert the queue's four deliveries left, the
+  // renewal whose answer was lost (now taken) and the one not taken (now a
+  // double spend).
+  const queued = (await db.prepare("SELECT prefix FROM renewals WHERE advert = 'not_admitted'").all()).results
+  assert.equal(queued.length, 1, JSON.stringify(queued))
+  const lost = unserved.find(u => u.word === 'lost')
+  const untaken = unserved.find(u => u.word === 'untaken')
+  const prefixOf = async txid => (await db.prepare('SELECT prefix FROM payment_grants WHERE txid = ?').bind(txid).first()).prefix
+  const [lostPrefix, untakenPrefix] = [await prefixOf(lost.paymentTxid), await prefixOf(untaken.paymentTxid)]
+  assert.deepEqual(new Set(await waiting()), new Set([queued[0].prefix, lostPrefix, untakenPrefix]))
+  await setReq(lost.renewingTxid, 'unmined')
+  await setReq(untaken.renewingTxid, 'doubleSpend')
+  const [s0, fl0, fu0] = [await submits(), await finds(lost.renewingTxid), await finds(untaken.renewingTxid)]
+  await runPass()
+  assert.equal((await renewal(queued[0].prefix)).advert, 'admitted')
+  const lostRow = await renewal(lostPrefix)
+  assert.deepEqual([lostRow.outcome, lostRow.advert], ['served', 'admitted'])
+  assert.deepEqual(await grantOf(lostPrefix), { state: 'granted', status: 200, expiry_time: lost.expiry })
+  assert.equal((await renewal(untakenPrefix)).outcome, 'not_made')
+  assert.equal((await grantOf(untakenPrefix)).state, 'paid')
+  assert.equal(await submits(), s0 + 2)
+  assert.deepEqual([await finds(lost.renewingTxid), await finds(untaken.renewingTxid)], [fl0 + 1, fu0 + 1])
+  assert.deepEqual(await waiting(), [])
+  await runPass()
+  assert.equal(await submits(), s0 + 2)
+  assert.deepEqual([await finds(lost.renewingTxid), await finds(untaken.renewingTxid)], [fl0 + 1, fu0 + 1])
+  log("the pass on the race's rows: the advert the queue's four deliveries left admitted; the lost answer's renewal, now taken: granted (status 200, its expiry), its advert admitted, in the same run; the untaken one, now a double spend: not_made, the grant paid; 2 submits and 1 wallet question each; a second run: nothing")
+
+  // Rows written for the pass.
+  let n = 0
+  const row = async (o) => {
+    const prefix = `pass-${++n}`
+    await db.prepare("INSERT INTO renewals (prefix, payment_txid, renewing_txid, outcome, advert, runs, reason, new_expiry_time, advert_beef, queued_until, queue_tries, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, 'YmVlZg==', ?8, 0, ?9, 1)")
+      .bind(prefix, `pay-${n}`, o.txid ?? `renewing-${n}`, o.outcome ?? 'served', o.advert ?? null, o.runs ?? 0, 1_950_000_000, o.queuedUntil ?? null, o.createdAt ?? n).run()
+    await db.prepare("INSERT INTO payment_grants (prefix, txid, route, identity_key, satoshis, paid_at, state) VALUES (?1, ?2, '/renew', 'k', 1000, 0, ?3)")
+      .bind(prefix, `pay-${n}`, o.grant ?? (o.outcome === 'no_word' ? 'paid' : 'granted')).run()
+    return prefix
+  }
+  const end = async prefixes => { for (const p of prefixes) await db.prepare("UPDATE renewals SET advert = 'admitted', outcome = 'served' WHERE prefix = ?").bind(p).run() }
+
+  // The cap: 25 adverts waiting, none with runs, oldest first, 20 a run.
+  {
+    const rows = []
+    for (let i = 0; i < 25; i++) rows.push(await row({ advert: 'not_admitted', createdAt: 1000 + i }))
+    const s = await submits()
+    await runPass()
+    assert.equal(await submits(), s + 20)
+    const states = []
+    for (const p of rows) states.push((await renewal(p)).advert)
+    assert.deepEqual(states, [...Array(20).fill('admitted'), ...Array(5).fill('not_admitted')])
+    await runPass()
+    assert.equal(await submits(), s + 25)
+    log('the pass, 25 adverts waiting: a run submits the 20 oldest (admitted), the next run the other 5')
+  }
+
+  // The overlay down: 20 submits, each counted; then no more than 20 a run.
+  {
+    await knob('overlay=fault')
+    const rows = []
+    for (let i = 0; i < 25; i++) rows.push(await row({ advert: 'not_admitted', createdAt: 2000 + i }))
+    const s = await submits()
+    await runPass()
+    assert.equal(await submits(), s + 20)
+    const runs = []
+    for (const p of rows) runs.push((await renewal(p)).runs)
+    assert.deepEqual(runs, [...Array(20).fill(1), ...Array(5).fill(0)])
+    assert.equal((await renewal(rows[0])).reason, 'HTTP 503')
+    // The next run takes the 5 with fewer runs first, then 15 of the rest.
+    await runPass()
+    assert.equal(await submits(), s + 40)
+    const again = []
+    for (const p of rows) again.push((await renewal(p)).runs)
+    assert.deepEqual(again, [...Array(15).fill(2), ...Array(5).fill(1), ...Array(5).fill(1)])
+    await knob('overlay=')
+    await end(rows)
+    log('the pass with the overlay down: 25 adverts waiting, 20 submits in the run, each a fault counted (runs 1, reason HTTP 503), 5 left; the next run takes those 5 first (fewest runs), then the 15 oldest of the rest')
+  }
+
+  // The endings of an advert waiting: a refusal (never submitted again), and
+  // the 72nd run (stopped).
+  {
+    const refusedRow = await row({ advert: 'not_admitted', createdAt: 3000 })
+    await knob('overlay=refuse')
+    let s = await submits()
+    await runPass()
+    await knob('overlay=')
+    const r = await renewal(refusedRow)
+    assert.equal(r.advert, 'refused')
+    assert.equal(r.reason, 'HTTP 400: script verification failed (subject t): input 0: the stand-in overlay refuses this spend')
+    assert.equal(await submits(), s + 1)
+    await runPass()
+    assert.equal(await submits(), s + 1)
+    const tired = await row({ advert: 'not_admitted', runs: 71, createdAt: 3001 })
+    await knob('overlay=fault')
+    s = await submits()
+    await runPass()
+    assert.deepEqual([(await renewal(tired)).advert, (await renewal(tired)).runs], ['stopped', 72])
+    await runPass()
+    await knob('overlay=')
+    assert.equal(await submits(), s + 1)
+    log("the pass's endings for an advert: the overlay's refusal (refused, its reason kept, never submitted again); a fault at the 72nd run (stopped, runs 72, tried no more)")
+  }
+
+  // The endings of a renewal with no word: no word (counted), then a take
+  // (granted, its advert admitted); a failure (not_made); the 72nd run.
+  {
+    const word = await row({ outcome: 'no_word', txid: 'word-1', createdAt: 4000 })
+    const failed = await row({ outcome: 'no_word', txid: 'word-2', createdAt: 4001 })
+    const tired = await row({ outcome: 'no_word', txid: 'word-3', runs: 71, createdAt: 4002 })
+    await setReq('word-1', 'unsent')
+    await setReq('word-2', 'invalid')
+    await runPass()
+    assert.deepEqual([(await renewal(word)).outcome, (await renewal(word)).runs], ['no_word', 1])
+    assert.equal((await renewal(failed)).outcome, 'not_made')
+    assert.equal((await grantOf(failed)).state, 'paid')
+    assert.deepEqual([(await renewal(tired)).advert, (await renewal(tired)).runs], ['stopped', 72])
+    await setReq('word-1', 'completed')
+    const s = await submits()
+    await runPass()
+    assert.deepEqual([(await renewal(word)).outcome, (await renewal(word)).advert], ['served', 'admitted'])
+    assert.deepEqual(await grantOf(word), { state: 'granted', status: 200, expiry_time: 1_950_000_000 })
+    assert.equal(await submits(), s + 1)
+    const f3 = await finds('word-3')
+    await runPass()
+    assert.equal(await finds('word-3'), f3)
+    log("the pass's endings for no word: unsent (counted, runs 1), then completed (granted, status 200, its expiry; its advert admitted in the same run); invalid (not_made, the grant paid); the 72nd run (stopped, asked no more)")
+  }
+
+  // A served row whose grant's second write did not land: the pass sets the
+  // grant granted, and submits nothing for it.
+  {
+    const seam = await row({ advert: 'admitted', grant: 'paid', createdAt: 4500 })
+    const s = await submits()
+    await runPass()
+    assert.deepEqual(await grantOf(seam), { state: 'granted', status: 200, expiry_time: 1_950_000_000 })
+    assert.equal(await submits(), s)
+    assert.deepEqual(await waiting(), [])
+    log("the pass on a served row whose grant reads paid: the grant granted (status 200, the row's expiry), no submit")
+  }
+
+  // Rows of other kinds, and a row still on the queue: left alone.
+  {
+    const alone = [
+      await row({ advert: 'admitted' }),
+      await row({ advert: 'refused' }),
+      await row({ advert: 'stopped' }),
+      await row({ outcome: 'not_made' }),
+      await row({ outcome: 'no_word', grant: 'granted' }),
+      await row({ advert: 'not_admitted', queuedUntil: 4_000_000_000 }),
+    ]
+    const s = await submits()
+    await runPass()
+    assert.equal(await submits(), s)
+    for (const p of alone) assert.equal((await renewal(p)).updated_at, 1, p)
+    log('the pass leaves alone: admitted, refused, stopped, not_made, a no-word row whose grant is not paid, and an advert still on the queue')
+  }
+
+  assert.deepEqual(await objects(), objectsBefore)
+  log(`the pass touched no stored object (${objectsBefore.length} objects: the same keys, etags and upload times)`)
 }
 
 try {

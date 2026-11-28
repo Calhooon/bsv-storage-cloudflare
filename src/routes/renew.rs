@@ -1,95 +1,119 @@
 //! POST /renew — see PROTOCOL.md §5.
 //!
-//! Port of `storage-server/src/routes/renew.ts`, redesigned for real
-//! pricing (the-composer #45). BRC-31 auth + BRC-29 payment are wired in
-//! `lib.rs`; this handler assumes both have been verified by the time it
-//! runs.
+//! Port of the reference's `renew` route, redesigned for real pricing (the
+//! price is bound to the advert's on-chain content length). BRC-31 auth and
+//! the BRC-29 payment door are wired in `lib.rs`.
 //!
-//! # Flow
+//! # What the route does, in order
 //!
-//! 0. (`lib.rs`, pre-payment) [`prepare`] — parse the body, `listOutputs`
-//!    the old advert by `uhrp_url_<hex>` tag, pick the output with max
-//!    `expiry_time_*`, PushDrop-decode field 4 (content length) from the
-//!    old locking script. The result both prices the request and is
-//!    threaded into [`handle`], so the wallet round-trip happens exactly
-//!    once per call.
-//! 1. Parse/validate body (`uhrpUrl`, `additionalMinutes`).
-//! 2. Compute `newExpiryTime = prevExpiryTime + additionalMinutes * 60`.
-//! 3. Build the new PushDrop locking script with the BRC-42-derived
-//!    locking pubkey and the same fields[0..2]+[4] but a new expiry.
-//!    Re-sign via the derived key.
-//! 4. `createAction` — input = old UTXO (PushDrop redeem), output =
-//!    new advert. wallet-infra handles change. A refusal here answers
-//!    409: two concurrent renews race to spend the same outpoint and
-//!    the loser's `createAction` fails (see [`RenewError::Conflict`]).
-//! 5. `sign_transaction_mixed` — P2PKH for change inputs, PushDrop for
-//!    the old advert input.
-//! 6. `processAction` with `isNoSend: false` — wallet-infra broadcasts via ARC
-//!    so status → 'unproven' (monitor's every-5-min check path). Overlay
-//!    `/submit` below also broadcasts; duplicates are idempotent.
-//! 7. Overlay `/submit` with `x-topics: ["tm_uhrp"]`.
-//! 8. Extend the R2 object's `custom-time` to (newExpiry + 300 s buffer)
-//!    via a same-key copy — the R2 stand-in for TS `renew.ts:212–213`'s
-//!    GCS `file.setMetadata({customTime})`. Best-effort (see `inner`).
-//! 9. Return `{status, prevExpiryTime, newExpiryTime, amount}` where
-//!    `amount` echoes the satoshis the payment middleware charged.
+//! 0. Before any payment ([`prepare`], called by `lib.rs`): parse the body;
+//!    `listOutputs` the advert by its `uhrp_url_<hex>` tag (any identity) and
+//!    pick the one with the largest `expiry_time_*`; decode field 4 (the
+//!    content length) from its PushDrop; then HEAD the stored object
+//!    `cdn/<object identifier>` through the `UHRP_FILES` binding (no byte of
+//!    it is read). No object, or an object whose size differs from field 4,
+//!    is a free 404 `ERR_FILE_NOT_FOUND`: nothing is claimed and the wallet
+//!    is not asked to take a payment. The price is `/quote`'s formula over
+//!    field 4 and `additionalMinutes`.
+//! 1. The payment door (`lib.rs`): the 402, the claim, `internalizeAction`,
+//!    the grant row `paid`.
+//! 2. The renewing step ([`renew_from`]): the new PushDrop advert (fields
+//!    0-2 and 4 as before, field 3 the new expiry, re-signed), then
+//!    `createAction` spending the old advert, the signature (PushDrop for the
+//!    old advert, P2PKH for change), and the Atomic BEEF of the new
+//!    transaction. Then the renewal's row is written (`renewals`: the
+//!    payment's txid, the renewing txid, the advert's bytes, the outcome no
+//!    word), and only then `processAction` with `isNoSend: false` and
+//!    `isDelayed: false` (the wallet sends it now). If the row cannot be
+//!    written the transaction is not handed over: the action is released and
+//!    the renewal is not made. After any answer of `processAction` that is
+//!    not a take, one read of the wallet's record of the txid
+//!    (`findProvenTxReqs`); the record decides when there is one
+//!    ([`crate::renewal::decide`]).
+//!    - `createAction` refused with the answer a spent advert gives (the
+//!      explicit input is unavailable): after [`RE_READ_DELAY_MS`], one
+//!      re-read of the file's current advert and, when it names the same
+//!      stored object at an expiry not lower than the first attempt's, one
+//!      more try of the whole step from it, in the same request, so that
+//!      two payers of one file at once can both be served. The second payer
+//!      is served when that try's renewing transaction is taken; otherwise
+//!      the answer is that of a payment taken with no renewal. There is
+//!      never a third try, and any other refusal is not retried.
+//!    - A failure after `createAction` and before `processAction` (the
+//!      signature, the BEEF, the row), or `processAction` refused with an
+//!      error by name while the wallet holds no record of the txid: the
+//!      action is released in the wallet, and with it the old advert.
+//! 3. Taken (a broadcaster took the renewing transaction): served. The
+//!    answer is the signed 200 `{status, prevExpiryTime, newExpiryTime,
+//!    amount, overlayAdmitted}` and the grant is `granted`, whatever
+//!    follows. The renewed advert is then submitted to the overlay, within
+//!    `overlay::ADMISSION_DEADLINE_MS`; `overlayAdmitted` says whether its
+//!    admission names the advert's output. The overlay's answer that its
+//!    script interpreter refused the transaction's spend is a refusal,
+//!    recorded with its reason and never submitted again; any other answer,
+//!    every other 4xx included, is a fault and puts one re-submit on the Worker's queue
+//!    (`renewal::QUEUE_DELIVERIES` deliveries at most), then the hourly pass.
+//! 4. Not made: `500 ERR_RENEWAL_NOT_MADE`. No word: `502
+//!    ERR_RENEWAL_UNCONFIRMED`. The grant stays `paid`; `lib.rs` settles the
+//!    renewal's row under the payment's prefix (`renewals`), with the
+//!    renewing txid and the outcome.
 //!
-//! # Pricing (the-composer #45)
+//! The route reads and writes no byte of the stored object: the HEAD before
+//! the payment is its only use of the object store.
 //!
-//! `fileSize` is NOT in the renew body — it is read from field 4 of the
-//! old advertisement's PushDrop, so the price is bound to on-chain data,
-//! never client claims. `lib.rs` feeds [`PreparedRenew::price_inputs`]
-//! into `routes::quote::compute_price_from_env` (the same formula `/quote`
-//! and `/upload` use) and runs the BRC-29 middleware with the result.
+//! # Any-identity renewal
 //!
-//! # Any-identity renewal (deviation from the first cut)
+//! The old advert is looked up by `uhrp_url_<hex>` alone, so anyone who
+//! pays can extend hosting. The renewed advert keeps the ORIGINAL uploader
+//! tag (never the caller's key), so the owner keeps `/list` and `/renew`
+//! visibility of the upload.
 //!
-//! The old advert is looked up by `uhrp_url_<hex>` alone — the
-//! `uploader_identity_key_<caller>` filter is gone, so anyone who pays can
-//! extend hosting (reference TS `renew.ts:84` filters by uhrp_url +
-//! object_identifier, not uploader). Critically, the renewed advert's tags
-//! preserve the ORIGINAL uploader tag instead of stamping the caller's key
-//! (like TS `renew.ts:150–153` copying old tags) — otherwise a stranger's
-//! renewal would re-tag the advert and the owner would lose `/list` and
-//! future-`/renew` visibility of their own upload.
+//! # Deviation from the TypeScript reference
 //!
-//! # Deviation from TS (flagged for parity harness)
+//! The reference is `infra/uhrp-server-cloud-bucket` in bsv-blockchain/ts-stack
+//! at 57c5f13055b555b83c1ef368fff3650abd21b6ef.
 //!
-//! - We derive `objectIdentifier` from the advert tags instead of a
-//!   `getMetadata` round-trip (they contain `object_identifier_<hex>` by
-//!   construction at advertise time), avoiding an R2 HEAD on the hot path.
-//! - `ERR_CREATE_ACTION_FAILED` is answered 409 (TS: 500). The dominant
-//!   cause of a createAction refusal on this route is the concurrent-renew
-//!   race on the old outpoint; 409 tells the client to re-quote and retry
-//!   (its next `prepare` finds the freshly renewed advert). A wallet-infra
-//!   outage at exactly this step also lands on 409 — the retry guidance is
-//!   correct for that cause too.
-//! - `processAction` failure is `ERR_INTERNAL_RENEW` 500 (previously it
-//!   shared `ERR_CREATE_ACTION_FAILED` with the createAction branch, which
-//!   would now mislabel an internal failure as a conflict).
+//! - **Served at the take.** This route answers 200 once a broadcaster took
+//!   the renewing transaction, and the overlay's admission is a duty after
+//!   it. The reference still requires the object's retention write and the
+//!   overlay's broadcast before its 200 (`src/routes/renew.ts:152-163`), and
+//!   answers 500 or 502 when either fails.
+//! - **A recorded `paid` row.** A taken payment with no renewal is answered
+//!   500 or 502 with the payment's txid and kept as a `paid` grant with a
+//!   `renewals` row; the reference records nothing (`renew.ts:168-171`).
+//! - **A missing object before any charge.** A missing or mismatched stored
+//!   object is a free 404 `ERR_FILE_NOT_FOUND`; the reference's pricing
+//!   answers it 500 `ERR_PAYMENT_INTERNAL`, also before any charge
+//!   (`src/utils/getMetadata.ts:54-59`).
+//! - **No custom time on a renewal.** The stored object's custom time is
+//!   not advanced; the term of record is the advert's expiry and the
+//!   grant's. The reference advances it with a metadata-only write
+//!   (`src/utils/extendObjectRetention.ts:4-27`, called at `renew.ts:156`).
+//! - **The object identifier** is read from the advert's
+//!   `object_identifier_<hex>` tag.
 
 use crate::error::{
-    ERR_CREATE_ACTION_FAILED, ERR_INTERNAL_RENEW, ERR_INVALID_TIME, ERR_MISSING_FIELDS,
-    ERR_MISSING_IDENTITY_KEY, ERR_OLD_ADVERTISEMENT_NOT_FOUND, ERR_OVERLAY_BROADCAST,
-    ERR_SIGNING_OLD_ADVERTISEMENT,
+    ERR_FILE_NOT_FOUND, ERR_INTERNAL_RENEW, ERR_INVALID_TIME, ERR_MISSING_FIELDS,
+    ERR_MISSING_IDENTITY_KEY, ERR_OLD_ADVERTISEMENT_NOT_FOUND,
 };
-use crate::overlay::{overlay_url_from_env, submit_uhrp_advert};
-use crate::routes::upload::{iso8601_millis, CUSTOM_TIME_BUFFER_SECONDS};
-use crate::storage::custom_time::extend_custom_time;
-use crate::storage::head::UHRP_BINDING;
+use crate::overlay::{admit_uhrp_advert, overlay_url_from_env, ADMISSION_DEADLINE_MS};
+use crate::pass::Ledger;
+use crate::renewal::{self, Admission, Outcome, ProcessWord};
+use crate::storage::head::{head_object, UHRP_BINDING};
 use crate::types::{ErrorBody, RenewRequest, RenewResponse};
 use crate::uhrp::pushdrop::{build_uhrp_advert_lock, UhrpAdvertFields};
 use crate::wallet::brc42::{
     derive_child_key, derive_child_public_key, uhrp_protocol_id, UHRP_COUNTERPARTY_ANYONE,
     UHRP_KEY_ID,
 };
-use crate::wallet::client::Wallet;
+use crate::wallet::client::{RpcFailure, Wallet};
 use crate::wallet::signer::{sign_transaction_mixed, InputUnlock};
 use crate::wallet::types::{
-    CreateActionInput, CreateActionOutput, CreateActionRequest, ListOutputsRequest, OutputItem,
-    ProcessActionRequest,
+    AbortActionRequest, CreateActionInput, CreateActionOutput, CreateActionRequest,
+    ListOutputsRequest, OutputItem, ProcessActionRequest, SignedTransaction,
 };
 
+use bsv_rs::primitives::ec::PrivateKey;
 use bsv_rs::primitives::encoding::Writer;
 use bsv_rs::primitives::hash::sha256;
 use serde_json::{json, Value};
@@ -102,12 +126,17 @@ const OBJECT_ID_TAG_PREFIX: &str = "object_identifier_";
 const EXPIRY_TAG_PREFIX: &str = "expiry_time_";
 
 /// PushDrop unlocking script length estimate (for wallet-infra fee calc).
-/// Matches TS `renew.ts:162` (`unlockingScriptLength: 74`).
+/// Matches the reference's `unlockingScriptLength: 74`.
 const PUSHDROP_UNLOCK_LEN: u32 = 74;
 
-/// Default pagination (TS `renew.ts:88–89`).
+/// Default pagination (the reference's defaults).
 const DEFAULT_LIMIT: u32 = 200;
 const DEFAULT_OFFSET: i32 = 0;
+
+/// The wait before the one re-read of the advert after `createAction`
+/// refused a spent advert, in milliseconds: the other renewal's
+/// `processAction` makes its advert the file's current one.
+pub const RE_READ_DELAY_MS: u64 = 2_000;
 
 /// Parsed + validated `/renew` body. Produced by [`parse_renew_body`],
 /// shared by [`prepare`] (pre-payment) and [`handle`] (post-payment) so
@@ -120,14 +149,16 @@ struct ParsedRenew {
     offset: i32,
 }
 
-/// Pre-fetched old-advert context — everything the post-payment handler
-/// needs from the single pre-payment `listOutputs` round-trip in
-/// [`prepare`].
+/// The advert a renewal starts from: everything the renewing step needs
+/// from the pre-payment `listOutputs` (or the one re-read).
 pub struct RenewContext {
     /// Canonical `uhrp://…` URL from the request body.
     pub uhrp_url: String,
     /// Whole minutes to extend by (validated finite and > 0).
     pub additional_minutes: u64,
+    /// The body's pagination, kept for the one re-read.
+    pub limit: u32,
+    pub offset: i32,
     /// Expiry of the chosen (max-`expiry_time_*`) old advert, unix seconds.
     pub prev_expiry: u64,
     /// Field 4 of the old advert's PushDrop — the on-chain content length
@@ -136,8 +167,7 @@ pub struct RenewContext {
     /// Decoded from the old advert's `object_identifier_<hex>` tag.
     pub object_identifier: String,
     /// The old advert's FULL `uploader_identity_key_<key>` tag, preserved
-    /// verbatim onto the renewed advert (see module doc: any-identity
-    /// renewal must not re-tag the advert with the caller's key).
+    /// verbatim onto the renewed advert.
     pub original_uploader_tag: Option<String>,
     /// Old advert outpoint — becomes input 0 of the renewal transaction.
     pub prev_txid: String,
@@ -147,29 +177,30 @@ pub struct RenewContext {
     pub beef: Vec<u8>,
 }
 
-/// Outcome of the pre-payment [`prepare`] step. Mirrors `/upload`'s
-/// `parse_pricing_inputs` contract: only `Ready` is priceable; every other
-/// variant prices at 0 (a free pass through the payment middleware) so the
-/// handler can emit the correct error without the client paying for it.
+/// Outcome of the pre-payment [`prepare`] step. Only `Ready` is priceable;
+/// every other variant prices at 0 (a free pass through the payment door)
+/// so the handler answers it without the client paying for it.
 pub enum PreparedRenew {
-    /// Old advert found and decoded; renewal is priceable.
+    /// Advert found and decoded, its stored object present at its size.
     Ready(RenewContext),
     /// Body malformed/invalid — `handle` re-parses and emits the exact 400.
     InvalidBody,
-    /// No advert matched the `uhrp_url_<hex>` tag — `handle` emits the 404.
+    /// No advert matched the `uhrp_url_<hex>` tag — 404.
     NotFound,
-    /// Wallet lookup or PushDrop decode failed — `handle` emits the 500.
+    /// The advert's stored object is not there — 404 `ERR_FILE_NOT_FOUND`.
+    FileMissing,
+    /// The stored object's size differs from the advert's content length —
+    /// 404 `ERR_FILE_NOT_FOUND`.
+    FileMismatch,
+    /// Wallet lookup, PushDrop decode or the object store's HEAD failed —
+    /// 500.
     LookupFailed,
 }
 
 impl PreparedRenew {
-    /// Pricing inputs `(fileSize, additionalMinutes)` for
-    /// `routes::quote::compute_price_from_env`. `fileSize` comes from field
-    /// 4 of the old advert's PushDrop — never from the client. `None` =
-    /// price 0 (free pass; the handler then produces the right error).
-    #[must_use]
     /// What a renewal of this advert grants, but its new expiry (the
     /// handler's answer carries it).
+    #[must_use]
     pub fn granted(&self) -> Option<crate::claims::Granted> {
         match self {
             Self::Ready(ctx) => Some(crate::claims::Granted {
@@ -183,6 +214,11 @@ impl PreparedRenew {
         }
     }
 
+    /// Pricing inputs `(fileSize, additionalMinutes)` for
+    /// `routes::quote::compute_price_from_env`. `fileSize` comes from field
+    /// 4 of the old advert's PushDrop — never from the client. `None` =
+    /// price 0 (free pass; the handler then produces the right error).
+    #[must_use]
     pub fn price_inputs(&self) -> Option<(f64, f64)> {
         match self {
             Self::Ready(ctx) => Some((ctx.content_length as f64, ctx.additional_minutes as f64)),
@@ -191,34 +227,70 @@ impl PreparedRenew {
     }
 }
 
-/// Pre-payment lookup + decode of the old advertisement. Called by
-/// `lib.rs` BEFORE the payment middleware so the price can be derived from
-/// the on-chain content length; the result is then passed into [`handle`]
-/// to avoid a second wallet round-trip.
+/// The pre-payment step: the advert, then a HEAD of its stored object.
+/// Called by `lib.rs` BEFORE the payment door so the price is derived from
+/// the on-chain content length; the result is passed into [`handle`].
 pub async fn prepare(body: &[u8], env: &Env) -> PreparedRenew {
     let Ok(parsed) = parse_renew_body(body) else {
         return PreparedRenew::InvalidBody;
     };
-
     let Ok(wallet) = Wallet::from_env(env) else {
         return PreparedRenew::LookupFailed;
     };
+    let found = find_advert(
+        &wallet,
+        parsed.uhrp_url,
+        parsed.additional_minutes,
+        parsed.limit,
+        parsed.offset,
+    )
+    .await;
+    let ctx = match found {
+        PreparedRenew::Ready(ctx) => ctx,
+        other => return other,
+    };
+    // The stored object: a HEAD, no body.
+    let key = format!("cdn/{}", ctx.object_identifier);
+    match head_object(env, UHRP_BINDING, &key).await {
+        Ok(Some(head)) if head.size == ctx.content_length => PreparedRenew::Ready(ctx),
+        Ok(Some(head)) => {
+            worker::console_log!(
+                "renew/prepare: {key} holds {} bytes, the advert {}",
+                head.size,
+                ctx.content_length
+            );
+            PreparedRenew::FileMismatch
+        }
+        Ok(None) => PreparedRenew::FileMissing,
+        Err(code) => {
+            worker::console_log!("renew/prepare: HEAD {key} failed: {code}");
+            PreparedRenew::LookupFailed
+        }
+    }
+}
 
-    // ── Find the old advertisement UTXO (any-identity: uhrp_url only) ─────
+/// The file's current advert: `listOutputs` by `uhrp_url_<hex>` (any
+/// identity), the output with the largest `expiry_time_*`, its object
+/// identifier and uploader tags, and field 4 of its PushDrop.
+async fn find_advert(
+    wallet: &Wallet<'_>,
+    uhrp_url: String,
+    additional_minutes: u64,
+    limit: u32,
+    offset: i32,
+) -> PreparedRenew {
     let list_req = ListOutputsRequest {
         basket: UHRP_BASKET.to_string(),
-        tags: lookup_tags(&parsed.uhrp_url),
+        tags: lookup_tags(&uhrp_url),
         tag_query_mode: Some("all".to_string()),
         // wallet-infra implements exactly `"locking scripts"` (it has no
         // BEEF support in listOutputs — its createAction resolves its own
         // txids internally, so `input_beef: None` on the spend is fine).
-        // `"entire transactions"` silently returned rows with NEITHER the
-        // script NOR a BEEF — the renewal 500'd on every real call.
         include: Some("locking scripts".to_string()),
         include_tags: Some(true),
         include_locking_scripts: Some(true),
-        limit: Some(parsed.limit),
-        offset: Some(parsed.offset),
+        limit: Some(limit),
+        offset: Some(offset),
     };
     let list_result = match wallet.list_outputs(&list_req).await {
         Ok(r) => r,
@@ -237,9 +309,9 @@ pub async fn prepare(body: &[u8], env: &Env) -> PreparedRenew {
         return PreparedRenew::NotFound;
     };
 
-    // `object_identifier_<hex>` is mandatory (the advert always has it —
-    // see `createUHRPAdvertisement.ts:76`). The uploader tag is preserved
-    // opportunistically: legacy adverts without one simply stay untagged.
+    // `object_identifier_<hex>` is mandatory (the advert always has it).
+    // The uploader tag is preserved when present: legacy adverts without
+    // one stay untagged.
     let Some(chosen_tags) = chosen.tags.as_ref() else {
         return PreparedRenew::NotFound;
     };
@@ -249,15 +321,9 @@ pub async fn prepare(body: &[u8], env: &Env) -> PreparedRenew {
     };
     let original_uploader_tag = extract_uploader_tag(chosen_tags);
 
-    // TS accesses `prevFields[4]` via `PushDrop.decode(prevLockingScript)`.
-    // We replicate by asking the server to include full transactions in
-    // `listOutputs` (`include: "entire transactions"`), then parsing the
-    // locking script from the matched output. If the old locking script is
-    // missing or can't be decoded, we surface a failure rather than guess
-    // at a length (the price would be unbound otherwise).
-    // Per-output lockingScript when the server provides it; else recover it
-    // from the returned BEEF (wallet-infra builds the script into the raw tx,
-    // not always onto the row — observed live 2026-07-02).
+    // The locking script from the row when the server provides it; else
+    // recovered from the returned BEEF. A script that is missing or cannot
+    // be decoded is a failure, never a guessed length.
     let beef_script;
     let prev_locking_hex = match chosen.locking_script.as_deref() {
         Some(hex) => hex,
@@ -283,8 +349,10 @@ pub async fn prepare(body: &[u8], env: &Env) -> PreparedRenew {
     };
 
     PreparedRenew::Ready(RenewContext {
-        uhrp_url: parsed.uhrp_url,
-        additional_minutes: parsed.additional_minutes,
+        uhrp_url,
+        additional_minutes,
+        limit,
+        offset,
         prev_expiry,
         content_length,
         object_identifier,
@@ -295,32 +363,62 @@ pub async fn prepare(body: &[u8], env: &Env) -> PreparedRenew {
     })
 }
 
-/// Handle `POST /renew`.
+/// The handler's answer, and what its renewing step came to when it ran.
+pub struct Renewed {
+    pub body: Value,
+    pub status: u16,
+    /// `None` when no renewing step ran (a 400, a 404, a lookup failure).
+    pub step: Option<StepRecord>,
+}
+
+/// What a renewing step came to: the row `lib.rs` records.
+#[derive(Debug, Clone)]
+pub struct StepRecord {
+    pub outcome: Outcome,
+    /// The renewing transaction, once one was signed.
+    pub renewing_txid: Option<String>,
+    /// The expiry the renewed advert carries, once one was signed.
+    pub new_expiry: Option<u64>,
+    /// The overlay's answer to the renewed advert (taken renewals only).
+    pub admission: Option<Admission>,
+    /// The renewed advert's Atomic BEEF, to submit again (taken or no word).
+    pub beef: Option<Vec<u8>>,
+}
+
+/// Handle `POST /renew` after the payment door.
 ///
-/// `price` is pre-computed by `lib.rs` (via the payment middleware's price
-/// calculation over [`prepare`]'s on-chain content length) and passed in so
-/// the handler returns the exact satoshi figure the client paid — same
-/// contract as `/upload`'s `amount` parameter. `prepared` is the pre-fetched
-/// old-advert context from the same pre-payment step.
+/// `price` is the satoshi figure the door charged (the answer's `amount`).
+/// `prepared` is the pre-payment step's result. `payment_txid` is the taken
+/// payment's transaction (`None` when no payment was taken), which the
+/// answers name when no renewal is served. `ledger` is where the renewal's
+/// row is written before its transaction is handed to the wallet (`None`
+/// when no payment was claimed).
 pub async fn handle(
     body: &[u8],
     identity_key: &str,
     price: u64,
     prepared: PreparedRenew,
+    payment_txid: Option<&str>,
+    ledger: Option<&Ledger<'_>>,
     env: &Env,
-) -> (Value, u16) {
+) -> Renewed {
+    let plain = |(body, status): (Value, u16)| Renewed {
+        body,
+        status,
+        step: None,
+    };
     if identity_key.is_empty() {
-        return error(
+        return plain(error(
             ERR_MISSING_IDENTITY_KEY,
             "Missing authfetch identityKey.",
             400,
-        );
+        ));
     }
 
-    // Re-run body validation for the exact TS error codes/order. Cheap (no
-    // I/O) and guarantees the 400s never depend on `prepare`'s classification.
+    // Re-run body validation for the exact error codes and order. Cheap (no
+    // I/O) and the 400s never depend on `prepare`'s classification.
     if let Err(resp) = parse_renew_body(body) {
-        return resp;
+        return plain(resp);
     }
 
     let ctx = match prepared {
@@ -328,89 +426,201 @@ pub async fn handle(
         // `parse_renew_body` above already answered the 400 for anything
         // `prepare` classified as InvalidBody; this arm is defensive.
         PreparedRenew::InvalidBody => {
-            return error(
+            return plain(error(
                 ERR_MISSING_FIELDS,
                 "Missing objectIdentifier or additionalMinutes.",
                 400,
-            )
+            ))
         }
         PreparedRenew::NotFound => {
-            return error(
+            return plain(error(
                 ERR_OLD_ADVERTISEMENT_NOT_FOUND,
                 "Couldn't find old advertisement output.",
                 404,
-            )
+            ))
+        }
+        PreparedRenew::FileMissing => {
+            return plain(error(
+                ERR_FILE_NOT_FOUND,
+                "The stored file was not found.",
+                404,
+            ))
+        }
+        PreparedRenew::FileMismatch => {
+            return plain(error(
+                ERR_FILE_NOT_FOUND,
+                "The stored file does not match its advertisement.",
+                404,
+            ))
         }
         PreparedRenew::LookupFailed => {
-            return error(
+            return plain(error(
                 ERR_INTERNAL_RENEW,
                 "An error occurred while handling the renewal.",
                 500,
-            )
+            ))
         }
     };
 
-    match inner(env, ctx, price).await {
-        Ok(resp) => (json!(resp), 200),
-        Err(err) => error_for(&err),
+    let Ok(wallet) = Wallet::from_env(env) else {
+        return not_made(None, payment_txid);
+    };
+    let (ctx, attempt) = renew_with_one_more_try(&wallet, env, ctx, ledger).await;
+    match attempt {
+        Attempt::Taken(made) => {
+            let admission = admit_uhrp_advert(
+                env,
+                &overlay_url_from_env(env),
+                &made.beef,
+                ADMISSION_DEADLINE_MS,
+            )
+            .await;
+            if admission != Admission::Admitted {
+                worker::console_error!(
+                    "renew: the overlay's answer for {}: {admission:?}",
+                    made.txid
+                );
+            }
+            let response = RenewResponse {
+                status: "success",
+                prev_expiry_time: ctx.prev_expiry,
+                new_expiry_time: made.new_expiry,
+                amount: price,
+                overlay_admitted: admission == Admission::Admitted,
+            };
+            Renewed {
+                body: json!(response),
+                status: 200,
+                step: Some(StepRecord {
+                    outcome: Outcome::Taken,
+                    renewing_txid: Some(made.txid),
+                    new_expiry: Some(made.new_expiry),
+                    admission: Some(admission),
+                    beef: Some(made.beef),
+                }),
+            }
+        }
+        Attempt::NoWord(made) => {
+            let (body, status) = renewal::no_word_answer(payment_txid);
+            Renewed {
+                body,
+                status,
+                step: Some(StepRecord {
+                    outcome: Outcome::NoWord,
+                    renewing_txid: Some(made.txid),
+                    new_expiry: Some(made.new_expiry),
+                    admission: None,
+                    beef: Some(made.beef),
+                }),
+            }
+        }
+        Attempt::NotMade { txid } => not_made(txid, payment_txid),
+        Attempt::CreateRefused(failure) => {
+            worker::console_error!("renew: createAction refused: {failure:?}");
+            not_made(None, payment_txid)
+        }
     }
 }
 
-enum RenewError {
-    /// `createAction` refused to spend the old outpoint — the concurrent-
-    /// renew race (another request just redeemed it). Answered 409.
-    Conflict,
-    SigningFailed,
-    /// `processAction` (post-signing record/broadcast) failed.
-    ProcessFailed,
-    OverlayFailed,
-    Internal,
-}
-
-/// Map a [`RenewError`] to its HTTP error body + status. Extracted from
-/// [`handle`] so the 409 conflict mapping is unit-testable without a live
-/// wallet.
-fn error_for(err: &RenewError) -> (Value, u16) {
-    match err {
-        RenewError::Conflict => error(
-            ERR_CREATE_ACTION_FAILED,
-            "Old advertisement could not be redeemed. It may have just been renewed by a concurrent request.",
-            409,
-        ),
-        RenewError::SigningFailed => error(
-            ERR_SIGNING_OLD_ADVERTISEMENT,
-            "Signing the replacement advertisement failed.",
-            500,
-        ),
-        RenewError::ProcessFailed => error(
-            ERR_INTERNAL_RENEW,
-            "Recording the renewal transaction failed.",
-            500,
-        ),
-        RenewError::OverlayFailed => error(ERR_OVERLAY_BROADCAST, "Overlay broadcast failed.", 500),
-        RenewError::Internal => error(
-            ERR_INTERNAL_RENEW,
-            "An error occurred while handling the renewal.",
-            500,
-        ),
+/// The answer and the record of a renewal that was not made.
+fn not_made(renewing_txid: Option<String>, payment_txid: Option<&str>) -> Renewed {
+    let (body, status) = renewal::not_made_answer(payment_txid);
+    Renewed {
+        body,
+        status,
+        step: Some(StepRecord {
+            outcome: Outcome::NotMade,
+            renewing_txid,
+            new_expiry: None,
+            admission: None,
+            beef: None,
+        }),
     }
 }
 
-async fn inner(env: &Env, ctx: RenewContext, price: u64) -> Result<RenewResponse, RenewError> {
-    let wallet = Wallet::from_env(env).map_err(|_| RenewError::Internal)?;
-    let admin_key = wallet.private_key().clone();
+/// What one try of the renewing step came to.
+enum Attempt {
+    /// `createAction` refused, with the wallet's answer or none.
+    CreateRefused(RpcFailure),
+    /// Not made; the renewing txid when one was signed.
+    NotMade { txid: Option<String> },
+    /// Signed and handed to the wallet; no word that it was sent.
+    NoWord(Made),
+    /// A broadcaster took it.
+    Taken(Made),
+}
 
-    // ── Build the new advert ──────────────────────────────────────────────
+/// A signed renewing transaction.
+struct Made {
+    txid: String,
+    new_expiry: u64,
+    /// Its Atomic BEEF, for the overlay.
+    beef: Vec<u8>,
+}
+
+/// The renewing step, and once more from the file's current advert when
+/// `createAction` refused the spent advert and the re-read names the same
+/// stored object ([`same_file`]). Returns the advert the last try started
+/// from, and what it came to.
+async fn renew_with_one_more_try(
+    wallet: &Wallet<'_>,
+    env: &Env,
+    ctx: RenewContext,
+    ledger: Option<&Ledger<'_>>,
+) -> (RenewContext, Attempt) {
+    let first = renew_from(wallet, env, &ctx, ledger).await;
+    let again = matches!(&first, Attempt::CreateRefused(f) if renewal::spent_advert(f));
+    if !again {
+        return (ctx, first);
+    }
+    worker::Delay::from(std::time::Duration::from_millis(RE_READ_DELAY_MS)).await;
+    let current = find_advert(
+        wallet,
+        ctx.uhrp_url.clone(),
+        ctx.additional_minutes,
+        ctx.limit,
+        ctx.offset,
+    )
+    .await;
+    match current {
+        PreparedRenew::Ready(next) if same_file(&ctx, &next) => {
+            let second = renew_from(wallet, env, &next, ledger).await;
+            (next, second)
+        }
+        _ => (ctx, first),
+    }
+}
+
+/// Whether the re-read advert `next` may carry the one more try begun from
+/// `first`: it names the same stored object, of the same content length
+/// (the price paid covers that size), and its expiry is not lower than the
+/// first attempt's. Two uploads of the same bytes share a URL and have two
+/// objects and two adverts; the try never renews the other one.
+#[must_use]
+fn same_file(first: &RenewContext, next: &RenewContext) -> bool {
+    next.object_identifier == first.object_identifier
+        && next.content_length == first.content_length
+        && next.prev_expiry >= first.prev_expiry
+}
+
+/// The new advert's `createAction` request, the key that signs the old
+/// advert's input, and the new expiry.
+struct Built {
+    request: CreateActionRequest,
+    signing_key: PrivateKey,
+    new_expiry: u64,
+}
+
+/// Build the renewed advert for `ctx`: the five PushDrop fields with the
+/// new expiry, signed, and the `createAction` that spends the old advert.
+fn build_advert(env: &Env, admin_key: &PrivateKey, ctx: &RenewContext) -> Option<Built> {
     let new_expiry = ctx.prev_expiry + ctx.additional_minutes * 60;
-    let hash = uhrp_url_to_hash(&ctx.uhrp_url).ok_or(RenewError::Internal)?;
+    let hash = uhrp_url_to_hash(&ctx.uhrp_url)?;
 
     // The renewed advert rebuilds its download URL from the CURRENT
-    // PUBLIC_URL_BASE — renewals automatically migrate adverts minted under
-    // an old base (e.g. the r2.dev dev URL) onto the custom domain.
-    let public_url_base = env
-        .var("PUBLIC_URL_BASE")
-        .map_err(|_| RenewError::Internal)?
-        .to_string();
+    // PUBLIC_URL_BASE — renewals move adverts minted under an old base onto
+    // the current one.
+    let public_url_base = env.var("PUBLIC_URL_BASE").ok()?.to_string();
     let public_url = format!(
         "{}/cdn/{}",
         public_url_base.trim_end_matches('/'),
@@ -418,23 +628,22 @@ async fn inner(env: &Env, ctx: RenewContext, price: u64) -> Result<RenewResponse
     );
 
     let locking_pubkey = derive_child_public_key(
-        &admin_key,
+        admin_key,
         &uhrp_protocol_id(),
         UHRP_KEY_ID,
         UHRP_COUNTERPARTY_ANYONE,
     )
-    .map_err(|_| RenewError::Internal)?;
+    .ok()?;
     let signing_key = derive_child_key(
-        &admin_key,
+        admin_key,
         &uhrp_protocol_id(),
         UHRP_KEY_ID,
         UHRP_COUNTERPARTY_ANYONE,
     )
-    .map_err(|_| RenewError::Internal)?;
+    .ok()?;
 
-    // Rebuild the five fields with the new expiry time. Field 4 (content
-    // length) is carried over verbatim from the old advert's PushDrop (it
-    // was decoded once in `prepare`). Sign the concat.
+    // The five fields with the new expiry. Field 4 (content length) is
+    // carried over from the old advert's PushDrop. Sign the concat.
     let server_identity_bytes = admin_key.public_key().to_compressed();
     let mut expiry_w = Writer::new();
     expiry_w.write_var_int(new_expiry);
@@ -456,40 +665,34 @@ async fn inner(env: &Env, ctx: RenewContext, price: u64) -> Result<RenewResponse
     sign_data.extend_from_slice(&expiry_bytes);
     sign_data.extend_from_slice(&content_length_bytes);
     let digest = sha256(&sign_data);
-    let sig = signing_key
-        .sign(&digest)
-        .map_err(|_| RenewError::Internal)?;
-    let sig_der = sig.to_der();
+    let sig_der = signing_key.sign(&digest).ok()?.to_der();
 
     let new_fields = UhrpAdvertFields {
         server_identity_key_hex: bsv_rs::primitives::encoding::to_hex(&server_identity_bytes),
         hash: hash.to_vec(),
-        url: public_url.clone(),
+        url: public_url,
         expiry_time: new_expiry,
         content_length: ctx.content_length,
         signature: sig_der,
     };
-    let new_locking_hex = build_uhrp_advert_lock(&locking_pubkey.to_hex(), &new_fields)
-        .map_err(|_| RenewError::Internal)?;
+    let new_locking_hex = build_uhrp_advert_lock(&locking_pubkey.to_hex(), &new_fields).ok()?;
 
-    // ── createAction spending the old UTXO → new advert ──────────────────
-    let outpoint_str = format!("{}.{}", ctx.prev_txid, ctx.prev_vout);
     let new_tags = build_renewal_tags(
         ctx.original_uploader_tag.as_deref(),
         &ctx.uhrp_url,
         &ctx.object_identifier,
         new_expiry,
     );
-    // Mark as ours so wallet-infra flips spendable=1 post-processAction.
-    // Matches bsv-wallet-toolbox-rs is_ours predicate.
-    let custom_instructions = serde_json::json!({
+    // Marked as ours, so wallet-infra makes the output spendable after
+    // processAction.
+    let custom_instructions = json!({
         "type": "UHRPAdvertisement",
         "protocolID": [2, "uhrp advertisement"],
         "keyID": "1",
         "counterparty": "anyone",
     })
     .to_string();
-    let create_req = CreateActionRequest {
+    let request = CreateActionRequest {
         outputs: vec![CreateActionOutput {
             locking_script: new_locking_hex,
             satoshis: 1,
@@ -499,12 +702,12 @@ async fn inner(env: &Env, ctx: RenewContext, price: u64) -> Result<RenewResponse
             custom_instructions: Some(custom_instructions),
         }],
         inputs: vec![CreateActionInput {
-            outpoint: outpoint_str,
+            outpoint: format!("{}.{}", ctx.prev_txid, ctx.prev_vout),
             unlocking_script_length: PUSHDROP_UNLOCK_LEN,
             input_description: "Redeeming old advertisement".to_string(),
         }],
-        // Carry the listOutputs BEEF so wallet-infra has the old UTXO
-        // ancestry for input-script verification.
+        // The listOutputs BEEF: the old advert's ancestry for wallet-infra's
+        // input-script verification.
         input_beef: if ctx.beef.is_empty() {
             None
         } else {
@@ -513,28 +716,65 @@ async fn inner(env: &Env, ctx: RenewContext, price: u64) -> Result<RenewResponse
         description: format!("Renew advertisement for uhrpUrl {}", ctx.uhrp_url),
         randomize_outputs: false,
     };
-    let template = wallet
-        .create_action(&create_req)
-        .await
-        .map_err(|_| RenewError::Conflict)?;
+    Some(Built {
+        request,
+        signing_key,
+        new_expiry,
+    })
+}
 
-    // ── Sign: PushDrop for the first input, P2PKH for the rest ────────────
-    //
-    // The inputs list from wallet-infra puts inputs in the order we
-    // requested them, so index 0 is the old PushDrop UTXO and any later
-    // indices are change from the admin wallet.
-    let mut unlocks: Vec<InputUnlock> = Vec::with_capacity(template.inputs.len());
-    for (i, _) in template.inputs.iter().enumerate() {
-        if i == 0 {
-            unlocks.push(InputUnlock::PushDrop { key: &signing_key });
-        } else {
-            unlocks.push(InputUnlock::P2pkh);
+/// One try of the renewing step from `ctx`: `createAction`, the signature,
+/// the Atomic BEEF, the renewal's row (`ledger`), `processAction`, and the
+/// wallet's word for the txid.
+async fn renew_from(
+    wallet: &Wallet<'_>,
+    env: &Env,
+    ctx: &RenewContext,
+    ledger: Option<&Ledger<'_>>,
+) -> Attempt {
+    let admin_key = wallet.private_key().clone();
+    let Some(built) = build_advert(env, &admin_key, ctx) else {
+        return Attempt::NotMade { txid: None };
+    };
+    let template = match wallet.create_action_answered(&built.request).await {
+        Ok(template) => template,
+        Err(failure) => return Attempt::CreateRefused(failure),
+    };
+
+    // ── Sign: PushDrop for input 0 (the old advert), P2PKH for the rest ──
+    let unlocks: Vec<InputUnlock> = (0..template.inputs.len())
+        .map(|i| {
+            if i == 0 {
+                InputUnlock::PushDrop {
+                    key: &built.signing_key,
+                }
+            } else {
+                InputUnlock::P2pkh
+            }
+        })
+        .collect();
+    let Ok(signed) = sign_transaction_mixed(&template, &admin_key, &unlocks) else {
+        release(wallet, &template.reference).await;
+        return Attempt::NotMade { txid: None };
+    };
+    // The overlay is given a full Atomic BEEF (the old advert's ancestry and
+    // the new transaction), never a bare transaction.
+    let Some(beef) = atomic_beef(&template.input_beef, &signed) else {
+        release(wallet, &template.reference).await;
+        return Attempt::NotMade { txid: None };
+    };
+
+    // ── The row, before the transaction is handed over: a request that ends
+    // at any later point leaves it for the pass. ──
+    if let Some(ledger) = ledger {
+        if let Err(e) = crate::pass::open(ledger, &signed.txid, built.new_expiry, &beef).await {
+            worker::console_error!("renew: the renewal's row was not written: {e}");
+            release(wallet, &template.reference).await;
+            return Attempt::NotMade { txid: None };
         }
     }
-    let signed = sign_transaction_mixed(&template, &admin_key, &unlocks)
-        .map_err(|_| RenewError::SigningFailed)?;
 
-    // ── processAction (record, no broadcast) ──────────────────────────────
+    // ── processAction: the wallet records the transaction and sends it now ──
     let process_req = ProcessActionRequest {
         is_new_tx: true,
         is_send_with: false,
@@ -545,60 +785,57 @@ async fn inner(env: &Env, ctx: RenewContext, price: u64) -> Result<RenewResponse
         raw_tx: Some(signed.raw_tx.clone()),
         send_with: vec![],
     };
-    wallet
-        .process_action(&process_req)
-        .await
-        .map_err(|_| RenewError::ProcessFailed)?;
-
-    // ── Overlay broadcast ────────────────────────────────────────────────
-    // Both references submit a FULL AtomicBEEF, never a bare raw tx: the TS
-    // renew broadcasts `Transaction.fromAtomicBEEF(tx)` (renew.ts:209) and
-    // advertise.rs merges the template's input ancestry with the signed tx.
-    // A naked tx fails the overlay's SPV on the spent-advert input —
-    // observed live 2026-07-02 (the one paid hop that failed).
-    let mut beef = bsv_rs::transaction::Beef::from_binary(&template.input_beef).map_err(|e| {
-        worker::console_error!("renew: input BEEF parse failed: {e}");
-        RenewError::OverlayFailed
-    })?;
-    beef.merge_raw_tx(signed.raw_tx.clone(), None);
-    let atomic_beef = beef.to_binary_atomic(&signed.txid).map_err(|e| {
-        worker::console_error!("renew: to_binary_atomic failed: {e}");
-        RenewError::OverlayFailed
-    })?;
-    let overlay_url = overlay_url_from_env(env);
-    submit_uhrp_advert(env, &overlay_url, &atomic_beef)
-        .await
-        .map_err(|e| {
-            worker::console_error!("renew: overlay broadcast failed: {e:?}");
-            RenewError::OverlayFailed
-        })?;
-
-    // ── Extend the R2 object's custom-time ───────────────────────────────
-    // TS parity: `renew.ts:212–213` does `file.setMetadata({customTime})`.
-    // R2 can't patch metadata in place, so this is a same-key copy (see
-    // `storage::custom_time`). Best-effort by design: the payment is taken
-    // and the renewed advert is on-chain + broadcast by this point, so
-    // failing the response would report a successful renewal as failed.
-    // Nothing on R2 reads custom-time operationally (no lifecycle rule) —
-    // it exists for the queue consumer's dup-advert guard and tooling.
-    let object_key = format!("cdn/{}", ctx.object_identifier);
-    let custom_time = renewal_custom_time(new_expiry);
-    if let Err(code) = extend_custom_time(env, UHRP_BINDING, &object_key, &custom_time).await {
-        worker::console_error!(
-            "renew: custom-time extend failed code={code} key={object_key} \
-             (advert renewed on-chain; R2 metadata stays stale until the next renewal)"
-        );
+    let answer = wallet.process_action_answered(&process_req).await;
+    let made = Made {
+        txid: signed.txid,
+        new_expiry: built.new_expiry,
+        beef,
+    };
+    if let Err(failure) = &answer {
+        worker::console_error!("renew: processAction: {failure:?}");
     }
+    // After any answer that is not a take, one read of the wallet's record.
+    let word = renewal::read_process_answer(&answer, &made.txid);
+    let record = if word == ProcessWord::Taken {
+        Ok(None)
+    } else {
+        match wallet.find_proven_tx_reqs(&made.txid).await {
+            Ok(rows) => Ok(renewal::read_record(&rows, &made.txid)),
+            Err(failure) => {
+                worker::console_error!("renew: findProvenTxReqs failed: {failure:?}");
+                Err(())
+            }
+        }
+    };
+    if renewal::release_after(word, &record) {
+        release(wallet, &template.reference).await;
+    }
+    match renewal::decide(word, &record) {
+        Outcome::Taken => Attempt::Taken(made),
+        Outcome::NotMade => Attempt::NotMade {
+            txid: Some(made.txid),
+        },
+        Outcome::NoWord => Attempt::NoWord(made),
+    }
+}
 
-    // ── Response ──────────────────────────────────────────────────────────
-    // `amount` echoes the satoshis the payment middleware charged, threaded
-    // from lib.rs exactly the way /upload's `amount` is.
-    Ok(RenewResponse {
-        status: "success",
-        prev_expiry_time: ctx.prev_expiry,
-        new_expiry_time: new_expiry,
-        amount: price,
-    })
+/// Release the wallet's action: its inputs (the old advert, the
+/// change) are released. A failure is logged.
+async fn release(wallet: &Wallet<'_>, reference: &str) {
+    let req = AbortActionRequest {
+        reference: reference.to_string(),
+    };
+    match wallet.abort_action(&req).await {
+        Ok(r) => worker::console_log!("renew: the action {reference} released: {}", r.aborted),
+        Err(e) => worker::console_error!("renew: the action {reference} not released: {e}"),
+    }
+}
+
+/// The Atomic BEEF of `signed` over the template's input ancestry.
+fn atomic_beef(input_beef: &[u8], signed: &SignedTransaction) -> Option<Vec<u8>> {
+    let mut beef = bsv_rs::transaction::Beef::from_binary(input_beef).ok()?;
+    beef.merge_raw_tx(signed.raw_tx.clone(), None);
+    beef.to_binary_atomic(&signed.txid).ok()
 }
 
 fn error(code: &'static str, description: impl Into<String>, status: u16) -> (Value, u16) {
@@ -702,13 +939,6 @@ fn build_renewal_tags(
     ));
     tags.push(format!("{EXPIRY_TAG_PREFIX}{new_expiry}"));
     tags
-}
-
-/// The renewed object's `custom-time` metadata value: ISO-8601 of
-/// `(newExpiry + 300 s buffer)`, byte-identical to what `/upload`'s
-/// presigner stamps at upload time (`upload.rs::iso8601_millis`).
-fn renewal_custom_time(new_expiry: u64) -> String {
-    iso8601_millis((new_expiry + CUSTOM_TIME_BUFFER_SECONDS) * 1000)
 }
 
 /// Walk `outputs`, pick the one with the largest `expiry_time_*`.
@@ -914,6 +1144,8 @@ mod tests {
         let prepared = PreparedRenew::Ready(RenewContext {
             uhrp_url: "uhrp://x".to_string(),
             additional_minutes: 43_200,
+            limit: DEFAULT_LIMIT,
+            offset: DEFAULT_OFFSET,
             prev_expiry: 1_000,
             content_length: 5_000_000_000,
             object_identifier: "obj1".to_string(),
@@ -932,6 +1164,8 @@ mod tests {
         assert_eq!(PreparedRenew::InvalidBody.price_inputs(), None);
         assert_eq!(PreparedRenew::NotFound.price_inputs(), None);
         assert_eq!(PreparedRenew::LookupFailed.price_inputs(), None);
+        assert_eq!(PreparedRenew::FileMissing.price_inputs(), None);
+        assert_eq!(PreparedRenew::FileMismatch.price_inputs(), None);
     }
 
     // ── Any-identity lookup ─────────────────────────────────────────────────
@@ -997,36 +1231,147 @@ mod tests {
         assert!(extract_uploader_tag(&["expiry_time_1".to_string()]).is_none());
     }
 
-    // ── custom-time formatting ──────────────────────────────────────────────
+    // ── The stored object ───────────────────────────────────────────────
 
     #[test]
-    fn renewal_custom_time_is_expiry_plus_buffer_iso8601() {
-        // newExpiry 1746880196 + 300 s buffer = 1746880496 s
-        // → JS `new Date(1746880496000).toISOString()` = "2025-05-10T12:34:56.000Z".
-        // Byte-identical to the value /upload's presigner would stamp.
+    fn the_route_reads_and_writes_no_byte_of_the_stored_object() {
+        let src = include_str!("renew.rs");
+        let code = &src[..src.find("#[cfg(test)]\nmod tests").unwrap()];
+        // The pre-payment HEAD is the route's only use of the object store.
+        assert_eq!(code.matches("head_object(").count(), 1);
+        // The object store is reached through a binding (`bucket`) or the
+        // HEAD helper; the route names no binding, no body read and no
+        // metadata write.
+        for read_or_write in [
+            ".bucket(",
+            ".bytes()",
+            ".text()",
+            "array_buffer",
+            "custom_time",
+            "custom-time",
+        ] {
+            assert!(!code.contains(read_or_write), "{read_or_write}");
+        }
+        let head = &code[code.find("pub async fn prepare(").unwrap()..];
+        let head = &head[..head.find("\n}\n").unwrap()];
+        assert!(head.contains("head_object(env, UHRP_BINDING, &key)"));
+        assert!(head.contains("head.size == ctx.content_length"));
+        // No module of the store rewrites an object's metadata.
+        let storage = include_str!("../storage/mod.rs");
+        assert!(!storage.contains("custom_time"));
+    }
+
+    #[test]
+    fn a_missing_or_mismatched_object_is_a_free_404() {
+        let src = include_str!("renew.rs");
+        let handle = &src[src.find("pub async fn handle(").unwrap()..];
+        for variant in ["PreparedRenew::FileMissing", "PreparedRenew::FileMismatch"] {
+            let arm = &handle[handle.find(variant).unwrap()..];
+            let arm = &arm[..arm.find("))\n        }").unwrap()];
+            assert!(
+                arm.contains("ERR_FILE_NOT_FOUND") && arm.contains("404"),
+                "{arm}"
+            );
+        }
+    }
+
+    // ── The renewing step ───────────────────────────────────────────────
+
+    #[test]
+    fn one_more_try_only_after_a_spent_advert_and_never_a_third() {
+        let src = include_str!("renew.rs");
+        let tries = &src[src.find("async fn renew_with_one_more_try(").unwrap()..];
+        let tries = &tries[..tries.find("\n}\n").unwrap()];
+        assert_eq!(tries.matches("renew_from(").count(), 2);
+        assert_eq!(tries.matches("find_advert(").count(), 1);
+        assert!(tries.contains("renewal::spent_advert(f)"));
+        assert!(!tries.contains("loop") && !tries.contains("while"));
+        assert_eq!(RE_READ_DELAY_MS, 2_000);
+    }
+
+    #[test]
+    fn a_failure_after_create_action_releases_the_action() {
+        let src = include_str!("renew.rs");
+        let step = &src[src.find("async fn renew_from(").unwrap()..];
+        let step = &step[..step.find("\n}\n").unwrap()];
+        let sign = step.find("sign_transaction_mixed(").unwrap();
+        let process = step.find("process_action_answered(").unwrap();
+        // The signature's, the BEEF's and the row's failures, before
+        // processAction: each releases the action.
         assert_eq!(
-            renewal_custom_time(1_746_880_196),
-            "2025-05-10T12:34:56.000Z"
+            step[sign..process]
+                .matches("release(wallet, &template.reference)")
+                .count(),
+            3
         );
+        // After processAction, only an error by name with no record of the
+        // txid releases it: the wallet processed nothing.
+        let after = &step[process..];
+        let released = after.find("release(wallet, &template.reference)").unwrap();
+        assert!(after[..released].contains("if renewal::release_after(word, &record) {"));
+        assert_eq!(step.matches("release(").count(), 4);
     }
 
-    // ── 409 conflict mapping ────────────────────────────────────────────────
-
+    /// The renewal's row is written before the renewing transaction is
+    /// handed to the wallet, and a failed write hands nothing over.
     #[test]
-    fn concurrent_renew_conflict_maps_to_409() {
-        let (body, status) = error_for(&RenewError::Conflict);
-        assert_eq!(status, 409);
-        let got = serde_json::to_string(&body).unwrap();
-        assert!(got.contains(r#""code":"ERR_CREATE_ACTION_FAILED""#));
-        assert!(got.contains("concurrent"));
+    fn the_row_is_written_before_process_action() {
+        let src = include_str!("renew.rs");
+        let step = &src[src.find("async fn renew_from(").unwrap()..];
+        let step = &step[..step.find("\n}\n").unwrap()];
+        let open = step.find("crate::pass::open(ledger, &signed.txid").unwrap();
+        let process = step.find("process_action_answered(").unwrap();
+        assert!(open < process);
+        let failed = &step[open..process];
+        let failed = &failed[..failed
+            .find("return Attempt::NotMade { txid: None };")
+            .unwrap()];
+        assert!(failed.contains("release(wallet, &template.reference)"));
+        assert_eq!(step.matches("process_action_answered(").count(), 1);
+        // The record is read after every answer that is not a take.
+        let read = &step[process..];
+        assert!(read.contains("let record = if word == ProcessWord::Taken {"));
+        assert_eq!(read.matches("find_proven_tx_reqs(").count(), 1);
+        assert!(read.contains("match renewal::decide(word, &record) {"));
     }
 
+    fn ctx(object: &str, prev_expiry: u64, content_length: u64) -> RenewContext {
+        RenewContext {
+            uhrp_url: "uhrp://same-bytes".into(),
+            additional_minutes: 30,
+            limit: DEFAULT_LIMIT,
+            offset: DEFAULT_OFFSET,
+            prev_expiry,
+            content_length,
+            object_identifier: object.into(),
+            original_uploader_tag: None,
+            prev_txid: "aa".repeat(32),
+            prev_vout: 0,
+            beef: vec![],
+        }
+    }
+
+    /// Two uploads of the same bytes: one URL, two objects, two adverts. The
+    /// one more try goes on only from an advert of the first attempt's
+    /// object at an expiry not lower than the first attempt's.
     #[test]
-    fn process_failure_is_500_internal_not_conflict() {
-        let (body, status) = error_for(&RenewError::ProcessFailed);
-        assert_eq!(status, 500);
-        let got = serde_json::to_string(&body).unwrap();
-        assert!(got.contains(r#""code":"ERR_INTERNAL_RENEW""#));
+    fn the_one_more_try_never_renews_another_files_advert() {
+        let first = ctx("object-a", 2_000, 1_000);
+        // The first attempt's object, renewed by the other payer.
+        assert!(same_file(&first, &ctx("object-a", 2_000 + 1_800, 1_000)));
+        assert!(same_file(&first, &ctx("object-a", 2_000, 1_000)));
+        // The other upload's advert of the same bytes, at any expiry.
+        for expiry in [1_000, 2_000, 9_000] {
+            assert!(!same_file(&first, &ctx("object-b", expiry, 1_000)));
+        }
+        // The same object at a lower expiry, or another size.
+        assert!(!same_file(&first, &ctx("object-a", 1_999, 1_000)));
+        assert!(!same_file(&first, &ctx("object-a", 3_000, 999)));
+        let src = include_str!("renew.rs");
+        let tries = &src[src.find("async fn renew_with_one_more_try(").unwrap()..];
+        let tries = &tries[..tries.find("\n}\n").unwrap()];
+        assert!(tries.contains("PreparedRenew::Ready(next) if same_file(&ctx, &next) =>"));
+        assert!(tries.contains("_ => (ctx, first),"));
     }
 
     // ── Body parsing ────────────────────────────────────────────────────────
@@ -1172,17 +1517,19 @@ mod tests {
 
     #[test]
     fn renew_response_has_expected_field_order() {
-        // PROTOCOL.md §5 response: {status, prevExpiryTime, newExpiryTime, amount}
+        // PROTOCOL.md §5 response: {status, prevExpiryTime, newExpiryTime,
+        // amount}, and this Worker's `overlayAdmitted`.
         let body = RenewResponse {
             status: "success",
             prev_expiry_time: 1_000,
             new_expiry_time: 2_000,
             amount: 42,
+            overlay_admitted: true,
         };
         let got = serde_json::to_string(&body).unwrap();
         assert_eq!(
             got,
-            r#"{"status":"success","prevExpiryTime":1000,"newExpiryTime":2000,"amount":42}"#
+            r#"{"status":"success","prevExpiryTime":1000,"newExpiryTime":2000,"amount":42,"overlayAdmitted":true}"#
         );
     }
 
