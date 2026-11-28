@@ -69,7 +69,7 @@ import { randomBytes } from 'node:crypto'
 import { spawnSync } from 'node:child_process'
 import assert from 'node:assert/strict'
 
-const { Miniflare } = await import(process.env.MINIFLARE_MODULE ?? 'miniflare')
+const { Miniflare, Log, LogLevel } = await import(process.env.MINIFLARE_MODULE ?? 'miniflare')
 
 const here = dirname(fileURLToPath(import.meta.url))
 const stage = process.argv[2] ?? 'store'
@@ -312,6 +312,8 @@ async function workerStage() {
   const mf = new Miniflare({
     // The scheduled handler is fired by hand (stage 11).
     unsafeTriggerHandlers: true,
+    // The queue's deliveries (each batch's acks) in the log.
+    log: new Log(LogLevel.INFO),
     workers: [
       storage('storage', resolve(root, 'build/worker'), {
         d1Databases: { CLAIMS: 'claims' },

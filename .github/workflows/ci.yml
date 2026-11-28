@@ -147,10 +147,10 @@ jobs:
     - run: cargo build --locked -p parity --bin race
     - run: npm ci
       working-directory: tests/workerd
-    - run: node run.mjs store
-      working-directory: tests/workerd
     - run: node run.mjs worker
       working-directory: tests/workerd
       env:
         OLD_BUILD: ${{ runner.temp }}/old/build/worker
         RACE_BIN: ${{ github.workspace }}/target/debug/race
+    - run: node run.mjs store
+      working-directory: tests/workerd

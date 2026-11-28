@@ -144,7 +144,9 @@ fn beef_of(row: &Value) -> Option<Vec<u8>> {
 /// The queue's delivery of a re-submit: one submit of the row's advert.
 /// Returns whether the message is to be delivered again.
 pub async fn deliver(env: &Env, prefix: &str) -> bool {
+    worker::console_log!("renewal {prefix}: a re-submit delivered");
     let Ok(db) = env.d1(CLAIMS_BINDING) else {
+        worker::console_error!("renewal {prefix}: no CLAIMS binding");
         return true;
     };
     let row = match db.prepare(renewal::QUEUE_TRY_SQL).bind(&[prefix.into()]) {
@@ -154,7 +156,10 @@ pub async fn deliver(env: &Env, prefix: &str) -> bool {
     let row = match row {
         Ok(Some(row)) => row,
         // Nothing of that kind waits under the prefix.
-        Ok(None) => return false,
+        Ok(None) => {
+            worker::console_log!("renewal {prefix}: no re-submit waits");
+            return false;
+        }
         Err(e) => {
             worker::console_error!("renewal {prefix}: {e}");
             return true;
