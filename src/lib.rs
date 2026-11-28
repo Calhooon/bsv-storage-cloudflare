@@ -469,7 +469,7 @@ async fn paid_route(paid: Paid<'_>, route: PaidRoute, request_body: &[u8]) -> Re
 }
 
 #[event(fetch)]
-async fn main(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
+async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     init_panic_hook();
 
     if req.method() == Method::Options {
