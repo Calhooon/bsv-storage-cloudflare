@@ -124,12 +124,7 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             let tag = query(&url, "tag");
             let advert = get_json(&kv, &format!("advert:{tag}")).await?;
             let mut counts = json!({});
-            for name in [
-                "listOutputs",
-                "createAction",
-                "processAction",
-                "abortAction",
-            ] {
+            for name in ["listOutputs", "createAction", "processAction", "release"] {
                 counts[name] = json!(count(&kv, &format!("{name}:{tag}")).await?);
             }
             return Response::from_json(&json!({ "advert": advert, "calls": counts }));
