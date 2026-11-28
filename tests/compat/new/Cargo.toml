@@ -27,4 +27,4 @@ base64 = "0.22"
 sha2 = "0.10"
 hmac = "0.12"
 bsv-middleware-cloudflare = { version = "=0.7.8", features = ["d1-claims"] }
-bsv-rs = { version = "0.8.14", features = ["auth", "wallet", "transaction", "script", "overlay", "wasm"] }
+bsv-rs = { version = "0.8.15", features = ["auth", "wallet", "transaction", "script", "overlay", "wasm"] }

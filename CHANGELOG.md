@@ -81,6 +81,18 @@ order, the cron line and the statements that list and reset a row.
   cases above; its second stage fires the scheduled handler. The `workerd`
   job of `ci.yml` builds the Worker, the stand-ins, v0.3.0 and the race
   client, and runs both stages on the hosted runner.
+- bsv-rs `0.8.15` (a caret requirement, the floor): the release the
+  published advisories GHSA-f2rq-878r-pgxv, GHSA-jx5m-j63r-7fgw,
+  GHSA-pfv3-7r7f-mhgh, GHSA-jjhc-7hvh-c3hm, GHSA-mp9c-g2q9-q3qw and
+  GHSA-jgrp-wvcx-vxf3 name as patched. Every lock moves to it (the root,
+  `tests/heap`, `tests/compat`'s `new`, `tests/workerd/kit`,
+  `tests/workerd/wallet`), and in each lock nothing moves but bsv-rs and,
+  where the lock carries it, this package's own version;
+  bsv-middleware-cloudflare stays `=0.7.8` (core 0.4.7). `/health`'s
+  `build.crates` names 0.3.4 and 0.8.15.
+- The advertisement figure of 0.3.3 (`ADVERT_BEEF_MAX_BYTES`, 614,400 bytes)
+  was read again at this pin and stays as it is; it is read again at each
+  bsv-rs pin of this crate.
 
 ## 0.3.3 (2026-11-28)
 
