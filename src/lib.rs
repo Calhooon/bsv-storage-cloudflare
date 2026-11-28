@@ -492,22 +492,37 @@ async fn paid_route(paid: Paid<'_>, route: PaidRoute, request_body: &[u8]) -> Re
     };
     if let (Some(won), Some(db)) = (&won, grants_db) {
         let granted = granted.unwrap_or_default();
+        // `/renew`: the renewal's row is settled first, then the grant. A
+        // request that ends between the two leaves a settled row beside a
+        // grant that reads `paid`, which the pass sets `granted`; a grant is
+        // never set `granted` beside a row that still reads no word.
+        let recorded = match &renewed {
+            Some((_, Some(step))) => {
+                match pass::record(env, db, &won.prefix, &won.txid, step).await {
+                    Ok(()) => true,
+                    Err(e) => {
+                        console_error!("{path}: the renewal's record failed: {e}");
+                        false
+                    }
+                }
+            }
+            _ => true,
+        };
         let written = match &renewed {
-            // `/renew`: `granted` when served; a taken payment with no
-            // renewal stays `paid`, its answer recorded.
+            // `/renew`: `granted` when served and its row settled; a taken
+            // payment with no renewal stays `paid`, its answer recorded. A
+            // served renewal whose row could not be settled leaves the grant
+            // `paid` beside the row that reads no word, for the pass to ask
+            // the wallet.
+            Some((served, _)) if *served && !recorded => None,
             Some((served, _)) => {
                 let state = if *served { "granted" } else { "paid" };
-                claims::grants::answered_as(db, won, state, status, &granted).await
+                Some(claims::grants::answered_as(db, won, state, status, &granted).await)
             }
-            None => claims::grants::answered(db, won, status, &granted).await,
+            None => Some(claims::grants::answered(db, won, status, &granted).await),
         };
-        if let Err(e) = written {
+        if let Some(Err(e)) = written {
             console_error!("{path}: the grant's second write failed: {e}");
-        }
-        if let Some((_, Some(step))) = &renewed {
-            if let Err(e) = pass::record(env, db, &won.prefix, &won.txid, step).await {
-                console_error!("{path}: the renewal's record failed: {e}");
-            }
         }
     }
     match session {
@@ -735,6 +750,22 @@ mod tests {
         assert!(renew.contains("let state = if *served { \"granted\" } else { \"paid\" };"));
         assert!(!renew.contains("\"refused\""));
         assert!(renew.contains("pass::record(env, db, &won.prefix, &won.txid, step)"));
+    }
+
+    /// The renewal's row is settled before the grant's second write, and a
+    /// served renewal's grant is set `granted` only once its row is settled
+    /// (the states each seam leaves: `renewal::on_sqlite`).
+    #[test]
+    fn the_renewals_row_is_settled_before_the_grant() {
+        let source = include_str!("lib.rs");
+        let route = &source[source.find("async fn paid_route(").unwrap()..];
+        let route = &route[..route.find("\n}\n").unwrap()];
+        let record = route
+            .find("pass::record(env, db, &won.prefix, &won.txid, step)")
+            .unwrap();
+        let grant = route.find("claims::grants::answered_as(").unwrap();
+        assert!(record < grant);
+        assert!(route.contains("Some((served, _)) if *served && !recorded => None,"));
     }
 
     // ── #31: typed middleware errors → JSON with the TS status codes ──────

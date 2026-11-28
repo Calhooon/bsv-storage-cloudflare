@@ -559,10 +559,12 @@ storage.bucket(GCP_BUCKET_NAME).file(`cdn/${objectIdentifier}`).setMetadata({
 4. Taken: the signed 200 `{status, prevExpiryTime, newExpiryTime, amount,
    overlayAdmitted}` and the grant `granted`. The renewed advert is then
    submitted to the overlay (`tm_uhrp`); `overlayAdmitted` is true when the
-   overlay's admission names the advert's output. A 400 or 422 in the
-   overlay's error shape is a refusal, recorded with its reason; every
-   other answer is a fault and puts one re-submit on the post-upload queue,
-   then the hourly pass.
+   overlay's admission names the advert's output. A 400 in the overlay's
+   error shape naming its script interpreter's refusal of the spend
+   (`ERR_SCRIPT_REFUSED`, or a message starting `script verification
+   failed (subject `) is a refusal, recorded with its reason; every other
+   answer, every other 4xx included, is a fault and puts one re-submit on
+   the post-upload queue, then the hourly pass.
 5. Not made: `500 ERR_RENEWAL_NOT_MADE`; no word: `502
    ERR_RENEWAL_UNCONFIRMED`. Each names `paymentTxid` and keeps the grant
    `paid`, with a `renewals` row.

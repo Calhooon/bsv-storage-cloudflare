@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.3.5 (unreleased)
+## 0.3.5 (2026-11-28)
 
 **For an operator, two things, in this order:**
 
@@ -29,7 +29,11 @@ and reset a row.
   with `isNoSend: false` and `isDelayed: false`. If the row cannot be
   written, the renewing transaction is not handed to the wallet: the action
   is released and the answer is the not-made one. A request that ends at
-  any point after `processAction` leaves that row for the pass.
+  any point after `processAction` leaves that row for the pass. Once the
+  route has its outcome, the row is settled first and the grant written
+  second; a served renewal's grant is set `granted` only once its row is
+  settled, so a request that ends between the two leaves a served row
+  whose grant reads `paid`, which the pass sets `granted`.
 - **The wallet's record decides.** After any answer of `processAction`
   that is not a take (`unproven` in `sendWithResults`, `success` in
   `notDelayedResults`), an error included, the route reads the wallet's
@@ -56,12 +60,15 @@ and reset a row.
   admission, to the submit made after the take within 10 s, names the
   renewed advert's output for `tm_uhrp`. Otherwise the renewal is still
   served. The overlay's answer is read in three kinds: **admitted** (a 2xx
-  admission naming the advert's output); **refused** (a 400 or 422 in the
-  overlay's error shape, `{"status": "error", "message": …}`, not marked
-  retryable), recorded with its reason and never submitted again by the
-  Worker; **a fault**, every other answer (none, the deadline, a 5xx, 408,
-  429, any other 4xx, a 2xx that is not an admission, an admission that
-  does not name the advert's output), which puts one re-submit message on
+  admission naming the advert's output); **refused** (a 400 in the
+  overlay's error shape naming its script interpreter's refusal of the
+  renewing transaction's spend: the code `ERR_SCRIPT_REFUSED`, or a message
+  starting `script verification failed (subject `), recorded with its
+  reason and never submitted again by the Worker; **a fault**, every other
+  answer (none, the deadline, a 5xx, every other 4xx whatever its body,
+  among them a failure of the overlay's header service or storage, a 2xx
+  that is not an admission, an admission that does not name the advert's
+  output), which puts one re-submit message on
   the post-upload queue, delivered at most four times (`max_retries = 3`),
   30 s apart, then the hourly pass. The row's `reason` keeps the last
   answer that was not an admission, its kind first.
@@ -90,17 +97,19 @@ and reset a row.
   (`served`, `not_made`, `no_word`), the advert's state (`admitted`,
   `not_admitted`, `refused`, `stopped`) with the pass's `runs` and the
   overlay's `reason`, the advert's Atomic BEEF to submit again (kept up to
-  512 KiB), the queue's window and count; and its index. It alters neither
+  512 KiB), the queue's window and count; and an index by age. It alters neither
   `payment_claims` nor `payment_grants`, and `0001` is unchanged.
 - **A new scheduled act: the hourly pass** (`crons = ["0 * * * *"]`). At
-  most 20 rows a run, fewest runs first and then oldest, each touched once:
+  most 20 rows a run, fewest runs first and then oldest, each read once:
   a served row whose grant still reads `paid` has its grant set `granted`;
   an advert not admitted gets one submit (admitted; refused, kept with its
   reason and never tried again; a fault adds a run); a `paid` grant whose
   renewal has no word gets one `findProvenTxReqs` question for its
   renewing txid (a take grants it and submits its advert in the same run;
   a failure makes it `not_made`; no word adds a run). At 72 runs a row is
-  `stopped` and listed until an operator resets it. So the pass makes at
+  `stopped` and listed until an operator resets it; a `refused` row is
+  listed with the overlay's reason, and an operator can reset it too. So
+  the pass makes at
   most 20 submits an hour to this deployment's overlay (the
   `OVERLAY_SUBMIT_URL` host, through the `OVERLAY` binding when it is
   bound); a row the overlay admits is then announced once to the other
@@ -112,9 +121,10 @@ and reset a row.
   one more try's rule for two adverts of the same bytes, the pass's steps,
   its statements on SQLite (the cap, the order by runs, each ending, a
   request cut after `processAction` and its row settled by the pass, a
-  served row's grant set `granted`, and 0.3.3's statements on a migrated
-  database) and source tests that `/renew` writes the row before
-  `processAction` and that `/renew` and the pass touch no stored object. `tests/workerd`:
+  served row's grant set `granted`, each seam of the route's two last
+  writes, and 0.3.3's statements on a migrated database) and source tests
+  that `/renew` writes the row before `processAction`, settles it before
+  the grant's second write, and that `/renew` and the pass touch no stored object. `tests/workerd`:
   the stand-in's knobs (`/knob?create=&process=&overlay=`), the object it
   seeds for each advert, the release of an action and `findProvenTxReqs`, and the
   cases above; its second stage fires the scheduled handler. The `workerd`

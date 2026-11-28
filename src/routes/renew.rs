@@ -48,9 +48,10 @@
 //!    amount, overlayAdmitted}` and the grant is `granted`, whatever
 //!    follows. The renewed advert is then submitted to the overlay, within
 //!    `overlay::ADMISSION_DEADLINE_MS`; `overlayAdmitted` says whether its
-//!    admission names the advert's output. A refusal in the overlay's error
-//!    shape is recorded with its reason and never submitted again; any other
-//!    answer is a fault and puts one re-submit on the Worker's queue
+//!    admission names the advert's output. The overlay's answer that its
+//!    script interpreter refused the transaction's spend is a refusal,
+//!    recorded with its reason and never submitted again; any other answer,
+//!    every other 4xx included, is a fault and puts one re-submit on the Worker's queue
 //!    (`renewal::QUEUE_DELIVERIES` deliveries at most), then the hourly pass.
 //! 4. Not made: `500 ERR_RENEWAL_NOT_MADE`. No word: `502
 //!    ERR_RENEWAL_UNCONFIRMED`. The grant stays `paid`; `lib.rs` settles the

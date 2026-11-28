@@ -560,7 +560,7 @@ async function passStage(mf, urls, db, unserved) {
     await knob('overlay=')
     const r = await renewal(refusedRow)
     assert.equal(r.advert, 'refused')
-    assert.equal(r.reason, 'HTTP 400: the stand-in overlay does not admit this advert')
+    assert.equal(r.reason, 'HTTP 400: script verification failed (subject t): input 0: the stand-in overlay refuses this spend')
     assert.equal(await submits(), s + 1)
     await runPass()
     assert.equal(await submits(), s + 1)

@@ -40,10 +40,11 @@
 //! the overlay answers. The renewed advert is then submitted to the overlay
 //! and the answer read ([`Admission`], `crate::overlay::read_admission`):
 //! admitted (the overlay's admission names this advert's output for the
-//! topic); refused (the overlay answered the submit with a refusal in its
-//! error shape: the row is marked `refused` with the overlay's reason,
-//! listed for an operator, and never submitted again by the Worker); or a
-//! fault (every other answer, and none), which puts one message on the
+//! topic); refused (the overlay answered that its script interpreter
+//! refused the transaction's spend: the row is marked `refused` with the
+//! overlay's reason, listed for an operator, and never submitted again by
+//! the Worker until an operator resets it); or a fault (every other answer,
+//! every other 4xx included, and none), which puts one message on the
 //! Worker's queue: the consumer submits it again, at most
 //! [`QUEUE_DELIVERIES`] deliveries in all, and when those are spent the row
 //! stays `not_admitted` for the pass. The row's `reason` keeps the last
@@ -52,13 +53,14 @@
 //! # The pass
 //!
 //! Once an hour, at most [`PASS_ROWS`] rows, fewest runs first and then
-//! oldest, each touched once ([`WAITING_SQL`]): a row `not_admitted` gets
+//! oldest, each read once ([`WAITING_SQL`]): a row `not_admitted` gets
 //! one submit of its advert; a `paid` grant whose outcome is no word gets
 //! one question to the wallet for its renewing txid; a served row whose
 //! grant still reads `paid` has its grant set `granted`. A fault, or no
-//! word, adds one to the row's `runs`; at [`PASS_RUNS`] (three days of
-//! runs) the row is `stopped`, listed, and left until an operator resets it
-//! (DEPLOYMENT.md).
+//! word, adds one to the row's `runs`; at [`PASS_RUNS`] runs (three days of
+//! hourly runs while at most [`PASS_ROWS`] rows wait; longer when more wait,
+//! since a row with more runs waits its turn) the row is `stopped`, listed,
+//! and left until an operator resets it (DEPLOYMENT.md).
 
 use serde_json::{json, Value};
 
@@ -307,8 +309,8 @@ fn answer_body(code: &str, description: &str, payment_txid: Option<&str>) -> Val
 pub enum Admission {
     /// Its admission names this advert's output for the topic.
     Admitted,
-    /// It answered the submit with a refusal in its error shape, with its
-    /// reason.
+    /// It answered that its script interpreter refused the transaction's
+    /// spend, with its reason (`crate::overlay::read_admission`).
     Refused(String),
     /// Every other answer, and none; the text names its kind first.
     Fault(String),
@@ -333,7 +335,8 @@ pub const RENEWALS_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS renewals (\
     updated_at INTEGER NOT NULL\
 )";
 
-/// The index the pass reads its rows in.
+/// The `renewals` table's index by age; the pass reads rows fewest runs
+/// first, then oldest ([`WAITING_SQL`]).
 #[allow(dead_code)]
 pub const RENEWALS_INDEX: &str =
     "CREATE INDEX IF NOT EXISTS renewals_by_age ON renewals (created_at, prefix)";
@@ -1364,6 +1367,176 @@ mod on_sqlite {
             column(&db, "cut", "renewing_txid"),
             text_value("renewing-1")
         );
+    }
+
+    /// The route's last two writes, the row settled and then the grant: a
+    /// request that ends at either seam (the first write lands and the
+    /// second does not, or neither lands) leaves a state the pass takes, or
+    /// one that is settled; the route never sets a grant `granted` beside a
+    /// row that reads no word, the one state the pass would not take.
+    #[test]
+    fn every_seam_of_the_routes_two_last_writes_leaves_a_state_the_pass_resolves() {
+        let db = migrated();
+        let n = |sql: &str, p: &[&dyn rusqlite::ToSql]| db.execute(sql, p).unwrap();
+        let settle = |prefix: &str, outcome: &str, advert: Option<&str>, queued: Option<i64>| {
+            n(
+                RECORD_SQL,
+                params![
+                    prefix,
+                    "pay",
+                    None::<String>,
+                    outcome,
+                    advert,
+                    None::<String>,
+                    None::<i64>,
+                    None::<String>,
+                    queued
+                ],
+            )
+        };
+        let answer = |prefix: &str, state: &str, status: i64| {
+            n(
+                crate::claims::GRANT_ANSWERED_SQL,
+                params![
+                    prefix,
+                    state,
+                    status,
+                    "o",
+                    "uhrp://u",
+                    1i64,
+                    60i64,
+                    1_900_000_000i64
+                ],
+            )
+        };
+        let grant_state = |prefix: &str| -> String {
+            db.query_row(
+                "SELECT state FROM payment_grants WHERE prefix = ?1",
+                [prefix],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        // Each request: the grant's first write, and the row opened before
+        // `processAction`.
+        for prefix in [
+            "served-both",
+            "served-row-only",
+            "served-row-only-queued",
+            "served-neither",
+            "not-made-both",
+            "not-made-row-only",
+            "not-made-neither",
+            "no-word-both",
+            "no-word-row-only",
+        ] {
+            grant(&db, prefix, "paid");
+            open(&db, prefix, &format!("renewing-{prefix}")).unwrap();
+        }
+        // Served.
+        assert_eq!(settle("served-both", "served", Some("admitted"), None), 1);
+        assert_eq!(answer("served-both", "granted", 200), 1);
+        assert_eq!(
+            settle("served-row-only", "served", Some("admitted"), None),
+            1
+        );
+        assert_eq!(
+            settle(
+                "served-row-only-queued",
+                "served",
+                Some("not_admitted"),
+                Some(5)
+            ),
+            1
+        );
+        // Not made.
+        assert_eq!(settle("not-made-both", "not_made", None, None), 1);
+        assert_eq!(answer("not-made-both", "paid", 500), 1);
+        assert_eq!(settle("not-made-row-only", "not_made", None, None), 1);
+        // No word.
+        assert_eq!(settle("no-word-both", "no_word", None, None), 1);
+        assert_eq!(answer("no-word-both", "paid", 502), 1);
+        assert_eq!(settle("no-word-row-only", "no_word", None, None), 1);
+
+        let mut kinds = kinds_now(&db, 10);
+        kinds.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            kinds,
+            vec![
+                ("no-word-both".to_string(), vec![Waiting::Word]),
+                ("no-word-row-only".to_string(), vec![Waiting::Word]),
+                ("not-made-neither".to_string(), vec![Waiting::Word]),
+                ("served-neither".to_string(), vec![Waiting::Word]),
+                ("served-row-only".to_string(), vec![Waiting::Grant]),
+                (
+                    "served-row-only-queued".to_string(),
+                    vec![Waiting::Grant, Waiting::Admit]
+                ),
+            ]
+        );
+        // Settled, nothing owed: a served renewal with its grant `granted`,
+        // and a renewal not made beside a `paid` grant.
+        assert_eq!(grant_state("served-both"), "granted");
+        for prefix in ["not-made-both", "not-made-row-only"] {
+            assert_eq!(column(&db, prefix, "outcome"), text_value("not_made"));
+            assert_eq!(grant_state(prefix), "paid");
+        }
+        // The pass's grant repair sets the served rows' grants `granted`.
+        for prefix in ["served-row-only", "served-row-only-queued"] {
+            assert_eq!(n(GRANT_SERVED_SQL, params![prefix, 1_900_000_000i64]), 1);
+            assert_eq!(grant_state(prefix), "granted");
+        }
+        let mut kinds = kinds_now(&db, 10);
+        kinds.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            kinds.iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>(),
+            vec![
+                "no-word-both",
+                "no-word-row-only",
+                "not-made-neither",
+                "served-neither",
+                "served-row-only-queued"
+            ]
+        );
+        // The wallet's word settles the rows with none.
+        for prefix in ["no-word-both", "served-neither"] {
+            assert_eq!(
+                n(
+                    WORD_SQL,
+                    params![prefix, "served", "admitted", None::<String>, None::<i64>]
+                ),
+                1
+            );
+            assert_eq!(n(GRANT_SERVED_SQL, params![prefix, 1_900_000_000i64]), 1);
+        }
+        for prefix in ["no-word-row-only", "not-made-neither"] {
+            assert_eq!(
+                n(
+                    WORD_SQL,
+                    params![
+                        prefix,
+                        "not_made",
+                        None::<String>,
+                        None::<String>,
+                        None::<i64>
+                    ]
+                ),
+                1
+            );
+        }
+        assert_eq!(
+            kinds_now(&db, 10),
+            vec![("served-row-only-queued".to_string(), vec![Waiting::Admit])]
+        );
+
+        // The one state the route never leaves: a grant `granted` beside a
+        // row that reads no word. The pass would not take it.
+        grant(&db, "granted-beside-no-word", "paid");
+        open(&db, "granted-beside-no-word", "renewing-x").unwrap();
+        assert_eq!(answer("granted-beside-no-word", "granted", 200), 1);
+        assert!(!kinds_now(&db, 10)
+            .iter()
+            .any(|(p, _)| p == "granted-beside-no-word"));
     }
 
     /// The route's second write settles the row it opened; a row the pass

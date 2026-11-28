@@ -7,7 +7,7 @@
 //! - [`run`]: the hourly pass, the Worker's only scheduled act.
 //!
 //! The pass reads at most [`renewal::PASS_ROWS`] rows a run, fewest runs
-//! first and then oldest, and touches each once: a served row whose grant
+//! first and then oldest, and reads each once: a served row whose grant
 //! still reads `paid` has its grant set `granted`; a `not_admitted` advert
 //! gets one submit to the overlay; a `paid` grant whose renewing transaction
 //! has no word gets one `findProvenTxReqs` question to the wallet (a take

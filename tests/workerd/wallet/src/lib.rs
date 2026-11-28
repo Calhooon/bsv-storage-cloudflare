@@ -212,7 +212,8 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 "fault" => Response::error("the stand-in overlay is down", 503),
                 "refuse" => Ok(Response::from_json(&json!({
                     "status": "error",
-                    "message": "the stand-in overlay does not admit this advert",
+                    "code": "ERR_SCRIPT_REFUSED",
+                    "message": "script verification failed (subject t): input 0: the stand-in overlay refuses this spend",
                 }))?
                 .with_status(400)),
                 "empty" => Response::from_json(

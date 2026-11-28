@@ -137,12 +137,66 @@ pub const ADMISSION_DEADLINE_MS: u64 = 10_000;
 /// (wallet-infra v0.7.8 `src/storage/create_action.rs:386`, `:514-517`).
 pub const RENEWED_ADVERT_VOUT: u32 = 0;
 
-/// The statuses the overlay answers a refusal of a submit with, in its
-/// error shape: 400 (the reference's `/submit`, ts-stack
-/// `packages/overlays/overlay-express/src/OverlayExpress.ts:3040-3045`, at
-/// 57c5f13055b555b83c1ef368fff3650abd21b6ef) and 422 (a transaction the
-/// network refused, as this deployment's overlay answers it).
-pub const REFUSAL_STATUSES: [u16; 2] = [400, 422];
+/// The status of a refusal: an answer that the submitted transaction is not
+/// admissible, as a judgment on its bytes.
+pub const REFUSAL_STATUS: u16 = 400;
+
+/// The `code` of the deployment's overlay for a spend its script interpreter
+/// refused (bsv-overlay-cloudflare `crates/overlay-cloudflare/src/routes.rs:377`,
+/// answered at `:1564-1570`, at 15725ea99287eb676006941b38eac8815dc5ca08).
+pub const SCRIPT_REFUSED_CODE: &str = "ERR_SCRIPT_REFUSED";
+
+/// The start of the deployment's overlay's message for the same verdict
+/// where it answers without a code (`EngineError::ScriptVerificationFailed`,
+/// `crates/overlay-engine/src/engine.rs:7286`, a 400 at
+/// `crates/overlay-cloudflare/src/routes.rs:44`, answered at `:2296`).
+pub const SCRIPT_REFUSED_MESSAGE: &str = "script verification failed (subject ";
+
+// Which of the overlay's answers is a refusal, and which a fault.
+//
+// A REFUSAL (the advert is never submitted again) is an answer that says
+// the submitted transaction is invalid, as a judgment on its bytes, and
+// nothing else. Of the answers the two overlays give, only one is told apart
+// as such: the deployment's overlay's script interpreter refusing a spend
+// (bsv-overlay-cloudflare at 15725ea99287eb676006941b38eac8815dc5ca08):
+//   - 400 `{"status":"error","code":"ERR_SCRIPT_REFUSED",…}`
+//     (`crates/overlay-cloudflare/src/routes.rs:377`, `:1564-1570`);
+//   - 400 `{"status":"error","message":"script verification failed (subject …"}`
+//     (`crates/overlay-engine/src/engine.rs:7286`; `routes.rs:44`, `:2296`).
+//
+// A FAULT (counted, tried again at most once a run, `stopped` at
+// [`crate::renewal::PASS_RUNS`] runs) is every other answer, among them the
+// 4xx answers that do not tell a judgment on the bytes from a failure of the
+// overlay's own means:
+//   - the deployment's overlay, 400 "SPV verification failed: …"
+//     (`EngineError::SpvError`, `engine.rs:7270`, a 400 at `routes.rs:39`):
+//     it carries "Chain tracker error at height …" when its header service
+//     fails (`engine.rs:3486-3489`, `:3534-3538`) and "root … is not valid
+//     for block height …" also when that service has not yet seen a block
+//     (`engine.rs:3476-3481`);
+//   - the deployment's overlay, 400 "BEEF parsing failed: …"
+//     (`EngineError::BeefParseError`, `engine.rs:7274`, a 400 at
+//     `routes.rs:40`): also raised over its own stored BEEF
+//     (`engine.rs:6595-6598`);
+//   - the deployment's overlay, 400 "This server does not support this
+//     topic: …" (`engine.rs:7236`, `routes.rs:29`): its configuration, not
+//     the bytes; and 400 for the request's headers (`routes.rs:751`, `:758`,
+//     `:793`);
+//   - the deployment's overlay, 422 "network rejected: …" (`routes.rs:2084`)
+//     and 422 "network rejected: evicted …" (`routes.rs:2165`, `:427-431`):
+//     a broadcaster's word, and an eviction the overlay itself re-admits on
+//     a mined proof;
+//   - the deployment's overlay, 500 for its storage (`routes.rs:37`), 502
+//     for a broadcast (`routes.rs:38`), 503 for a walk it could not run
+//     (`routes.rs:59`), 413 (`routes.rs:70`), and any body marked
+//     `"retryable": true` (`routes.rs:398`);
+//   - the reference (ts-stack `packages/overlays/overlay-express/src/OverlayExpress.ts`
+//     at 57c5f13055b555b83c1ef368fff3650abd21b6ef): every error of its
+//     `/submit`, an invalid transaction, its storage and its header service
+//     alike, is one 400 `{"status":"error","message":…}` (`:3040-3045`)
+//     whose message is "Request could not be processed" for all but a
+//     missing header or body (`publicErrorMessage`, `:330-335`; `:3005`,
+//     `:3010`): none of it is told apart, so none of it is a refusal.
 
 /// The overlay's answer to one submit, as it came.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -191,12 +245,14 @@ pub async fn admit_uhrp_advert(
 ///
 /// - **admitted**: a 2xx whose body is the overlay's admission (a STEAK)
 ///   naming `vout` among the topic's `outputsToAdmit`;
-/// - **refused**: a status in [`REFUSAL_STATUSES`] whose body is the
-///   overlay's error shape, `{"status": "error", "message": …}` (or
-///   `description`), not marked `retryable`; the reason is its message;
-/// - **a fault**, every other answer: none, the deadline, a 5xx, a 408 or
-///   429, any other 4xx or a refusal status without the error shape, a 2xx
-///   that is not an admission, and an admission that does not name `vout`
+/// - **refused**: a [`REFUSAL_STATUS`] whose body is the overlay's error
+///   shape, `{"status": "error", …}`, not marked `retryable`, naming the
+///   script interpreter's refusal of a spend ([`SCRIPT_REFUSED_CODE`], or a
+///   message starting [`SCRIPT_REFUSED_MESSAGE`]); the reason is its message
+///   (see the list beside [`REFUSAL_STATUS`]);
+/// - **a fault**, every other answer: none, the deadline, a 5xx, every other
+///   4xx whatever its body, a 2xx that is not an admission, and an admission
+///   that does not name `vout`
 ///   (the reference's engine answers the same empty admission for a
 ///   transaction it admitted nothing of, one it already holds, and a topic
 ///   whose check failed: ts-stack `packages/overlays/overlay/src/Engine.ts:349-354`).
@@ -226,26 +282,32 @@ pub fn read_admission(answer: &SubmitAnswer, topic: &str, vout: u32) -> Admissio
             Err(_) => Admission::Fault(reason(&format!("not an admission: HTTP {status}"))),
         };
     }
+    // A refusal only for the script interpreter's verdict; every other 4xx
+    // is a fault (the list of both, with their sources, beside
+    // `REFUSAL_STATUS`).
     match refusal_message(body) {
-        Some(message) if REFUSAL_STATUSES.contains(&status) => {
+        Some(message) if status == REFUSAL_STATUS => {
             Admission::Refused(reason(&format!("HTTP {status}: {message}")))
         }
         _ => Admission::Fault(format!("HTTP {status}")),
     }
 }
 
-/// The message of a body in the overlay's error shape: a JSON object with
-/// `"status": "error"` and a string `message` (or `description`), not marked
-/// `"retryable": true`.
+/// The message of a body in the overlay's error shape that names the script
+/// interpreter's refusal of a spend: a JSON object with `"status": "error"`,
+/// not marked `"retryable": true`, whose `code` is [`SCRIPT_REFUSED_CODE`] or
+/// whose `message` starts [`SCRIPT_REFUSED_MESSAGE`]; its `message` (or
+/// `description`).
 fn refusal_message(body: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(body).ok()?;
     if value["status"].as_str() != Some("error") || value["retryable"].as_bool() == Some(true) {
         return None;
     }
-    value["message"]
+    let message = value["message"]
         .as_str()
-        .or_else(|| value["description"].as_str())
-        .map(str::to_string)
+        .or_else(|| value["description"].as_str())?;
+    let coded = value["code"].as_str() == Some(SCRIPT_REFUSED_CODE);
+    (coded || message.starts_with(SCRIPT_REFUSED_MESSAGE)).then(|| message.to_string())
 }
 
 /// `fut`'s output, or `None` when `deadline_ms` passes first.
@@ -852,6 +914,13 @@ mod tests {
     const ERROR_SHAPE: &str =
         r#"{"status":"error","message":"the topic manager does not admit it"}"#;
 
+    /// The deployment's overlay's coded refusal of a spend (its
+    /// `json_error_coded`, which carries `message` too).
+    const SCRIPT_REFUSED_CODED: &str = r#"{"status":"error","code":"ERR_SCRIPT_REFUSED","description":"broadcast-gated: script verification failed: transaction t input 0: false stack","message":"broadcast-gated: script verification failed: transaction t input 0: false stack"}"#;
+
+    /// The same verdict without a code (`EngineError::ScriptVerificationFailed`).
+    const SCRIPT_REFUSED_PLAIN: &str = r#"{"status":"error","message":"script verification failed (subject t): input 0: false stack"}"#;
+
     #[test]
     fn admitted_only_when_the_admission_names_this_adverts_output() {
         assert_eq!(RENEWED_ADVERT_VOUT, 0);
@@ -874,30 +943,82 @@ mod tests {
     }
 
     #[test]
-    fn refused_only_when_the_overlay_answers_a_refusal_in_its_error_shape() {
-        for status in REFUSAL_STATUSES {
-            assert_eq!(
-                read(&http(status, ERROR_SHAPE)),
-                Admission::Refused(format!(
-                    "HTTP {status}: the topic manager does not admit it"
-                ))
-            );
-        }
-        // The reference's coded shape carries `description`.
+    fn refused_only_when_the_overlay_answers_that_the_interpreter_refused_a_spend() {
+        assert_eq!(
+            read(&http(400, SCRIPT_REFUSED_CODED)),
+            Admission::Refused(
+                "HTTP 400: broadcast-gated: script verification failed: transaction t input 0: false stack"
+                    .into()
+            )
+        );
+        assert_eq!(
+            read(&http(400, SCRIPT_REFUSED_PLAIN)),
+            Admission::Refused(
+                "HTTP 400: script verification failed (subject t): input 0: false stack".into()
+            )
+        );
+        // The code with `description` alone.
         assert_eq!(
             read(&http(
                 400,
-                r#"{"status":"error","code":"ERR_SCRIPT_REFUSED","description":"script verification failed"}"#
+                r#"{"status":"error","code":"ERR_SCRIPT_REFUSED","description":"refused"}"#
             )),
-            Admission::Refused("HTTP 400: script verification failed".into())
+            Admission::Refused("HTTP 400: refused".into())
         );
         // A long reason is cut.
-        let long = format!(r#"{{"status":"error","message":"{}"}}"#, "y".repeat(1000));
+        let long = format!(
+            r#"{{"status":"error","message":"{SCRIPT_REFUSED_MESSAGE}{}"}}"#,
+            "y".repeat(1000)
+        );
         let Admission::Refused(why) = read(&http(400, &long)) else {
             unreachable!()
         };
         assert_eq!(why.chars().count(), crate::renewal::REASON_MAX_CHARS);
-        assert!(why.starts_with("HTTP 400: yy"));
+        assert!(why.starts_with("HTTP 400: script verification failed (subject yy"));
+    }
+
+    /// The overlays' 4xx answers that do not tell a judgment on the bytes
+    /// from a failure of the overlay's own means are faults, each by name.
+    #[test]
+    fn every_other_4xx_of_the_overlays_is_a_fault() {
+        let error = |message: &str| format!(r#"{{"status":"error","message":"{message}"}}"#);
+        for (status, body) in [
+            // The deployment's overlay: its header service, and a root it has
+            // not yet seen.
+            (400, error("SPV verification failed: Chain tracker error at height 900000: timeout")),
+            (400, error("SPV verification failed: Invalid merkle path for transaction t: root r is not valid for block height 900000")),
+            (400, error("SPV verification failed: Merkle root r invalid for block height 900000")),
+            (400, error("SPV verification failed: Unable to verify SPV information: missing source")),
+            // A parse fault, raised over its own stored BEEF too.
+            (400, error("BEEF parsing failed: missing stored BEEF")),
+            // Its configuration, and the request's headers.
+            (400, error("This server does not support this topic: tm_uhrp")),
+            (400, error("Missing x-topics header")),
+            (400, error("Too many topics (max 100)")),
+            (400, error("broadcast-gated: EF: missing source")),
+            // A broadcaster's word, and an eviction.
+            (422, error("network rejected: REJECTED")),
+            (422, error("network rejected: evicted (DOUBLE_SPEND_ATTEMPTED) — the index re-admits it on a MINED proof or the operator's readmit")),
+            // The reference's one answer for every error of its `/submit`.
+            (400, error("Request could not be processed")),
+            (400, error("Missing or empty BEEF body")),
+            // The interpreter's verdict at another status, or marked retryable.
+            (422, SCRIPT_REFUSED_CODED.to_string()),
+            (413, SCRIPT_REFUSED_PLAIN.to_string()),
+            (
+                400,
+                r#"{"status":"error","code":"ERR_SCRIPT_REFUSED","message":"m","retryable":true}"#
+                    .to_string(),
+            ),
+            // Another code.
+            (400, r#"{"status":"error","code":"ERR_OTHER","message":"m"}"#.to_string()),
+        ] {
+            assert_eq!(
+                read(&http(status, &body)),
+                Admission::Fault(format!("HTTP {status}")),
+                "{body}"
+            );
+        }
     }
 
     /// Every other answer is a fault, its kind first.
@@ -918,8 +1039,9 @@ mod tests {
             fault(http(status, ERROR_SHAPE), &format!("HTTP {status}"));
             fault(http(status, "down"), &format!("HTTP {status}"));
         }
-        // Any other 4xx, even in the error shape; a refusal status without it.
-        for status in [401, 403, 404, 405, 409, 413, 421] {
+        // Any 4xx in the error shape that is not the interpreter's verdict,
+        // and the refusal status without the error shape.
+        for status in [400, 401, 403, 404, 405, 409, 413, 421, 422] {
             fault(http(status, ERROR_SHAPE), &format!("HTTP {status}"));
         }
         for body in [

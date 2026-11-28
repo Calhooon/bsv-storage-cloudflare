@@ -194,16 +194,20 @@ operator; the pass takes them from its first run after a deploy with the
 line.
 
 A run reads at most 20 rows, fewest `runs` first and then oldest, so rows
-that keep faulting do not hold newer ones back, and touches each once: a
+that keep faulting do not hold newer ones back, and reads each once: a
 served row whose grant still reads `paid` (the grant's second write did not
 land) has its grant set `granted`; a row `not_admitted` whose
 `queued_until` is null or past gets one submit of its advert to the
 overlay; a row `no_word` whose grant is `paid` gets one `findProvenTxReqs`
 question to the wallet for its `renewing_txid` (a take grants it and
 submits its advert in the same run). A fault or no word adds one to
-`runs`; at 72 runs the row is `stopped`. The overlay's answer is a refusal
-only when it answers a 400 or 422 in its error shape; every other answer
-is a fault and is tried again within these bounds.
+`runs`; at 72 runs the row is `stopped`. While more than 20 rows wait, a
+row with more runs waits its turn, so its 72 runs can take longer than
+three days. The overlay's answer is a refusal only when it is a 400 in its
+error shape naming its script interpreter's refusal of the transaction's
+spend (the code `ERR_SCRIPT_REFUSED`, or a message starting `script
+verification failed (subject `); every other answer, every other 4xx
+included, is a fault and is tried again within these bounds.
 
 What the pass sends out, at most, in an hour: 20 submits to this
 deployment's overlay (the `OVERLAY_SUBMIT_URL` host, through the `OVERLAY`
@@ -221,12 +225,19 @@ wrangler d1 execute CLAIMS --remote --command "SELECT r.prefix, r.payment_txid, 
 ```
 
 A `refused` advert is the overlay's answer, with its `reason`; the Worker
-does not submit it again. A `stopped` row is tried no more until an
-operator resets it, which puts it back to the pass with no runs:
+does not submit it again. A `stopped` row is tried no more. An operator
+resets either, which puts it back to the pass with no runs:
 
 ```bash
-wrangler d1 execute CLAIMS --remote --command "UPDATE renewals SET advert = CASE WHEN outcome = 'no_word' THEN NULL ELSE 'not_admitted' END, runs = 0, queued_until = NULL, updated_at = unixepoch() WHERE prefix = '<prefix>' AND advert = 'stopped'"
+wrangler d1 execute CLAIMS --remote --command "UPDATE renewals SET advert = CASE WHEN outcome = 'no_word' THEN NULL ELSE 'not_admitted' END, runs = 0, queued_until = NULL, updated_at = unixepoch() WHERE prefix = '<prefix>' AND advert IN ('refused', 'stopped')"
 ```
+
+When to reset, by the row's `reason`: a `stopped` row once the overlay (or
+the wallet, for a row whose `outcome` is `no_word`) answers again; a
+`refused` row when the overlay's reason points at the overlay rather than
+at the transaction (its script interpreter, or a source of the transaction
+it did not hold), once that is mended. A reset row is taken by the pass at
+its next run.
 
 **A rollback to 0.3.4 or 0.3.3** keeps migration `0002` in place: each
 reads and writes `payment_claims` and `payment_grants` only, and `0002`
