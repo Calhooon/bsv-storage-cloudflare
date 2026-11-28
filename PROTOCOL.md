@@ -409,6 +409,12 @@ for each output in outputs:
 }
 ```
 
+This Worker answers `ERR_MISSING_IDENTITY_KEY`, `ERR_MISSING_FIELDS`,
+`ERR_INVALID_TIME` (400), `ERR_OLD_ADVERTISEMENT_NOT_FOUND`,
+`ERR_FILE_NOT_FOUND` (404), `ERR_INTERNAL_RENEW` (500, before any
+payment), `ERR_RENEWAL_NOT_MADE` (500) and `ERR_RENEWAL_UNCONFIRMED` (502);
+the last two carry `paymentTxid`.
+
 **Validation Rules**
 - `uhrpUrl`: Required, non-empty string
 - `additionalMinutes`: Required, must be positive integer (> 0)
@@ -520,6 +526,54 @@ storage.bucket(GCP_BUCKET_NAME).file(`cdn/${objectIdentifier}`).setMetadata({
 
 **Line References**
 - Route handler: `src/routes/renew.ts:34–229`
+
+**This Worker's `/renew` (0.3.4), in order** (`src/routes/renew.rs`,
+`src/renewal.rs`, `src/pass.rs`):
+
+1. Before any 402: parse the body; `listOutputs` the advert by its
+   `uhrp_url_<hex>` tag (any identity), the one with the largest
+   `expiry_time_*`; field 4 of its PushDrop is the size priced; then a HEAD
+   of the stored object `cdn/<object identifier>` through the binding (no
+   byte read). A missing object, or one whose size differs from field 4, is
+   a free `404 ERR_FILE_NOT_FOUND`.
+2. The payment door: the 402, the claim, `internalizeAction`, the grant row
+   `paid`.
+3. The renewing step: `createAction` spending the old advert, the
+   signature, `processAction` with `isNoSend: false`, `isDelayed: false`.
+   The wallet's answer for the renewing txid decides; a `sending` answer is
+   followed by one `findProvenTxReqs` read of that txid's broadcast
+   request. `createAction` refusing the advert as unavailable gets one
+   re-read of the current advert and one more try; a failure after
+   `createAction` and before `processAction`, or `processAction` refused
+   with an answer, is followed by `abortAction`.
+4. Taken: the signed 200 `{status, prevExpiryTime, newExpiryTime, amount,
+   overlayAdmitted}` and the grant `granted`. The renewed advert is then
+   submitted to the overlay (`tm_uhrp`); `overlayAdmitted` says whether it
+   admitted it. A refusal is recorded with its reason; a fault puts one
+   re-submit on the post-upload queue, then the hourly pass.
+5. Not made: `500 ERR_RENEWAL_NOT_MADE`; no word: `502
+   ERR_RENEWAL_UNCONFIRMED`. Each names `paymentTxid` and keeps the grant
+   `paid`, with a `renewals` row.
+
+The route reads and writes no byte of the stored object.
+
+**Deviations from the TypeScript reference** (`infra/uhrp-server-cloud-bucket`
+in bsv-blockchain/ts-stack at `57c5f13055b555b83c1ef368fff3650abd21b6ef`):
+
+- The 200 is answered once a broadcaster took the renewing transaction; the
+  reference still requires its retention write and the overlay's broadcast
+  before its 200 (`src/routes/renew.ts:152-163`) and answers 500 or 502
+  when either fails.
+- A taken payment with no renewal served is answered 500 or 502 with the
+  payment's txid and recorded as a `paid` grant with a `renewals` row; the
+  reference keeps no record (`src/routes/renew.ts:168-171`).
+- A missing stored object is a free 404 `ERR_FILE_NOT_FOUND`; the
+  reference answers it 500 `ERR_PAYMENT_INTERNAL` from its pricing, also
+  before any charge (`src/utils/getMetadata.ts:54-59`).
+- The stored object's custom time is not advanced on a renewal; the
+  reference advances it with a metadata-only write
+  (`src/utils/extendObjectRetention.ts:4-27`, called at
+  `src/routes/renew.ts:156`).
 
 ---
 

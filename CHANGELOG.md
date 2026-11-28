@@ -1,5 +1,86 @@
 # Changelog
 
+## 0.3.4 (2026-11-28)
+
+**For an operator, before the deploy:** apply migration `0002` to each
+instance's `CLAIMS` database (`wrangler d1 migrations apply CLAIMS
+--remote`, from the checkout being deployed), then deploy. The Worker
+gains one scheduled act (below): the `[triggers] crons` line of
+`wrangler.toml` is part of the deploy config. `DEPLOYMENT.md` has the
+order, the cron line and the statements that list and reset a row.
+
+- **`/renew`, in order.** Before any 402 the route HEADs the advert's
+  stored object `cdn/<object identifier>` through the `UHRP_FILES` binding
+  (no byte of it is read): a missing object, or one whose size differs from
+  the advert's content length, is a free `404 ERR_FILE_NOT_FOUND`, nothing
+  claimed and the wallet not asked to take a payment. After the payment
+  door, the renewing step (`createAction`, the signature, `processAction`
+  with `isNoSend: false` and `isDelayed: false`) is read by the wallet's
+  answer for the renewing txid; a `sending` answer is followed by one
+  `findProvenTxReqs` read of that txid's broadcast request. Three outcomes:
+  - **taken** (`unmined` or `completed`; `unproven` in `sendWithResults`;
+    `success` in `notDelayedResults`): the signed 200 and the grant
+    `granted`;
+  - **not made** (the call refused with a `-32602` or `-32001` answer;
+    `failed`; `doubleSpend`, `invalid`, `invalidTx`):
+    `500 ERR_RENEWAL_NOT_MADE`, "The payment was taken. The renewal was not
+    made. It is recorded under <txid>. A new payment renews the file.";
+  - **no word** (no answer read, any other word, or no result for the
+    txid): `502 ERR_RENEWAL_UNCONFIRMED`, "The payment was taken. This host
+    has no word yet that the renewing transaction was sent. It is recorded
+    under <txid>."
+  Both non-2xx answers carry `paymentTxid`, the payment's transaction, and
+  keep the grant `paid` with its `status` and `answered_at`; the reference
+  client sends neither answer again by itself. The same payment presented
+  again is the signed `409 ERR_PAYMENT_REPLAYED`.
+- **One more try.** When `createAction` refuses the advert as unavailable
+  (spent by another renewal), the route waits 2 s, reads the file's current
+  advert once and runs the renewing step once more from it: two payers of
+  one file at once are both served, two payments and two extensions. No
+  other refusal is tried again, and there is no third try.
+- **Releasing the action.** A failure after `createAction` and before
+  `processAction` (the signature, the BEEF), and `processAction` refused
+  with an answer, call `abortAction`, which releases the old advert.
+- **The new field.** The 200 is `{status, prevExpiryTime, newExpiryTime,
+  amount, overlayAdmitted}`: `overlayAdmitted` is `true` when the overlay
+  admitted the renewed advert, submitted after the take within 10 s.
+  Otherwise the renewal is still served: an overlay that answers it does
+  not admit the advert is recorded with its reason and never submitted
+  again by the Worker; a fault (no answer, a 5xx, 408, 429, the deadline)
+  puts one re-submit message on the post-upload queue, delivered at most
+  four times (`max_retries = 3`), then the hourly pass.
+- **The stored object.** `/renew` reads and writes no byte of it; its
+  custom time is the one `/upload` set, and the term of record is the
+  advert's expiry and the grant's. The queue's duplicate-advert guard reads
+  an event's custom time against the file's current advert, which a
+  renewal only moves later.
+- **Migration `0002_renewals.sql`.** One new table, `renewals`, under the
+  payment's prefix: the payment's txid, the renewing txid, the outcome
+  (`served`, `not_made`, `no_word`), the advert's state (`admitted`,
+  `not_admitted`, `refused`, `stopped`) with the pass's `runs` and the
+  overlay's `reason`, the advert's Atomic BEEF to submit again (kept up to
+  512 KiB), the queue's window and count; and its index. It alters neither
+  `payment_claims` nor `payment_grants`, and `0001` is unchanged.
+- **A new scheduled act: the hourly pass** (`crons = ["0 * * * *"]`). At
+  most 20 rows a run, oldest first, each touched once: an advert not
+  admitted gets one submit (admitted; refused, kept with its reason and
+  never tried again; a fault adds a run); a `paid` grant whose renewal has
+  no word gets one `findProvenTxReqs` question for its renewing txid (a
+  take grants it and submits its advert in the same run; a failure makes
+  it `not_made`; no word adds a run). At 72 runs a row is `stopped` and
+  listed until an operator resets it. The pass makes and signs no
+  transaction, touches no stored object and no row of another kind, and
+  no request waits on it.
+- **Tests.** Native tests for the wallet's words one by one, the answers'
+  texts, the pass's steps, its statements on SQLite (the cap, the order,
+  each ending, and 0.3.3's statements on a migrated database) and source
+  tests that `/renew` and the pass touch no stored object. `tests/workerd`:
+  the stand-in's knobs (`/knob?create=&process=&overlay=`), the object it
+  seeds for each advert, `abortAction` and `findProvenTxReqs`, and the
+  cases above; its second stage fires the scheduled handler. The `workerd`
+  job of `ci.yml` builds the Worker, the stand-ins, v0.3.0 and the race
+  client, and runs both stages on the hosted runner.
+
 ## 0.3.3 (2026-11-28)
 
 - bsv-middleware-cloudflare `=0.7.8` (core 0.4.7), still an exact pin;

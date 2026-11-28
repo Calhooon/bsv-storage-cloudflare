@@ -1,6 +1,6 @@
 # bsv-storage-cloudflare
 
-UHRP file-storage service **0.2.3** on Cloudflare Workers, written in Rust
+UHRP file-storage service **0.3.4** on Cloudflare Workers, written in Rust
 and compiled to WASM. It implements the six client routes of
 [`@bsv/uhrp-storage-server`](https://github.com/bsv-blockchain/storage-server)
 with Cloudflare R2 for file bytes and a post-upload Queue consumer for
@@ -15,7 +15,7 @@ advertisements. See the [wire specification](./PROTOCOL.md).
 | GET | `/find` | BRC-31 | Look up metadata for a UHRP URL. |
 | GET | `/list` | BRC-31 | List the caller's uploaded files. |
 | POST | `/advertise` | BRC-31 + admin allowlist | Publish a UHRP advertisement for an uploaded object. |
-| POST | `/renew` | BRC-31 + BRC-29 payment | Redeem the old advertisement and publish one with an extended expiry. |
+| POST | `/renew` | BRC-31 + BRC-29 payment | Redeem the old advertisement and publish one with an extended expiry; served once a broadcaster takes the renewing transaction. |
 
 The authenticated routes use the BRC-31 handshake through
 `bsv-middleware-cloudflare`. On the paid routes, `/upload` and `/renew`,
@@ -39,6 +39,12 @@ construction and storage. See the [upload handler](./src/routes/upload.rs),
 [queue consumer](./src/queue/mod.rs) and [overlay submitter](./src/overlay/mod.rs).
 The queue currently buffers file bytes for hashing; multi-GB hashing can
 exceed Worker memory, as recorded in the queue source.
+A paid `/renew` HEADs the stored object before its 402 and reads or writes
+none of its bytes. It is served once a broadcaster takes the renewing
+transaction; the overlay's admission of the renewed advert follows it (one
+re-submit on the same queue, then an hourly pass of at most 20 rows). See
+the [renew route](./src/routes/renew.rs) and
+[DEPLOYMENT.md](./DEPLOYMENT.md#the-renewals-and-the-hourly-pass-034).
 
 ## Health and release status
 
@@ -49,8 +55,8 @@ establishing wallet, overlay or storage readiness. See the
 [health implementation](./src/health.rs) and [0.2.1 release notes](./CHANGELOG.md#021).
 
 Public tags exist up to
-[`v0.2.2`](https://github.com/Calhooon/bsv-storage-cloudflare/releases/tag/v0.2.2);
-0.2.3 is this manifest's version, released by its `v0.2.3` tag. A live upload, public GET, hash check, advertisement and renewal round
+[`v0.3.3`](https://github.com/Calhooon/bsv-storage-cloudflare/releases/tag/v0.3.3);
+0.3.4 is this manifest's version. A live upload, public GET, hash check, advertisement and renewal round
 trip on the current line is pending. The historical checks below do not
 establish current deployment readiness.
 

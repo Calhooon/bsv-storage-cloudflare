@@ -182,6 +182,7 @@ pub fn admission_of(e: &SubmitError) -> Admission {
 
 /// `fut`'s output, or `None` when `deadline_ms` passes first.
 async fn within<F: std::future::Future>(fut: F, deadline_ms: u64) -> Option<F::Output> {
+    use std::future::Future as _;
     use std::task::Poll;
     let mut fut = std::pin::pin!(fut);
     let mut timer = std::pin::pin!(worker::Delay::from(std::time::Duration::from_millis(
