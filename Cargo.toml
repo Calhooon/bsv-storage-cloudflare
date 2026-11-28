@@ -1,6 +1,6 @@
 [package]
 name = "bsv-storage-cloudflare"
-version = "0.3.3"
+version = "0.3.4"
 edition = "2021"
 description = "UHRP file-storage server on Cloudflare Workers. Protocol-compatible Rust/WASM port of @bsv/uhrp-storage-server (nanostore.babbage.systems)."
 license = "MIT"
@@ -46,7 +46,7 @@ sha2 = "0.10"
 # `d1-claims`: the payment prefix is claimed in the `CLAIMS` D1 database
 # (`D1PrefixStore`, `payment_prefix_gate`).
 bsv-middleware-cloudflare = { version = "=0.7.8", features = ["d1-claims"] }
-bsv-rs = { version = "0.8.14", features = ["auth", "wallet", "transaction", "script", "overlay", "wasm"] }
+bsv-rs = { version = "0.8.15", features = ["auth", "wallet", "transaction", "script", "overlay", "wasm"] }
 # SigV4 for R2 S3-compatible presigned URLs (task #4).
 hmac = "0.12"
 

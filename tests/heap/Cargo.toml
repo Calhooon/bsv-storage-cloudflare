@@ -19,7 +19,7 @@ path = "payment_door.rs"
 [dev-dependencies]
 bsv-storage-cloudflare = { path = "../.." }
 bsv-middleware-cloudflare = "=0.7.8"
-bsv-rs = { version = "0.8.14", features = ["auth", "wallet", "transaction", "script"] }
+bsv-rs = { version = "0.8.15", features = ["auth", "wallet", "transaction", "script"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 hex = "0.4"
