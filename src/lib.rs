@@ -792,7 +792,7 @@ mod tests {
         // The largest authenticated body this Worker serves, a draft, is
         // under the figure with room to spare.
         assert_eq!(routes::drafts::MAX_DRAFT_BYTES, 256 * 1024);
-        assert!((routes::drafts::MAX_DRAFT_BYTES as u64) * 4 < AUTH_BODY_MAX_BYTES);
+        const { assert!((routes::drafts::MAX_DRAFT_BYTES as u64) * 4 < AUTH_BODY_MAX_BYTES) };
 
         // The layer's reader at this Worker's bounds: a declared length over
         // the figure is its 413 with nothing read.
