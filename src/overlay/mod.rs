@@ -1161,7 +1161,7 @@ mod tests {
     #[test]
     fn an_advert_beef_is_parsed_up_to_the_figure_and_skipped_past_it() {
         assert_eq!(ADVERT_BEEF_MAX_BYTES, 614_400);
-        assert!(ADVERT_BEEF_MAX_BYTES < LOOKUP_ANSWER_MAX_BYTES);
+        const { assert!(ADVERT_BEEF_MAX_BYTES < LOOKUP_ANSWER_MAX_BYTES) };
 
         // Exactly the figure: parsed, and its host taken.
         let at = ship_beef_of(ADVERT_BEEF_MAX_BYTES);
